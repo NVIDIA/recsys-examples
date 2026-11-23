@@ -276,6 +276,7 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        given = frequencies is not None
         if frequencies is None:
             frequencies = torch.ones(
                 keys.shape[0], dtype=torch.int64, device=keys.device
@@ -288,6 +289,11 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
 
         accumulated = self._counter.add(keys, table_ids, frequencies)
         admit_mask = accumulated >= self._threshold
+        # What the caller gave is a per-batch increment; what it gets back is the
+        # running total, which an LFU table takes as the admitted key's score.
+        # With no frequencies given there is nothing to hand back to.
+        if given:
+            frequencies.copy_(accumulated)
 
         # A key that got in is no longer waiting, so it stops taking up room.
         # This repeats a compaction the caller also makes over the same mask;

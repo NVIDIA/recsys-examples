@@ -1723,8 +1723,12 @@ class MultiTableAdmitter(abc.ABC):
 
         ``frequencies`` is how often each key occurred in *this batch*, where
         the module counts occurrences at all; None means treat each key as one.
-        It is an increment, not a running total -- any total is the admitter's
-        own to keep.
+        On input it is an increment, not a running total -- any total is
+        the admitter's own to keep. It is a copy made for this call and it is
+        where an answer goes back: an admitter that keeps a running total
+        overwrites it in place with each key's total (this batch included),
+        which a table that evicts by LFU takes as the score the key is inserted
+        with; one that keeps none leaves it as it is.
         """
 
     def state(self) -> Optional[Counter]:
@@ -1750,6 +1754,10 @@ class MultiTableAdmitter(abc.ABC):
 `FrequencyAdmissionStrategy` admits a key once it has been seen often enough,
 and carries the counter it accumulates into, so admission is configured in one
 place. Its admitter erases a key from that counter the moment it is admitted.
+On a table that evicts by LFU (`LFU`, or `(TIMESTAMP, LFU)` in either order) it
+also writes each key's running count over its score, so an admitted key's score
+includes the occurrences it waited with and it ranks as if it had been in the
+table since it was first seen.
 
 ```python
 class FrequencyAdmissionStrategy(AdmissionStrategy):
