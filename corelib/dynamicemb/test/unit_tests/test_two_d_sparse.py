@@ -68,6 +68,11 @@ EMBEDDING_DIM = 8
 NUM_EMBEDDINGS = 1 << 16
 INIT_VALUE = 0.125
 KEYS_PER_REPLICA = 4
+# --grow: a table starts at GROW_CAPACITY and doubles past a load factor of 0.5.
+# Each replica trains GROW_KEYS_PER_SHARD keys a shard of its own once, which
+# fits, and the sync brings it the other replicas' as well, which does not.
+GROW_CAPACITY = 1024
+GROW_KEYS_PER_SHARD = 300
 DTYPES = {
     "fp32": torch.float32,
     "fp16": torch.float16,
@@ -112,6 +117,7 @@ def _build(args) -> DMPCollection:
             use_dynamicemb=True,
             dynamicemb_options=DynamicEmbTableOptions(
                 global_hbm_for_values=1024**3,
+                init_capacity=GROW_CAPACITY if args.grow else None,
                 embedding_dtype=DTYPES[args.embedding_dtype],
                 score_strategy=SCORES[args.score_strategy],
                 initializer_args=DynamicEmbInitializerArgs(
@@ -159,16 +165,21 @@ def _replica_group(model: DMPCollection) -> dist.ProcessGroup:
     return model.device_mesh.get_group("replicate")
 
 
-def _replica_keys(replica: int) -> List[int]:
+def _replica_keys(args, replica: int) -> List[int]:
+    if args.grow:
+        count = GROW_KEYS_PER_SHARD * args.sharding_group_size
+        return [10 + replica * count + i for i in range(count)]
     # Consecutive replicas share half their keys, so every key is held by one
     # replica or two, and each shard gets some of each.
     return [10 + 2 * replica + i for i in range(KEYS_PER_REPLICA)]
 
 
-def _train(model: DMPCollection, steps: int = 2) -> None:
+def _train(args, model: DMPCollection) -> None:
     # Every rank of a replica feeds the replica's keys; the fused optimizer
-    # steps inside backward.
-    keys = _replica_keys(dist.get_rank(_replica_group(model)))
+    # steps inside backward. One step under --grow: the table counts a batch's
+    # keys toward its load before it knows how many are new.
+    steps = 1 if args.grow else 2
+    keys = _replica_keys(args, dist.get_rank(_replica_group(model)))
     device = torch.device("cuda", torch.cuda.current_device())
     kjt = torchrec.KeyedJaggedTensor(
         keys=[_feature(table) for table in TABLES],
@@ -222,10 +233,15 @@ def _at_table_precision(values: torch.Tensor, dtype: torch.dtype) -> torch.Tenso
 
 def check_sync(args) -> None:
     model = _build(args)
-    _train(model)
+    _train(args, model)
     sync = DynamicEmbReplicaSync(model)
     before = _gather_replicas(model, _rows(model))
+    states = [kernel.tables.tables[0] for kernel in get_dynamic_emb_module(model)]
+    generations = [state.key_map_generation for state in states]
     stats = {table.table_name: table for table in sync.sync()}
+    if args.grow:
+        grew = [state.key_map_generation for state in states] != generations
+        assert grew, "no table grew during the sync; --grow tested nothing"
     after = _gather_replicas(model, _rows(model))
     replica_count = len(before)
     dtype = DTYPES[args.embedding_dtype]
@@ -270,7 +286,7 @@ def check_sync(args) -> None:
 
 def check_checkpoint(args) -> None:
     model = _build(args)
-    _train(model)
+    _train(args, model)
     # No sync: the replicas disagree, so the rows a load returns say who wrote.
     first = _gather_replicas(model, _rows(model))[0]
     DynamicEmbDump(args.save_path, model, optim=True)
@@ -322,6 +338,11 @@ def main(argv) -> None:
     parser.add_argument("--embedding-dtype", choices=sorted(DTYPES), default="fp32")
     parser.add_argument("--score-strategy", choices=sorted(SCORES), default="lru_lfu")
     parser.add_argument("--optimizer", choices=sorted(OPTIMIZERS), default="adagrad")
+    parser.add_argument(
+        "--grow",
+        action="store_true",
+        help="small tables that the sync's inserts make grow",
+    )
     parser.add_argument("--save-path", default="/tmp/dynamicemb_two_d_ckpt")
     args = parser.parse_args(argv)
 
@@ -335,6 +356,7 @@ def main(argv) -> None:
             f"{world_size // args.sharding_group_size} replica(s) x "
             f"{args.sharding_group_size}, {'strided' if args.strided else 'contiguous'}"
             f", {args.embedding_dtype}, {args.score_strategy}, {args.optimizer}"
+            f"{', growing' if args.grow else ''}"
         )
     MODES[args.mode](args)
     dist.barrier()

@@ -226,8 +226,13 @@ class DynamicEmbReplicaSync:
                 ),
                 torch.float32,
             ).item()
-        row_bytes = 4 * (emb_dim + fresh_opt.size(1)) + 16
-        chunk_rows = max(1, SYNC_CHUNK_BYTES // row_bytes)
+        # Per key: one row of every replica is gathered at once, beside the sums,
+        # with a mask byte per replica.
+        row_bytes = (
+            4 * (emb_dim + fresh_opt.size(1)) + 8 * state.key_index_map.num_scores_
+        )
+        key_bytes = (self.replica_count + 2) * row_bytes + self.replica_count
+        chunk_rows = max(1, SYNC_CHUNK_BYTES // key_bytes)
         local_keys = 0
         for begin in range(0, union.numel(), chunk_rows):
             local_keys += self.sync_chunk(
@@ -320,6 +325,8 @@ class DynamicEmbReplicaSync:
                 keys.numel(), state.value_dim, dtype=state.emb_dtype, device=device
             ),
         )
+        # A table that grew has a new key map, which the insert went into.
+        key_map = state.key_index_map
         _, placed, rows, slots = key_map.lookup(
             keys, table_ids, score_arg, return_slots=True
         )
