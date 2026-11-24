@@ -1512,7 +1512,7 @@ def store_to_flat_single_table(
 
 
 def score_source(
-    state: DynamicEmbTableState,
+    evict_strategy: Optional[EvictStrategy],
     frequency: Optional[torch.Tensor] = None,
     key_scores: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
@@ -1521,16 +1521,16 @@ def score_source(
     The two inputs a key can carry are separate channels -- ``frequency``, how
     often the batch counted it, and ``key_scores``, what the input scored it
     with -- and this is the one place that says which of them a table takes: an
-    LFU table the frequency, a CUSTOMIZED table the score of the input. Every
-    path that hands a score to the key map (the find, the insert) asks here, so a
-    table that takes both one day has one rule to change.
+    LFU table the frequency, a CUSTOMIZED table the score of the input. A caller
+    chooses here, once, and hands the table's finds and inserts that one tensor
+    (``score_input``); the tables and stores below it never see the other.
 
     ``None`` means "the table's own default" -- ``get_find_score_arg`` and
     ``get_insert_score_arg`` supply it.
     """
-    if state.evict_strategy == EvictStrategy.KLfu:
+    if evict_strategy == EvictStrategy.KLfu:
         return frequency
-    if state.evict_strategy == EvictStrategy.KCustomized:
+    if evict_strategy == EvictStrategy.KCustomized:
         return key_scores
     return None
 
@@ -2752,20 +2752,20 @@ class DynamicEmbCache(Cache):
         self,
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-        key_scores: Optional[torch.Tensor] = None,
+        score_input: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Lookup with overflow fallback. Returns (score_out, founds, indices).
 
-        ``key_scores`` is for a cache that owns scores (the NINE path); the cache
-        of the inclusive path ranks by timestamp and takes neither input.
+        ``score_input`` is what the cache's score is made from (see
+        :func:`score_source`); only a cache that owns scores (the NINE path) takes
+        one. The cache of the inclusive path ranks by timestamp and takes none.
         """
         state = self._state
         score_arg = get_find_score_arg(
             state,
             unique_keys.size(0),
             unique_keys.device,
-            score_source(state, lfu_accumulated_frequency, key_scores),
+            score_input,
         )
         result = state.key_index_map.lookup_with_overflow(
             unique_keys, table_ids, score_arg
@@ -3022,7 +3022,7 @@ class DynamicEmbStorage(Storage):
                     state,
                     keys.numel(),
                     device,
-                    score_input=score_source(state, lfu_freq),
+                    score_input=score_source(state.evict_strategy, lfu_freq),
                 )
                 _, founds, _ = km.lookup(keys, table_ids, score_find)
                 missing = torch.logical_not(founds)
@@ -3094,8 +3094,7 @@ class DynamicEmbStorage(Storage):
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-        key_scores: Optional[torch.Tensor] = None,
+        score_input: Optional[torch.Tensor] = None,
     ) -> Tuple[
         int,
         torch.Tensor,
@@ -3110,7 +3109,7 @@ class DynamicEmbStorage(Storage):
             self._state,
             unique_keys,
             table_ids,
-            score_source(self._state, lfu_accumulated_frequency, key_scores),
+            score_input,
         )
         (
             h_num_missing,
@@ -3726,8 +3725,7 @@ class HybridStorage(Storage):
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-        key_scores: Optional[torch.Tensor] = None,
+        score_input: Optional[torch.Tensor] = None,
     ) -> Tuple[
         int,
         torch.Tensor,
@@ -3738,7 +3736,10 @@ class HybridStorage(Storage):
         torch.Tensor,
         torch.Tensor,
     ]:
-        if key_scores is not None:
+        if (
+            score_input is not None
+            and self._hbm.evict_strategy == EvictStrategy.KCustomized
+        ):
             raise NotImplementedError(
                 "A score per key is not supported by HybridStorage."
             )
@@ -3746,7 +3747,7 @@ class HybridStorage(Storage):
             self._hbm,
             unique_keys,
             table_ids,
-            score_source(self._hbm, lfu_accumulated_frequency),
+            score_input,
         )
         (
             h_num_missing_hbm,
@@ -3816,7 +3817,7 @@ class HybridStorage(Storage):
         if (
             self._hbm.evict_strategy == EvictStrategy.KLfu
             and self._host.evict_strategy == EvictStrategy.KLfu
-            and lfu_accumulated_frequency is not None
+            and score_input is not None
         ):
             if global_missing_indices.numel() == 0:
                 assert (
@@ -3825,7 +3826,7 @@ class HybridStorage(Storage):
             else:
                 assert global_missing_scores is not None
                 assert global_missing_scores.numel() == global_missing_indices.numel()
-                expected = lfu_accumulated_frequency[global_missing_indices]
+                expected = score_input[global_missing_indices]
                 assert torch.equal(
                     global_missing_scores.long(),
                     expected.long(),

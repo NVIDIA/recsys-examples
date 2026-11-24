@@ -982,8 +982,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-        key_scores: Optional[torch.Tensor] = None,
+        score_input: Optional[torch.Tensor] = None,
         *,
         find_debug_context: Optional[str] = None,
     ) -> Tuple[
@@ -1010,19 +1009,17 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             missing_scores,
             founds,
             output_scores,
-        ) = self.find_impl(
-            unique_keys, table_ids, unique_vals, lfu_accumulated_frequency
-        )
+        ) = self.find_impl(unique_keys, table_ids, unique_vals, score_input)
 
         h_table_ids = table_ids.cpu()
         if (
-            lfu_accumulated_frequency is not None
+            score_input is not None
             and self.options[0].score_strategy == DynamicEmbScoreStrategy.LFU
         ):
             # An LFU score accumulates: what a key is found with is the count
             # the store kept for it plus this batch's, and the store keeps that.
             h_keys = unique_keys.cpu()
-            h_freq = lfu_accumulated_frequency.cpu()
+            h_freq = score_input.cpu()
             h_founds = founds.cpu()
             for i in h_founds.nonzero().flatten().tolist():
                 composite_key = (h_table_ids[i].item(), h_keys[i].item())

@@ -538,7 +538,9 @@ def _prefetch_inclusive_cache_path(
         # ``score_input`` is what the storage's score is made from, chosen once
         # here and carried with the keys from now on; ``accumulated_frequency``
         # is only for admission below.
-        score_input = score_source(storage._state, accumulated_frequency, key_scores)
+        score_input = score_source(
+            storage._state.evict_strategy, accumulated_frequency, key_scores
+        )
         with torch.cuda.nvtx.range("op:storage_find"):
             (_, _, _, _, _, st_founds, _, st_slots) = _find_keys(
                 storage._state,
@@ -754,7 +756,9 @@ def _prefetch_hbm_direct_path(
                 state,
                 unique_keys,
                 unique_table_ids,
-                score_input=score_source(state, accumulated_frequency, key_scores),
+                score_input=score_source(
+                    state.evict_strategy, accumulated_frequency, key_scores
+                ),
                 return_slots=True,
             )
 
@@ -1202,11 +1206,10 @@ def _generic_forward_path(
             ) = storage.find(
                 unique_keys,
                 unique_table_ids,
-                copy_mode=CopyMode.VALUE,
-                lfu_accumulated_frequency=accumulated_frequency,
-                # Only when there are some: an external store written against
-                # the interface before per-key scores has no such parameter.
-                **({} if key_scores is None else {"key_scores": key_scores}),
+                CopyMode.VALUE,
+                # The one input the table's score is made from, positionally: an
+                # external store keeps its own name for the parameter.
+                score_source(evict_strategy, accumulated_frequency, key_scores),
             )
 
         key_persisted = founds.clone()

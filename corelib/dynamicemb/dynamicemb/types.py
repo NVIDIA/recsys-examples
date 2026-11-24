@@ -227,8 +227,7 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-        key_scores: Optional[torch.Tensor] = None,
+        score_input: Optional[torch.Tensor] = None,
     ) -> Tuple[
         int,
         torch.Tensor,
@@ -381,7 +380,7 @@ class Cache(abc.ABC):
         self,
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        score_input: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Lookup with overflow fallback.
 

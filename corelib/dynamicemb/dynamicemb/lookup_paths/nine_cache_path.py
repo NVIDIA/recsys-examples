@@ -69,34 +69,31 @@ def prefetch_nine_cache_path(
             empty = torch.empty(0, dtype=torch.int64, device=device)
             return empty, None
 
+        # ``score_input`` is chosen once: the cache's score, and the store's, are
+        # made from it. The frequency is only for admission below.
+        score_input = score_source(
+            state.evict_strategy, accumulated_frequency, key_scores
+        )
+
         # 1. Lookup with overflow fallback; pin what is found (the counter kernel
         # skips the misses' slots, -1).
         with torch.cuda.nvtx.range("op:cache_lookup"):
             _, founds, cache_indices = cache.lookup(
-                unique_keys,
-                unique_table_ids,
-                lfu_accumulated_frequency=accumulated_frequency,
-                key_scores=key_scores,
+                unique_keys, unique_table_ids, score_input
             )
         slot_indices = cache_indices.clone()
         cache.increment_counter(cache_indices, unique_table_ids)
 
-        # 2. The misses. ``score_input`` is what the cache's score is made from.
-        score_input = score_source(state, accumulated_frequency, key_scores)
+        # 2. The misses. ``score_input`` is what the cache's score is made from;
+        # the frequency is kept for admission, which counts by it.
         with torch.cuda.nvtx.range("op:flagged_compact"):
             (
                 num_miss,
                 miss_pos,
-                (miss_keys, miss_tids, miss_freq, miss_key_scores, miss_score_input),
+                (miss_keys, miss_tids, miss_freq, miss_score_input),
             ) = flagged_compact(
                 ~founds,
-                [
-                    unique_keys,
-                    unique_table_ids,
-                    accumulated_frequency,
-                    key_scores,
-                    score_input,
-                ],
+                [unique_keys, unique_table_ids, accumulated_frequency, score_input],
             )
         if num_miss == 0:
             return slot_indices, None
@@ -106,9 +103,8 @@ def prefetch_nine_cache_path(
             (_, _, _, _, _, in_store, store_scores, values) = storage.find(
                 miss_keys,
                 miss_tids,
-                copy_mode=CopyMode.VALUE,
-                lfu_accumulated_frequency=miss_freq,
-                key_scores=miss_key_scores,
+                CopyMode.VALUE,
+                miss_score_input,  # positionally: a store names the parameter itself
             )
 
         # 4. Admit the new ones (a key the store has was admitted before)
