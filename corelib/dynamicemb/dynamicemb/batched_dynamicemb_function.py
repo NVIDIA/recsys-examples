@@ -14,8 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
-from enum import Enum, auto
-from typing import Callable, ContextManager, Optional, Tuple
+from typing import Callable, ContextManager, Optional, Tuple, Union
 
 import torch
 from dynamicemb.async_erase import table_section
@@ -41,6 +40,7 @@ from dynamicemb.key_value_table import (
 )
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb.state.storage_layout import CachePath, StorageLayout
 from dynamicemb.types import CopyMode, MultiTableAdmitter
 from dynamicemb.utils import decode_table_values, gradient_dtype
 from dynamicemb_extensions import (
@@ -193,12 +193,6 @@ def largest_score_per_unique_key(
     )
 
 
-class StorageMode(Enum):
-    DEFAULT = auto()
-    CACHE = auto()
-    HBM_DIRECT = auto()
-
-
 @dataclass
 class PrefetchState:
     unique_keys: torch.Tensor
@@ -207,7 +201,10 @@ class PrefetchState:
     lfu_accumulated_frequency: torch.Tensor
     table_num: int
     emb_dtype: torch.dtype
-    storage_mode: StorageMode
+    storage_layout: StorageLayout
+    # The table whose hash slots ``slot_indices`` are: the cache when HBM caches, else
+    # the storage. Its counter pins them and its state is what they address.
+    slot_owner: Union[Cache, Storage]
     slot_indices: Optional[torch.Tensor]
     # Value-buffer row per key -- what forward and backward both address values
     # with. It differs from ``slot_indices`` for a table that stores a row per
@@ -275,16 +272,6 @@ def refresh_slots_after_rehash(state: DynamicEmbTableState, batch) -> None:
     )[-1]
     batch.slot_indices = torch.where(batch.slot_indices >= 0, slots, batch.slot_indices)
     batch.key_map_generation = state.key_map_generation
-
-
-def _is_hbm_storage(storage: Storage) -> bool:
-    """True if values live in GPU device memory (HBM). Use buffer type, not
-    tensor.is_cuda: host memory registered to CUDA address space can report is_cuda True.
-    """
-    return (
-        isinstance(storage, DynamicEmbStorage)
-        and storage._state.tables[0].is_device_buffer()
-    )
 
 
 def _apply_admission(
@@ -494,7 +481,7 @@ def _insert_into_storage(
         next_tier.insert(evicted_keys, evicted_table_ids, evicted_values)
 
 
-def _prefetch_cache_path(
+def _prefetch_inclusive_cache_path(
     cache: DynamicEmbCache,
     storage: DynamicEmbStorage,
     unique_keys: torch.Tensor,
@@ -509,7 +496,7 @@ def _prefetch_cache_path(
     external_storage: Optional[Storage] = None,
     key_scores: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Cache prefetch with counter protection and overflow buffer.
+    """Cache prefetch with counter protection and overflow buffer (CachePath.INCLUSIVE).
 
     ``storage`` is the tier that owns every key's score; the cache above it
     ranks by timestamp only, and holds the freshest value of a key until it is
@@ -529,7 +516,7 @@ def _prefetch_cache_path(
 
     Returns (slot_indices, non_admitted_positions).
     """
-    with torch.cuda.nvtx.range("_prefetch_cache_path"):
+    with torch.cuda.nvtx.range("_prefetch_inclusive_cache_path"):
         device = unique_keys.device
         state = cache._state
 
@@ -896,6 +883,7 @@ def dynamicemb_prefetch(
     offsets: torch.Tensor,
     cache: Optional[Cache],
     storage: Storage,
+    storage_layout: StorageLayout,
     feature_offsets: torch.Tensor,
     initializer: MultiTableInitializer,
     forward_stream: Optional[torch.cuda.Stream] = None,
@@ -907,6 +895,10 @@ def dynamicemb_prefetch(
     table_gate: Optional[Callable[[], ContextManager]] = None,
 ) -> PrefetchState:
     """Unified prefetch for all storage types (cache, HBM-direct, generic).
+
+    ``storage_layout`` says where the values are (see :class:`StorageLayout`); its
+    ``cache_path`` says what a cache sits on: under NINE, ``storage`` is the
+    external store itself and ``external_storage`` is unused.
 
     Returns a PrefetchState containing unique embeddings + optimizer states
     and the metadata needed by forward/backward.
@@ -927,7 +919,6 @@ def dynamicemb_prefetch(
         emb_dtype = storage.embedding_dtype()
         max_emb_dim = storage.max_embedding_dim()
         max_val_dim = storage.max_value_dim()
-        caching = cache is not None
 
         evict_strat = EvictStrategy(evict_strategy.value) if evict_strategy else None
         # todo: double check
@@ -968,41 +959,59 @@ def dynamicemb_prefetch(
         non_admitted_positions = None
         value_row_indices = None
         key_map_generation = 0
-        if caching:
-            storage_mode = StorageMode.CACHE
-        elif _is_hbm_storage(storage):
-            storage_mode = StorageMode.HBM_DIRECT
-        else:
-            storage_mode = StorageMode.DEFAULT
 
         with table_section(table_gate):
             if hasattr(storage, "expand_if_need"):
                 storage.expand_if_need(unique_size_per_table)
 
-            if storage_mode == StorageMode.CACHE:
-                (
-                    slot_indices,
-                    non_admitted_positions,
-                ) = _prefetch_cache_path(
-                    cache,
-                    storage,
-                    unique_keys,
-                    unique_table_ids,
-                    max_emb_dim,
-                    max_val_dim,
-                    emb_dtype,
-                    initializer,
-                    evict_strat,
-                    lfu_accumulated_frequency,
-                    admitter,
-                    external_storage,
-                    key_scores=unique_scores,
-                )
+            if storage_layout.caching:
+                if storage_layout.cache_path == CachePath.NINE:
+                    # Imported here: the path module imports helpers from this one.
+                    from dynamicemb.lookup_paths.nine_cache_path import (
+                        prefetch_nine_cache_path,
+                    )
+
+                    (
+                        slot_indices,
+                        non_admitted_positions,
+                    ) = prefetch_nine_cache_path(
+                        cache,
+                        storage,
+                        unique_keys,
+                        unique_table_ids,
+                        max_emb_dim,
+                        max_val_dim,
+                        emb_dtype,
+                        initializer,
+                        evict_strat,
+                        lfu_accumulated_frequency,
+                        admitter,
+                        key_scores=unique_scores,
+                    )
+                else:
+                    (
+                        slot_indices,
+                        non_admitted_positions,
+                    ) = _prefetch_inclusive_cache_path(
+                        cache,
+                        storage,
+                        unique_keys,
+                        unique_table_ids,
+                        max_emb_dim,
+                        max_val_dim,
+                        emb_dtype,
+                        initializer,
+                        evict_strat,
+                        lfu_accumulated_frequency,
+                        admitter,
+                        external_storage,
+                        key_scores=unique_scores,
+                    )
                 # The cache addresses its own value buffer by cache slot: a cache is
                 # never NO_EVICTION (it enables overflow, which NO_EVICTION rejects
                 # at construction), so the two index spaces coincide here.
                 value_row_indices = slot_indices
-            elif storage_mode == StorageMode.HBM_DIRECT:
+            elif storage_layout.hbm_direct:
                 (
                     slot_indices,
                     non_admitted_positions,
@@ -1029,7 +1038,8 @@ def dynamicemb_prefetch(
             table_num=table_num,
             emb_dtype=emb_dtype,
             slot_indices=slot_indices,
-            storage_mode=storage_mode,
+            storage_layout=storage_layout,
+            slot_owner=cache if storage_layout.caching else storage,
             non_admitted_positions=non_admitted_positions,
             unique_scores=unique_scores,
             value_row_indices=value_row_indices,
@@ -1272,20 +1282,17 @@ def _generic_forward_path(
 
 
 def release_slot_pins(
-    cache: Optional[Cache],
-    storage: Storage,
-    storage_mode: StorageMode,
+    slot_owner: Union[Cache, Storage],
     slot_indices: torch.Tensor,
     unique_table_ids: torch.Tensor,
 ) -> None:
     """Undo the ref-counter pins that prefetch took on ``slot_indices``.
 
-    The counter sits beside the hash table of whichever of ``cache`` / ``storage``
-    served the batch, and is indexed by hash slot (not by value row). Called by
+    The counter sits beside the hash table of ``slot_owner`` (the cache or the
+    storage that served the batch), and is indexed by hash slot (not by value row). Called by
     backward, or by a forward that has no backward (no autograd graph).
     """
-    counter_owner = cache if storage_mode == StorageMode.CACHE else storage
-    counter_owner.decrement_counter(slot_indices, unique_table_ids)
+    slot_owner.decrement_counter(slot_indices, unique_table_ids)
 
 
 class DynamicEmbeddingFunction(torch.autograd.Function):
@@ -1328,11 +1335,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             # rows to write and read back in between.
             direct = False
             if use_counter:
-                state = (
-                    cache._state
-                    if prefetch_state.storage_mode == StorageMode.CACHE
-                    else storage._state
-                )
+                state = prefetch_state.slot_owner._state
                 direct = (
                     not is_pooling
                     and prefetch_state.non_admitted_positions is None
@@ -1367,7 +1370,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 unique_values = None
                 persisted_unique_indices = None
             else:
-                assert prefetch_state.storage_mode == StorageMode.DEFAULT
+                assert not prefetch_state.storage_layout.caching
                 evict_strat = (
                     EvictStrategy(evict_strategy.value) if evict_strategy else None
                 )
@@ -1450,14 +1453,13 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             # The backward reads key i's gradient from the row its output took.
             ctx.out_rows = out_rows
             ctx.unique_table_ids = prefetch_state.unique_table_ids
-            ctx.cache = cache
             ctx.storage = storage
             ctx.slot_indices = prefetch_state.slot_indices
             # Same split as the forward: the fused optimizer writes into the
             # value buffer (rows), the ref counter is indexed by hash slot.
             ctx.update_value_rows = prefetch_state.value_row_indices
             ctx.key_map_generation = prefetch_state.key_map_generation
-            ctx.storage_mode = prefetch_state.storage_mode
+            ctx.slot_owner = prefetch_state.slot_owner
             ctx.optimizer = optimizer
             ctx.layout = layout
             ctx.offsets = offsets
@@ -1474,7 +1476,6 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grads):
         with torch.cuda.nvtx.range("DynamicEmbeddingFunction.backward"):
-            cache = ctx.cache
             storage = ctx.storage
             optimizer = ctx.optimizer
             grads = grads.contiguous()
@@ -1515,11 +1516,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
             with torch.cuda.nvtx.range("DynamicEmbeddingFunction.update"):
                 if ctx.use_counter:
-                    state = (
-                        cache._state
-                        if ctx.storage_mode == StorageMode.CACHE
-                        else storage._state
-                    )
+                    state = ctx.slot_owner._state
                     # A later batch's prefetch may have rehashed the table
                     # since this one's prefetch (prefetch pipelines, several
                     # forwards before their backwards).
@@ -1541,9 +1538,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         )
 
                     release_slot_pins(
-                        cache,
-                        storage,
-                        ctx.storage_mode,
+                        ctx.slot_owner,
                         ctx.slot_indices,
                         ctx.unique_table_ids,
                     )

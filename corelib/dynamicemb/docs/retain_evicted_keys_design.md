@@ -56,7 +56,7 @@ module-level test caught it):
 - **(A) the `storage.insert` path** → `key_value_table._insert_key_values`. Used
   by: a direct `storage.insert` (`DynamicEmbStorage` / the host tier of
   `HybridStorage`), the caching-mode cache-eviction write-back to backing
-  (`_prefetch_cache_path`), and `_generic_forward_path`.
+  (`_prefetch_inclusive_cache_path`), and `_generic_forward_path`.
 - **(B) the forward HBM-direct path** →
   `batched_dynamicemb_function._prefetch_hbm_direct_path`. Used by **non-caching
   training forward** (single-tier HBM `DynamicEmbStorage`), which calls

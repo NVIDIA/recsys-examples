@@ -2753,14 +2753,19 @@ class DynamicEmbCache(Cache):
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Lookup with overflow fallback. Returns (score_out, founds, indices)."""
+        """Lookup with overflow fallback. Returns (score_out, founds, indices).
+
+        ``key_scores`` is for a cache that owns scores (the NINE path); the cache
+        of the inclusive path ranks by timestamp and takes neither input.
+        """
         state = self._state
         score_arg = get_find_score_arg(
             state,
             unique_keys.size(0),
             unique_keys.device,
-            score_source(state, lfu_accumulated_frequency),
+            score_source(state, lfu_accumulated_frequency, key_scores),
         )
         result = state.key_index_map.lookup_with_overflow(
             unique_keys, table_ids, score_arg
@@ -4474,20 +4479,30 @@ def _write_back_evicted(
 
 def flush_cache(
     cache: DynamicEmbCache,
-    storage: DynamicEmbStorage,
+    storage: Storage,
     external_storage: Optional[Storage] = None,
+    *,
+    cache_owns_scores: bool = False,
 ) -> None:
     """Push every cache entry's value down, as the prefetch path does on eviction.
 
-    Storage keeps the scores, so a key it still has only has its value
-    updated. One it has evicted goes to ``external_storage``, or is dropped
-    when there is none: it is not re-inserted, which would evict another row.
+    Inclusive path (the default): storage keeps the scores, so a key it still has
+    only has its value updated. One it has evicted goes to ``external_storage``, or
+    is dropped when there is none: it is not re-inserted, which would evict
+    another row.
+
+    NINE path (``cache_owns_scores``): ``storage`` is the external store itself, and
+    the cache owns the scores, so each entry goes down with its score.
     """
     state = cache._state
     batch_size = state.threads_in_wave
 
     for t in range(state.num_tables):
-        for keys, _, indices in state.key_index_map._batched_export_keys_scores(
+        for (
+            keys,
+            named_scores,
+            indices,
+        ) in state.key_index_map._batched_export_keys_scores(
             [state.score_policy.name],
             state.device,
             batch_size=batch_size,
@@ -4496,7 +4511,10 @@ def flush_cache(
         ):
             tid = torch.full((keys.numel(),), t, dtype=torch.int64, device=keys.device)
             values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE)
-            _write_back_evicted(storage, external_storage, keys, tid, values)
+            if cache_owns_scores:
+                storage.insert(keys, tid, values, named_scores[state.score_policy.name])
+            else:
+                _write_back_evicted(storage, external_storage, keys, tid, values)
 
 
 # ---------------------------------------------------------------------------

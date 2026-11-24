@@ -31,11 +31,9 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     EmbOptimType,
 )
-from dynamicemb.batched_dynamicemb_tables import (
-    BatchedDynamicEmbeddingTablesV2,
-    StorageLayout,
-)
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.extendable_tensor import DeviceExtendableBuffer
+from dynamicemb.state.storage_layout import CachePath, StorageLayout, StorageTier
 
 DIM = 16
 ROWS = 64 * 1024  # a multiple of every bucket width involved, so nothing rounds
@@ -74,9 +72,9 @@ def build(current_device: int, budgets: List[int], caching: bool):
 
 def hbm_tier(model):
     """The state holding the HBM rows of a model that splits its rows."""
-    if model._storage_layout == StorageLayout.CACHING:
+    if model._storage_layout.caching:
         return model._cache._state
-    assert model._storage_layout == StorageLayout.HYBRID
+    assert model._storage_layout == StorageLayout(StorageTier.HBM | StorageTier.DDR)
     return model._storage._hbm
 
 
@@ -106,8 +104,9 @@ def test_each_table_keeps_its_own_share(current_device, caching):
     model = build(
         current_device, [TABLE_BYTES // 16, TABLE_BYTES * 3 // 4], caching=caching
     )
-    assert model._storage_layout == (
-        StorageLayout.CACHING if caching else StorageLayout.HYBRID
+    assert model._storage_layout == StorageLayout(
+        StorageTier.HBM | StorageTier.DDR,
+        CachePath.INCLUSIVE if caching else None,
     )
 
     hbm = hbm_tier(model)
@@ -151,13 +150,13 @@ def test_zero_hbm_budget_takes_caching_off_the_table(current_device, budget):
         with pytest.warns(UserWarning, match="local_hbm_for_values of zero"):
             model = build(current_device, [0], caching=True)
         assert model._cache is None
-        assert model._storage_layout == StorageLayout.HOST_ONLY
+        assert model._storage_layout == StorageLayout(StorageTier.DDR)
         # More unique keys than the former one-bucket cache plus its overflow
         # (1024 + 3 * 1024 rows) could ever hold.
         train_one_step(model, current_device, bags=8192)
     else:
         model = build(current_device, [budget], caching=True)
-        assert model._storage_layout == StorageLayout.CACHING
+        assert model._storage_layout.caching
         assert model._cache is not None
 
 
@@ -177,6 +176,24 @@ def test_a_group_that_fits_its_summed_budget_stays_in_hbm(current_device):
     although it is the first table."""
     model = build(current_device, [0, 2 * TABLE_BYTES], caching=False)
 
-    assert model._storage_layout == StorageLayout.HBM_ONLY
+    assert model._storage_layout == StorageLayout(StorageTier.HBM)
     assert_on_device(model._storage._state)
     train_one_step(model, current_device)
+
+
+@pytest.mark.parametrize(
+    "max_capacity, frac, bucket, expected",
+    [
+        (64 * 1024, 0.25, 1024, 16 * 1024),  # already whole buckets
+        (1000, 0.25, 128, 128),  # 250 rows: down to one bucket of 128
+        (1000, 0.5, 128, 384),  # 500 rows: down to 3 buckets
+        (1 << 20, 0.0, 128, 128),  # no budget: one bucket, not one row
+        (1 << 20, 1.0, 128, 1 << 20),
+    ],
+)
+def test_a_budget_share_is_whole_buckets_and_at_least_one(
+    max_capacity, frac, bucket, expected
+):
+    from dynamicemb.batched_dynamicemb_tables import _budget_capacity
+
+    assert _budget_capacity(max_capacity, frac, bucket) == expected

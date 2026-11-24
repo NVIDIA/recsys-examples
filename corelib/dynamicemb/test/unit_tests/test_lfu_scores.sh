@@ -12,7 +12,7 @@ BATCH_SIZE=32
 NUM_ITERATIONS=10
 TOLERANCE=0.0
 
-# HybridStorage + StorageMode DEFAULT (no cache); see test_embedding_admission.sh
+# HybridStorage + the generic prefetch path (no cache); see test_embedding_admission.sh
 GLOBAL_HBM_BUDGET_SCALE_DEFAULT=0.25
 
 # Cache configurations
@@ -51,7 +51,7 @@ for dedup_flag in "${DEDUP_FLAGS[@]}"; do
     for optimizer_type in ${OPTIMIZER_TYPE[@]}; do
       echo ""
       echo "----------------------------------------"
-      echo "Test: StorageMode DEFAULT / Hybrid ($dedup_label) | GPUs: $num_gpus | Optimizer: $optimizer_type | HBM scale: $GLOBAL_HBM_BUDGET_SCALE_DEFAULT"
+      echo "Test: the generic prefetch path / Hybrid ($dedup_label) | GPUs: $num_gpus | Optimizer: $optimizer_type | HBM scale: $GLOBAL_HBM_BUDGET_SCALE_DEFAULT"
       echo "----------------------------------------"
       torchrun \
         --nnodes 1 \

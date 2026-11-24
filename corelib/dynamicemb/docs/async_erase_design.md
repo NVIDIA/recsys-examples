@@ -28,7 +28,7 @@
 | `CACHE` (`DynamicEmbCache` over a `DynamicEmbStorage`) | yes | only the backing storage is erased, the cache is left alone; see §5 |
 | `DEFAULT` (host values, no `PrefetchState`) | **no** | no ref counter: a key can be erased between forward and the key-based write-back in backward |
 | `HybridStorage` | **no** | two tiers, no ref counter in use |
-| `CACHE` with an `external_storage` (`CACHING_PS`), or the PS alone (`HOST_PS`) | **no** | erase drops data that is no longer used, so it has nothing to do with a PS; the table is rejected rather than left with a stale copy there (§5, consequence 2) |
+| `CACHE` with an `external_storage` (an `EXTERNAL` tier under a cache), or the PS alone | **no** | erase drops data that is no longer used, so it has nothing to do with a PS; the table is rejected rather than left with a stale copy there (§5, consequence 2) |
 
 An unsupported layout is rejected at call time (an error, not a silent skip), but only
 when a table of the module would be scanned: a module with no table that qualifies
@@ -41,7 +41,7 @@ answers with an already-finished handle, whatever its layout.
    event or CPU lock on the table path.
 2. **A prefetched batch borrows slots until backward.** Prefetch resolves keys to
    `slot_indices` (kept in `PrefetchState`) and `increment_counter`s them; backward
-   `decrement_counter`s them (`_prefetch_cache_path`, `_prefetch_hbm_direct_path`,
+   `decrement_counter`s them (`_prefetch_inclusive_cache_path`, `_prefetch_hbm_direct_path`,
    backward).
 3. **The ref counter is the existing pin.** The evict kernel re-reads `counter[slot]`
    after `try_lock` and skips a slot with `counter > 0`. `_ref_counter` used to be
@@ -131,7 +131,7 @@ worker is a new one (a lock and an event belong to one process and device).
 - **Prefetch** (`dynamicemb_prefetch(..., table_gate=...)`) takes a section from
   `expand_if_need` through the find and the `increment_counter`, for both storage
   modes. Two things were moved to before the section, because they do not read the
-  tables: `expand_table_ids_cuda` and the choice of `storage_mode`. The rest of
+  tables: `expand_table_ids_cuda` and the choice of the path (cache, HBM-direct, generic). The rest of
   `dynamicemb_prefetch` is unchanged apart from indentation.
 - **Erase** takes a section per chunk of its scan (§4.8, `_erase_state_by_score`). Inside
   it the key map and the table's bucket range are read **again** each time: between two
@@ -329,7 +329,7 @@ the way a cached copy of any key storage has evicted does.
 Why that is safe (checked, not assumed):
 
 - **Scores live only in storage.** The cache ranks by timestamp, and prefetch
-  `_find_keys` every key in storage, hits included (step 2 of `_prefetch_cache_path`).
+  `_find_keys` every key in storage, hits included (step 2 of `_prefetch_inclusive_cache_path`).
   "Score below the threshold" is decided on storage.
 - **"In storage but not in cache" and "in cache but not in storage" are both already
   legal states.** `_write_back_evicted` looks each key the cache evicts up in storage: one
@@ -473,8 +473,8 @@ reader from seeing a half-filled buffer.
 - **Chunk size: 2^22 slots**, in whole buckets, clamped to the table's own bucket range
   (§4.8), a parameter. **The key map is read again for every chunk**, and a table's scan
   restarts if its key map was replaced (`key_map_generation`).
-- **`external_storage`: not supported.** A table whose layout has a PS (`CACHING_PS`,
-  `HOST_PS`) is rejected at call time, like `DEFAULT` and `HybridStorage`.
+- **`external_storage`: not supported.** A table whose layout has the `EXTERNAL` tier
+  (`StorageLayout.tiers`) is rejected at call time, like `DEFAULT` and `HybridStorage`.
 - **Return value**: the number erased and the number spared (a key whose score is below
   the threshold but that was pinned, so it stays).
 - **`NO_EVICTION` tables can be erased**, as `(NO_EVICTION, CUSTOMIZED)` /

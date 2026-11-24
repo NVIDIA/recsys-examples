@@ -1351,8 +1351,8 @@ component is `per_rank_storage`, which reads each table's own.
 grouping key, so a group where one member asks for caching and another does not
 cannot form -- `any(option.caching ...)` in the runtime is `all` of them, and a
 "mixed caching group" is not a reachable state. And an external store is
-accounted for: it zeroes the host tier in the two layouts that have a backing
-tier to move, CACHING_PS and HOST_PS. `HybridStorage` ignores `external_storage`
+accounted for: it zeroes the host tier in the layouts that have a backing
+tier to move: an external store under a cache, or alone (`StorageTier.EXTERNAL`). `HybridStorage` ignores `external_storage`
 and warns, so its host tier is local and is counted, which is correct.
 
 Both are read only *after* the group is found not to fit, as the runtime reads

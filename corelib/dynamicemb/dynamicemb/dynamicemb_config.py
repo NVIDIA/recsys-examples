@@ -571,6 +571,11 @@ class DynamicEmbTableOptions:
         A value of zero also turns ``caching`` off for the table, with a
         warning -- a cache is an HBM tier the table has no budget for (see
         :func:`normalize_caching_against_hbm_budget`).
+    local_ddr_for_values : int
+        Host memory (DDR) allocated for the values of the ``DynamicEmbStorage``
+        tier, in bytes. Default is 0. With ``DynamicEmbeddingShardingPlanner``, this
+        is set to ``ceil(global_ddr_for_values / fanout)`` per rank. It only matters
+        for a caching table with an ``external_storage``; see ``global_ddr_for_values``.
     device_id : Optional[int], optional
         CUDA device index.
     training: bool
@@ -658,9 +663,29 @@ class DynamicEmbTableOptions:
         It has different meanings under `caching=True` and  `caching=False`.
             When `caching=False`, it decides how much GPU memory is in the total memory to store value in a single hybrid table.
             When `caching=True`, it decides the table capacity of the GPU table.
+    global_ddr_for_values : int
+        Total host memory (DDR) allocated to the values of the ``DynamicEmbStorage`` tier
+        of a caching table, in bytes. Default is 0 (unset). It is only read when
+        ``caching=True`` **and** ``external_storage`` is given, and then it selects the
+        cache path (see ``external_storage``). Without an ``external_storage`` the
+        ``DynamicEmbStorage`` always holds the whole table and this is ignored, with a
+        warning if it is set.
     external_storage: Storage
         The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
         If not provided, will using DynamicEmbeddingTable as the Storage.
+        Under ``caching=True`` the cache path follows from it:
+            * no ``external_storage``: the **inclusive** path, HBM cache ⊂ ``DynamicEmbStorage``
+              (which holds the whole table). The cache ranks by timestamp only and the
+              storage owns every key's score.
+            * ``external_storage`` and ``global_ddr_for_values > 0``: the **inclusive** path,
+              HBM cache ⊂ ``DynamicEmbStorage`` (sized by ``local_ddr_for_values``) with the
+              ``external_storage`` below it, which receives what the storage evicts.
+            * ``external_storage`` and ``global_ddr_for_values`` unset: the **NINE**
+              (non-inclusive, non-exclusive) path, HBM cache + ``external_storage``, with no
+              ``DynamicEmbStorage``. The store is opaque, so a key may be in both, and the
+              cache owns the scores, so it keeps the table's own ``score_strategy`` (a single
+              strategy: a compound one, which keeps two score words, is not supported here).
+        ``NO_EVICTION`` is not supported with an ``external_storage``.
     index_type : Optional[torch.dtype], optional
         Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
     dist_type : str
@@ -727,6 +752,7 @@ class DynamicEmbTableOptions:
     global_capacity: Optional[int] = None
     evict_strategy: DynamicEmbEvictStrategy = DynamicEmbEvictStrategy.LRU
     local_hbm_for_values: int = 0  # in bytes
+    local_ddr_for_values: int = 0  # in bytes
     device_id: Optional[int] = None
 
     training: bool = True
@@ -748,6 +774,7 @@ class DynamicEmbTableOptions:
     bucket_capacity: int = DEFAULT_BUCKET_CAPACITY
     safe_check_mode: DynamicEmbCheckMode = DynamicEmbCheckMode.IGNORE
     global_hbm_for_values: int = 0  # in bytes
+    global_ddr_for_values: int = 0  # in bytes
     external_storage: Storage = None
     index_type: Optional[torch.dtype] = None
     dist_type: str = "roundrobin"
@@ -1383,8 +1410,10 @@ def get_group_value_bytes_by_tier(
     rest go to the host -- and under ``caching`` the HBM is a cache in front of
     a host tier holding every row rather than a disjoint partition, so the host
     figure is the whole thing rather than the remainder. An
-    external store takes that backing tier off this box, which is honoured in
-    the two layouts that have one to move -- CACHING_PS and HOST_PS.
+    external store takes that backing tier off this box: under ``caching`` the
+    host keeps only what the ``local_ddr_for_values`` budget buys (the
+    DynamicEmbStorage between cache and PS; nothing when it is unset, the NINE
+    cache path), and an external store alone keeps nothing.
     ``HybridStorage`` ignores it and warns, so its host tier is local and counts.
 
     An ``optimizer_type`` of ``None`` counts a table's rows without optimizer
@@ -1398,12 +1427,15 @@ def get_group_value_bytes_by_tier(
 
     total = 0
     hbm_budget = 0
+    # What the tables keep in the DynamicEmbStorage of a caching group with a PS.
+    ddr_kept = 0
     # What the tables keep in HBM when the group does not fit: each its own
     # budget, up to its own size.
     hbm_kept = 0
     for options, optimizer_type in members:
         budget = options.local_hbm_for_values
         hbm_budget += budget
+        ddr = options.local_ddr_for_values
         dim = options.dim
         dtype = options.embedding_dtype
         if not dim or dtype is None or not options.max_capacity:
@@ -1411,6 +1443,7 @@ def get_group_value_bytes_by_tier(
             # lone unsized table still reports (budget, 0).
             total += budget
             hbm_kept += budget
+            ddr_kept += ddr
             continue
         state_dim = (
             get_optimizer_state_dim(optimizer_type, dim, dtype)
@@ -1420,6 +1453,7 @@ def get_group_value_bytes_by_tier(
         table_bytes = options.max_capacity * DTYPE_NUM_BYTES[dtype] * (dim + state_dim)
         total += table_bytes
         hbm_kept += min(table_bytes, budget)
+        ddr_kept += min(table_bytes, ddr)
 
     first = members[0][0]
     caching = first.caching
@@ -1433,7 +1467,12 @@ def get_group_value_bytes_by_tier(
     # a 20 GiB budget cost 20 + 4 where the runtime spends 4 and nothing.
     if total > hbm_budget:
         if caching:
-            return hbm_kept, 0 if external else total
+            if not external:
+                return hbm_kept, total
+            # With a PS the host tier is the DynamicEmbStorage the ddr budget
+            # buys (each table its own share, up to its own size), or none
+            # at all on the NINE path, where the PS is the only backing.
+            return hbm_kept, ddr_kept
         if external and hbm_budget <= 0:
             return 0, 0
         return hbm_kept, total - hbm_kept

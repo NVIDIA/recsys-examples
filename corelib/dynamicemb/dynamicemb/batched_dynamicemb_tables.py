@@ -19,7 +19,6 @@ import warnings
 from collections import deque
 from copy import deepcopy
 from dataclasses import dataclass
-from enum import Enum
 from itertools import accumulate
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -36,7 +35,6 @@ from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
     OutputAlloc,
     PrefetchState,
-    StorageMode,
     dynamicemb_eval_forward,
     dynamicemb_prefetch,
     refresh_slots_after_rehash,
@@ -95,6 +93,7 @@ from dynamicemb.optimizer import (
     SGDDynamicEmbeddingOptimizer,
     get_optimizer_state_dim,
 )
+from dynamicemb.state.storage_layout import CachePath, StorageLayout, StorageTier
 from dynamicemb.types import ReplayStats
 from dynamicemb.utils import (
     DTYPE_NUM_BYTES,
@@ -112,13 +111,17 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
 from torch import Tensor, nn  # usort:skip
 
 
-class StorageLayout(Enum):
-    HBM_ONLY = "HBM-only (single tier, GPU)"
-    HOST_ONLY = "Host-only (single tier, CPU)"
-    HYBRID = "Hybrid (HBM + Host, disjoint partitions; total = HBM + Host)"
-    CACHING = "Caching (HBM cache + Host full backing; HBM rows duplicate Host)"
-    CACHING_PS = "Caching (HBM cache + external PS backing; HBM rows duplicate PS)"
-    HOST_PS = "External PS only (host-resident, opaque)"
+def _budget_capacity(max_capacity: int, frac: float, bucket_capacity: int) -> int:
+    """Rows a ``frac`` share of a table's ``max_capacity`` buys, in whole buckets.
+
+    The hash table rounds a capacity up to whole buckets, so a share that is not
+    one would hold more than its budget: round down, but to one bucket at least
+    (a table cannot have fewer, so a share of 0 is one bucket, not one row).
+    """
+    return max(
+        bucket_capacity,
+        int(max_capacity * frac) // bucket_capacity * bucket_capacity,
+    )
 
 
 def _tier_bytes_from_state(state) -> List[Tuple[int, int, int, int, int, int]]:
@@ -278,22 +281,26 @@ def _print_memory_consume(
     """
     # Build (tier_label, per-table rows) list. Each row is the 6-tuple above.
     tiers: List[Tuple[str, List[Tuple]]] = []
-    if layout == StorageLayout.HBM_ONLY:
+    present = layout.tiers
+    if layout.caching:
+        tiers.append(
+            (f"hbm cache/cuda:{device_id}", _tier_bytes_from_state(cache._state))
+        )
+        if StorageTier.DDR in present:
+            label = (
+                "host storage"
+                if StorageTier.EXTERNAL in present
+                else "host backing (full)"
+            )
+            tiers.append((label, _tier_bytes_from_state(storage._state)))
+    elif present == StorageTier.HBM:
         tiers.append((f"hbm/cuda:{device_id}", _tier_bytes_from_state(storage._state)))
-    elif layout == StorageLayout.HOST_ONLY:
+    elif present == StorageTier.DDR:
         tiers.append(("host (CPU)", _tier_bytes_from_state(storage._state)))
-    elif layout == StorageLayout.HYBRID:
+    elif present == StorageTier.HBM | StorageTier.DDR:
         tiers.append((f"hbm/cuda:{device_id}", _tier_bytes_from_state(storage._hbm)))
         tiers.append(("host (CPU)", _tier_bytes_from_state(storage._host)))
-    elif layout == StorageLayout.CACHING:
-        tiers.append(
-            (f"hbm cache/cuda:{device_id}", _tier_bytes_from_state(cache._state))
-        )
-        tiers.append(("host backing (full)", _tier_bytes_from_state(storage._state)))
-    elif layout == StorageLayout.CACHING_PS:
-        tiers.append(
-            (f"hbm cache/cuda:{device_id}", _tier_bytes_from_state(cache._state))
-        )
+    if StorageTier.EXTERNAL in present:
         tiers.append(
             (
                 "external PS",
@@ -302,17 +309,8 @@ def _print_memory_consume(
                 ),
             )
         )
-    elif layout == StorageLayout.HOST_PS:
-        tiers.append(
-            (
-                "external PS",
-                _tier_bytes_from_options(
-                    dynamicemb_options, optimizer, emb_optimizer_type
-                ),
-            )
-        )
-    else:
-        raise ValueError(f"Unhandled StorageLayout: {layout!r}")
+    if not tiers:
+        raise ValueError(f"Unhandled StorageLayout: {layout}")
 
     # Pick a single unit (MB if any value reaches 1 MB; else KB).
     max_byte = 0
@@ -343,8 +341,8 @@ def _print_memory_consume(
         _build_tier_block(label, rows, table_names, F) for label, rows in tiers
     ]
     body = _render_tier_table(header, tier_blocks)
-    output = f"\n\nStorage layout: {layout.value}\n" + body
-    if layout in (StorageLayout.CACHING, StorageLayout.CACHING_PS):
+    output = f"\n\nStorage layout: {layout}\n" + body
+    if layout.caching:
         output += (
             "\nNote: HBM cache rows duplicate backing rows; "
             "total memory ≈ HBM cache + Host/PS backing (no subtract)."
@@ -737,47 +735,121 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         "Can't use caching mode as the reserved HBM size is too small."
                     )
 
+                PS = self._dynamicemb_options[0].external_storage
+                if PS and any(
+                    has_no_eviction(option.score_strategy)
+                    for option in self._dynamicemb_options
+                ):
+                    # The cache rejects NO_EVICTION (it enables overflow, see
+                    # create_table_state), and a NO_EVICTION storage never
+                    # evicts, so nothing would ever reach a PS below it.
+                    raise NotImplementedError(
+                        "NO_EVICTION is not supported with external_storage."
+                    )
+                local_ddr = sum(
+                    option.local_ddr_for_values for option in self._dynamicemb_options
+                )
+                # What a cache sits on, from the options (see CachePath): our own
+                # storage whenever there is no PS, or the PS comes with a DDR
+                # budget for it; else the PS alone.
+                cache_path = (
+                    CachePath.NINE if PS and local_ddr <= 0 else CachePath.INCLUSIVE
+                )
+                if cache_path == CachePath.NINE and any(
+                    isinstance(option.score_strategy, tuple)
+                    for option in self._dynamicemb_options
+                ):
+                    # The cache owns the scores here and the PS is handed one
+                    # word per key; a compound strategy keeps two (LruLfu), which
+                    # the cache's refused-key report and the write-back cannot carry.
+                    raise NotImplementedError(
+                        "A compound score_strategy (e.g. (TIMESTAMP, LFU)) is not "
+                        "supported with an external_storage and no "
+                        "global_ddr_for_values (the cache-over-PS NINE path). Give "
+                        "the tables a global_ddr_for_values budget, or use a single "
+                        "score_strategy."
+                    )
+                if not PS and any(
+                    option.global_ddr_for_values > 0 or option.local_ddr_for_values > 0
+                    for option in self._dynamicemb_options
+                ):
+                    warnings.warn(
+                        "global_ddr_for_values is ignored without an "
+                        "external_storage: the DynamicEmbStorage below the cache "
+                        "then holds the whole table.",
+                        UserWarning,
+                    )
+
                 cache_options = deepcopy(self._dynamicemb_options)
                 for cache_option, frac in zip(cache_options, hbm_fractions):
                     cache_option.bucket_capacity = 1024
-                    cap = max(1, int(cache_option.max_capacity * frac))
+                    cap = _budget_capacity(
+                        cache_option.max_capacity, frac, cache_option.bucket_capacity
+                    )
                     cache_option.max_capacity = min(cache_option.max_capacity, cap)
                     cache_option.init_capacity = min(cache_option.max_capacity, cap)
 
-                # The cache ranks by timestamp only; the backing storage is the
-                # full set and owns every key's score (and the no-eviction mode,
-                # which cache overflow rejects, see create_table_state).
-                for cache_option in cache_options:
-                    cache_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
-                    cache_option.evict_strategy = DynamicEmbEvictStrategy.LRU
+                if cache_path == CachePath.INCLUSIVE:
+                    # The cache ranks by timestamp only; the storage below it is
+                    # a superset and owns every key's score (and the no-eviction
+                    # mode, which cache overflow rejects, see create_table_state).
+                    for cache_option in cache_options:
+                        cache_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
+                        cache_option.evict_strategy = DynamicEmbEvictStrategy.LRU
+                # Under NINE the cache keeps the table's own strategy: it owns
+                # the scores, and the PS only stores what it is given.
 
                 self._cache = DynamicEmbCache(cache_options, self._optimizer)
 
                 storage_options = deepcopy(self._dynamicemb_options)
                 for storage_option in storage_options:
                     storage_option.local_hbm_for_values = 0
-                PS = storage_options[0].external_storage
-                if PS and has_no_eviction(storage_options[0].score_strategy):
-                    # NO_EVICTION storage never evicts (it expands instead), so
-                    # nothing would ever spill to the PS; see _insert_into_storage.
-                    raise NotImplementedError(
-                        "NO_EVICTION is not supported with external_storage: the "
-                        "storage expands instead of evicting, so a PS below it "
-                        "would never be used."
+                if cache_path == CachePath.NINE:
+                    # No storage of ours: the PS is the tier below the cache.
+                    self._storage = PS(storage_options, self._optimizer)
+                    self._storage_layout = StorageLayout(
+                        StorageTier.HBM | StorageTier.EXTERNAL, cache_path
                     )
-                # Under a cache the cache pins the slots a batch uses, never the
-                # storage's, so its per-slot reference counter would only take
-                # (a lot of) memory.
-                self._storage = DynamicEmbStorage(
-                    storage_options, self._optimizer, use_ref_counter=False
-                )
-                if PS:
-                    # The PS sits below the storage: the storage owns scores and
-                    # the freshest values, the PS only holds what it evicted.
-                    self._external_storage = PS(storage_options, self._optimizer)
-                self._storage_layout = (
-                    StorageLayout.CACHING_PS if PS else StorageLayout.CACHING
-                )
+                else:
+                    # The PS (if any) is built on the whole table's options, as
+                    # it owns whatever the storage cannot hold.
+                    ps_options = deepcopy(storage_options)
+                    if PS:
+                        # Each table keeps the share its own DDR budget buys.
+                        for storage_option, nbytes in zip(storage_options, table_bytes):
+                            frac = (
+                                min(1.0, storage_option.local_ddr_for_values / nbytes)
+                                if nbytes > 0
+                                else 1.0
+                            )
+                            cap = _budget_capacity(
+                                storage_option.max_capacity,
+                                frac,
+                                storage_option.bucket_capacity,
+                            )
+                            storage_option.max_capacity = min(
+                                storage_option.max_capacity, cap
+                            )
+                            storage_option.init_capacity = min(
+                                storage_option.init_capacity or cap, cap
+                            )
+                    # Under a cache the cache pins the slots a batch uses, never
+                    # the storage's, so its per-slot reference counter would only
+                    # take (a lot of) memory.
+                    self._storage = DynamicEmbStorage(
+                        storage_options, self._optimizer, use_ref_counter=False
+                    )
+                    if PS:
+                        # The PS sits below the storage: the storage owns scores
+                        # and the freshest values, the PS only holds what it
+                        # evicted.
+                        self._external_storage = PS(ps_options, self._optimizer)
+                    self._storage_layout = StorageLayout(
+                        StorageTier.HBM
+                        | StorageTier.DDR
+                        | (StorageTier.EXTERNAL if PS else StorageTier(0)),
+                        cache_path,
+                    )
             else:
                 # No caching and no HBM budget for values: single-tier host/PS storage.
                 if local_hbm <= 0:
@@ -802,8 +874,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                             storage_options, self._optimizer, use_ref_counter=False
                         )
                     )
-                    self._storage_layout = (
-                        StorageLayout.HOST_PS if PS else StorageLayout.HOST_ONLY
+                    self._storage_layout = StorageLayout(
+                        StorageTier.EXTERNAL if PS else StorageTier.DDR
                     )
                 else:
                     # No caching: HybridStorage (HBM tier + host tier)
@@ -856,7 +928,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     self._storage = HybridStorage(
                         hbm_options, host_options, self._optimizer
                     )
-                    self._storage_layout = StorageLayout.HYBRID
+                    self._storage_layout = StorageLayout(
+                        StorageTier.HBM | StorageTier.DDR
+                    )
         else:
             # HBM-only: everything fits in GPU memory.
             if any(
@@ -869,7 +943,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     UserWarning,
                 )
             self._storage = DynamicEmbStorage(self._dynamicemb_options, self._optimizer)
-            self._storage_layout = StorageLayout.HBM_ONLY
+            self._storage_layout = StorageLayout(StorageTier.HBM)
 
         _print_memory_consume(
             self._table_names,
@@ -1099,7 +1173,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     def flush(self) -> None:
         if self._caching and self._cache is not None:
-            flush_cache(self._cache, self._storage, self._external_storage)
+            flush_cache(
+                self._cache,
+                self._storage,
+                self._external_storage,
+                cache_owns_scores=self._storage_layout.cache_path == CachePath.NINE,
+            )
 
     def reset_cache_states(self) -> None:
         if self._caching and self._cache is not None:
@@ -1232,7 +1311,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
 
         if not self.training:
-            if self._external_storage is not None:
+            # Evaluation reads the cache and the one storage below it. A PS that
+            # is that storage (NINE, or EXTERNAL only) is read; a PS behind our
+            # own storage (HBM|DDR|EXTERNAL) is not, so a key spilled to it
+            # would be treated as missing.
+            tiers = self._storage_layout.tiers
+            if StorageTier.EXTERNAL in tiers and StorageTier.DDR in tiers:
                 raise RuntimeError(
                     "Evaluation does not read external_storage: a key spilled to "
                     "it would be treated as missing. Train with external_storage "
@@ -1292,17 +1376,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # Grad-mode forwards keep their slot pins until backward. Without an
         # autograd graph, release on this stream after the gather consumed them.
         if not res.requires_grad and prefetch_state.slot_indices is not None:
-            owner = (
-                self._cache
-                if prefetch_state.storage_mode == StorageMode.CACHE
-                else self._storage
-            )
+            owner = prefetch_state.slot_owner
             # A later batch's prefetch may have rehashed the table since this one's.
             refresh_slots_after_rehash(owner._state, prefetch_state)
             release_slot_pins(
-                self._cache,
-                self._storage,
-                prefetch_state.storage_mode,
+                owner,
                 prefetch_state.slot_indices,
                 prefetch_state.unique_table_ids,
             )
@@ -1398,6 +1476,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 offsets,
                 self._cache,
                 self._storage,
+                self._storage_layout,
                 self.feature_offsets,
                 self._initializer,
                 forward_stream,
@@ -1462,12 +1541,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 result[table_name] = self._scores[table_name]
         return result
 
-    # What a storage layout lets an erase by score do. Only a single-tier GPU storage
-    # and the backing storage of a cache keep a key map the erase can scan; the others
-    # keep their keys where it cannot (host values read by the generic path, two tiers,
-    # an external store).
-    _ERASABLE_LAYOUTS = (StorageLayout.HBM_ONLY, StorageLayout.CACHING)
-
     def erasable_table_ids(self, score_strategy: DynamicEmbScoreStrategy) -> List[int]:
         """The tables an erase by ``score_strategy`` would scan, after checking that it can.
 
@@ -1486,11 +1559,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 isinstance(part, tuple) and score_strategy in part
             ):
                 table_ids.append(table_id)
-        if table_ids and self._storage_layout not in self._ERASABLE_LAYOUTS:
+        if table_ids and not self._storage_layout.erasable:
             raise NotImplementedError(
                 "erase by score needs the keys in a GPU hash table: HBM-only storage, "
                 "or a cache over host storage with no external storage. This module "
-                f"is {self._storage_layout.name}."
+                f"is {self._storage_layout}."
             )
         return table_ids
 
