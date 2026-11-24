@@ -124,6 +124,15 @@ def prefetch_nine_cache_path(
                 ) = flagged_compact(is_new, [miss_keys, miss_tids, miss_freq, miss_pos])
             if num_new > 0:
                 admit_mask = admitter.admit(new_keys, new_tids, new_freq)
+                if (
+                    miss_score_input is not None
+                    and new_freq is not None
+                    and state.evict_strategy == EvictStrategy.KLfu
+                ):
+                    # An LFU score is a frequency: the admitter hands back each
+                    # key's running total in the frequencies it was given, so a
+                    # key that waited several batches enters with its full count.
+                    miss_score_input[new_rows] = new_freq
                 admitted[new_rows] = admit_mask
                 with torch.cuda.nvtx.range("op:flagged_compact"):
                     num_refused, _, (refused_pos,) = flagged_compact(

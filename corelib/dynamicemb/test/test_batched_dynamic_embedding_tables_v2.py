@@ -1015,6 +1015,20 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         )
 
         h_table_ids = table_ids.cpu()
+        if (
+            lfu_accumulated_frequency is not None
+            and self.options[0].score_strategy == DynamicEmbScoreStrategy.LFU
+        ):
+            # An LFU score accumulates: what a key is found with is the count
+            # the store kept for it plus this batch's, and the store keeps that.
+            h_keys = unique_keys.cpu()
+            h_freq = lfu_accumulated_frequency.cpu()
+            h_founds = founds.cpu()
+            for i in h_founds.nonzero().flatten().tolist():
+                composite_key = (h_table_ids[i].item(), h_keys[i].item())
+                total = self.scores.get(composite_key, 0) + h_freq[i].item()
+                self.scores[composite_key] = total
+                output_scores[i] = total
         missing_table_ids_list = []
         for idx in missing_indices.cpu().tolist():
             missing_table_ids_list.append(h_table_ids[idx].item())
@@ -4205,6 +4219,74 @@ def test_caching_ps_takes_the_evictions(nine):
         # every key.
         bdebt.flush()
         assert ps.size() >= 32
+
+
+def test_caching_nine_ps_lfu_admission_carries_the_accumulated_count():
+    """NINE with an LFU table and frequency admission: a key enters the cache
+    with the count it waited with, and a key the PS keeps comes back with the
+    count the PS kept plus this batch's -- not the frequency of the batch alone."""
+    from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
+
+    device = torch.device("cuda:0")
+    threshold = 3
+    options = DynamicEmbTableOptions(
+        dim=8,
+        max_capacity=256,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=0,
+        score_strategy=DynamicEmbScoreStrategy.LFU,
+        caching=True,
+        local_hbm_for_values=1024,
+        external_storage=PyDictStorage,
+        admit_strategy=FrequencyAdmissionStrategy(
+            threshold=threshold, counter=KVCounter(capacity=4096)
+        ),
+    )
+    bdebt = BatchedDynamicEmbeddingTablesV2(
+        table_names=["t0"],
+        table_options=[options],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=EmbOptimType.SGD,
+        use_index_dedup=True,
+        learning_rate=0.1,
+    )
+    assert bdebt._storage_layout.cache_path == CachePath.NINE
+    ps = bdebt._storage
+    assert isinstance(ps, PyDictStorage)
+
+    def lookup(keys):
+        keys = torch.tensor(keys, dtype=torch.int64, device=device)
+        offsets = torch.tensor([0, keys.numel()], dtype=torch.int64, device=device)
+        out = bdebt(keys, offsets)
+        out.mean().backward()
+        torch.cuda.synchronize()
+
+    def score(key):
+        return ps.scores.get((0, key))
+
+    hot = 7
+    # Seen once: waiting in the counter, not admitted.
+    lookup([hot])
+    # Seen twice more, 3 in all: admitted, with the whole count it waited with
+    # (this batch alone would be 2).
+    lookup([hot, hot])
+    bdebt.flush()
+    assert score(hot) == 3, f"admitted with {score(hot)}, expected 3"
+
+    # Keys seen 4 times each, in one batch, outrank it, so a full bucket gives up
+    # the hot key first and the PS takes it with its count.
+    for start in range(1000, 1000 + 32 * 40, 32):
+        lookup([k for k in range(start, start + 32) for _ in range(4)])
+    assert (0, hot) in ps.dict, "the hot key was never evicted to the PS"
+    assert score(hot) == 3
+
+    # Back from the PS: its kept 3 plus this batch's 3. The batch alone (3) would
+    # rank it below the keys it has to displace.
+    lookup([hot, hot, hot])
+    bdebt.flush()
+    assert score(hot) == 6, f"back with {score(hot)}, expected 3 + 3"
 
 
 def test_caching_ps_below_storage_is_not_evaluated():
