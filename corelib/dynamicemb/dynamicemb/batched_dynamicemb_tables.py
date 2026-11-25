@@ -40,7 +40,7 @@ from dynamicemb.batched_dynamicemb_function import (
     refresh_slots_after_rehash,
     release_slot_pins,
 )
-from dynamicemb.checkpoint_io import (  # noqa: F401 - preserve checkpoint helper exports
+from dynamicemb.checkpoint.files import (  # noqa: F401 - preserve checkpoint helper exports
     encode_checkpoint_file_path,
     encode_counter_checkpoint_file_path,
     encode_meta_json_file_path,

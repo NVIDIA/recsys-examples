@@ -15,17 +15,12 @@
 
 import collections
 import contextlib
-import json
 import math
-import os
-import threading
-import warnings
 from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
     ContextManager,
-    Dict,
     Iterator,
     List,
     Optional,
@@ -34,10 +29,9 @@ from typing import (
     Tuple,
 )
 
-import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
-from dynamicemb.checkpoint_io import (  # noqa: F401 - preserve checkpoint helper exports
+from dynamicemb.checkpoint.files import (  # noqa: F401 - preserve checkpoint helper exports
     META_EMBEDDING_DIM,
     META_EMBEDDING_DTYPE,
     META_OPT_STATE_DTYPE,
@@ -46,7 +40,26 @@ from dynamicemb.checkpoint_io import (  # noqa: F401 - preserve checkpoint helpe
     dtype_from_meta_name,
     dtype_to_meta_name,
     load_from_json,
+    _raw_bytes,
     resolve_checkpoint_value_layout,
+    save_to_json,
+)
+from dynamicemb.checkpoint.state_dump import (  # noqa: F401 (re-exported)
+    _all_gather_dumped_columns,
+    _dump_table,
+    export_keys_values_iter,
+)
+from dynamicemb.checkpoint.state_load import (  # noqa: F401 (re-exported)
+    _count_owned_keys,
+    _load_key_values,
+    _validate_load_meta,
+    check_dist_type_migration,
+    suppress_layout_warnings,
+)
+from dynamicemb.checkpoint.state_replay import (  # noqa: F401 (re-exported)
+    _replay_at_slots,
+    _replay_state_increment,
+    _replay_write_values,
 )
 from dynamicemb.dynamicemb_config import (
     DynamicEmbScoreStrategy,
@@ -66,7 +79,6 @@ from dynamicemb.extendable_tensor import (
     ExtendableBuffer,
     HostExtendableBuffer,
 )
-from dynamicemb.key_ownership import OwnershipRule
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import (
     ScoreArg,
@@ -88,107 +100,29 @@ from dynamicemb.score.args import (  # noqa: F401 (re-exported)
     score_source,
 )
 from dynamicemb.score.spec import get_score_policy  # noqa: F401 (re-exported)
+from dynamicemb.state.value_rows import (  # noqa: F401 (re-exported)
+    _row_differs_from_slot,
+    load_from_flat,
+    load_from_flat_by,
+    load_from_flat_single_table,
+    store_to_flat,
+    store_to_flat_single_table,
+)
 from dynamicemb.types import (
-    EMBEDDING_TYPE,
-    KEY_TYPE,
-    OPT_STATE_TYPE,
     SCORE_TYPE,
     Cache,
     CopyMode,
     ReplayStats,
     Storage,
-    torch_dtype_to_np_dtype,
 )
 from dynamicemb.utils import checkpoint_dtype, decode_table_values, encode_table_values
 from dynamicemb_extensions import EvictStrategy, device_timestamp, flagged_compact
-from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
-from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
-from dynamicemb_extensions import load_from_flat_table_value as _load_value
 from dynamicemb_extensions import segmented_sum_cuda, select_insert_failed_values
-from dynamicemb_extensions import store_to_flat_table_contiguous as _store_contiguous
-from dynamicemb_extensions import store_to_flat_table_value as _store_value
 from torch import Tensor, nn  # usort:skip
 
 # ---------------------------------------------------------------------------
 # Utility helpers
 # ---------------------------------------------------------------------------
-
-
-def _all_gather_dumped_columns(
-    columns: List[Tensor],
-    pg: dist.ProcessGroup,
-) -> List[Tensor]:
-    """Gather a set of row-aligned dump columns from all ranks into CPU tensors.
-
-    Every tensor in *columns* must live on the same device and share ``size(0)``
-    (the per-rank dumped-key count); trailing dimensions may differ (e.g. keys
-    ``(N,)``, values ``(N, D)``, scores ``(N, W)``). Returns the same columns with
-    all ranks' rows concatenated in rank order, on host and still row-aligned.
-
-    NCCL has no variable-length gather, so this is one size all_gather followed by
-    a padded all_gather per column.
-    """
-    assert columns, "_all_gather_dumped_columns needs at least one column"
-    device = columns[0].device
-    world_size = dist.get_world_size(group=pg)
-    n = columns[0].size(0)
-    d_count = torch.tensor([n], dtype=torch.long, device=device)
-    gathered_counts = [torch.empty_like(d_count) for _ in range(world_size)]
-    dist.all_gather(gathered_counts, d_count, group=pg)
-    counts = [int(c.item()) for c in gathered_counts]
-    max_n = max(counts)
-
-    out: List[Tensor] = []
-    for col in columns:
-        padded = torch.zeros(
-            (max_n,) + tuple(col.shape[1:]), dtype=col.dtype, device=device
-        )
-        if n > 0:
-            padded[:n] = col
-        gathered = [torch.empty_like(padded) for _ in range(world_size)]
-        dist.all_gather(gathered, padded, group=pg)
-        out.append(
-            torch.cat(
-                [gathered[i][: counts[i]] for i in range(world_size)], dim=0
-            ).cpu()
-        )
-    return out
-
-
-# ---------------------------------------------------------------------------
-# Utility helpers (continued)
-# ---------------------------------------------------------------------------
-
-
-def save_to_json(data: Dict[str, Any], file_path: str) -> None:
-    try:
-        with open(file_path, "w") as json_file:
-            json.dump(data, json_file, indent=4)
-    except Exception as e:
-        raise RuntimeError(f"Error saving data to JSON file: {e}")
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint value layout
-#
-# Key / embedding / score / optimizer-state files are bare row-major blobs with
-# no header, so the table's meta JSON is the only record of how to read them
-# back. Embeddings and optimizer states are dumped at the table's own precision
-# (``DynamicEmbTableState.emb_dtype``) rather than being upcast to fp32, which
-# makes ``embedding_dtype`` and ``embedding_dim`` load-bearing rather than
-# decorative. Checkpoints written before those keys existed are always fp32, and
-# their dim is recoverable from the file size -- see
-# :func:`resolve_checkpoint_value_layout`.
-# ---------------------------------------------------------------------------
-
-
-def _raw_bytes(tensor: torch.Tensor) -> bytes:
-    """Little-endian raw bytes of *tensor*, for any dtype it can hold.
-
-    Views as uint8 instead of going through ``numpy().tobytes()`` because numpy
-    has no bfloat16, and value files now carry the table's own precision.
-    """
-    return tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
 
 
 def get_uvm_tensor(dim, dtype, device, is_managed=False):
@@ -1118,12 +1052,6 @@ def expand_if_need_impl(
 # ---------------------------------------------------------------------------
 
 
-def _row_differs_from_slot(state: DynamicEmbTableState) -> bool:
-    """Whether a key's value row is not its hash slot, i.e. the table stores a row
-    per key (``use_rows``). A dumped ``slot_index`` then has to carry both."""
-    return getattr(state.key_index_map, "use_rows_", False)
-
-
 def _encode_slot_index(
     state: DynamicEmbTableState,
     slot_indices: torch.Tensor,
@@ -1187,131 +1115,6 @@ def _split_value_row(
     return (
         emb,
         state.optimizer.states_for_checkpoint(opt, emb_dim).contiguous(),
-    )
-
-
-def load_from_flat(
-    state: DynamicEmbTableState,
-    indices: torch.Tensor,
-    table_ids: torch.Tensor,
-    copy_mode: CopyMode,
-) -> torch.Tensor:
-    # The key map hands rows back on the host after a dump.
-    indices = indices.to(device=state.device, dtype=torch.int64)
-    N = indices.numel()
-    if copy_mode == CopyMode.EMBEDDING:
-        max_dim = state.emb_dim
-        _load = _load_emb
-    else:
-        max_dim = state.value_dim
-        _load = _load_value
-    output = torch.empty(N, max_dim, dtype=state.emb_dtype, device=state.device)
-    if N > 0:
-        _load(
-            state.table_ptrs_dev,
-            indices,
-            table_ids,
-            output,
-            state.table_value_dims,
-            state.table_emb_dims,
-            state.emb_dim,
-            state.all_dims_vec4,
-        )
-    return output
-
-
-def load_from_flat_by(
-    state: DynamicEmbTableState,
-    indices: torch.Tensor,
-    table_ids: torch.Tensor,
-    entry_of_row: torch.Tensor,
-    out: torch.Tensor,
-    out_rows: Optional[torch.Tensor] = None,
-) -> None:
-    """Into row i of ``out`` (``[entry_of_row.numel(), columns]``, of the
-    tables' dtype; row ``out_rows[i]`` with ``out_rows``, int32) the embedding
-    of row ``indices[entry_of_row[i]]`` of table ``table_ids[entry_of_row[i]]``;
-    rows whose index is negative are left as they are."""
-    _load_emb(
-        state.table_ptrs_dev,
-        indices,
-        table_ids,
-        out,
-        state.table_value_dims,
-        state.table_emb_dims,
-        state.emb_dim,
-        state.all_dims_vec4,
-        entry_of_row,
-        out_rows,
-    )
-
-
-def store_to_flat(
-    state: DynamicEmbTableState,
-    indices: torch.Tensor,
-    table_ids: torch.Tensor,
-    values: torch.Tensor,
-) -> None:
-    if values.dim() == 1:
-        values = values.unsqueeze(1)
-    _store_value(
-        state.table_ptrs_dev,
-        indices,
-        table_ids,
-        encode_table_values(values, state.emb_dtype),
-        state.table_value_dims,
-        state.table_emb_dims,
-        state.emb_dim,
-        state.all_dims_vec4,
-    )
-
-
-def load_from_flat_single_table(
-    state: DynamicEmbTableState,
-    indices: torch.Tensor,
-    table_id: int,
-) -> torch.Tensor:
-    """Load full values for a single table. Returns compact [N, value_dim_t]."""
-    indices = indices.to(device=state.device, dtype=torch.int64)
-    N = indices.numel()
-    vdim = state.table_value_dims_cpu[table_id]
-    output = torch.empty(N, vdim, dtype=state.emb_dtype, device=state.device)
-    if N > 0:
-        _load_contiguous(
-            state.table_ptrs_dev,
-            indices,
-            table_id,
-            output,
-            state.table_value_dims,
-            state.table_emb_dims,
-            state.emb_dim,
-            state.all_dims_vec4,
-        )
-    return output
-
-
-def store_to_flat_single_table(
-    state: DynamicEmbTableState,
-    indices: torch.Tensor,
-    table_id: int,
-    values: torch.Tensor,
-) -> None:
-    """Store full values for a single table. Expects compact [N, value_dim_t]."""
-    indices = indices.to(device=state.device, dtype=torch.int64)
-    N = indices.numel()
-    if N == 0:
-        return
-    if values.dim() == 1:
-        values = values.unsqueeze(1)
-    _store_contiguous(
-        state.table_ptrs_dev,
-        indices,
-        table_id,
-        encode_table_values(values, state.emb_dtype),
-        state.table_value_dims,
-        state.table_emb_dims,
-        state.emb_dim,
-        state.all_dims_vec4,
     )
 
 
@@ -1587,552 +1390,6 @@ def _insert_and_evict_keys(
     )
 
 
-def export_keys_values_iter(
-    state: DynamicEmbTableState,
-    device: torch.device,
-    batch_size: int = 65536,
-    table_id: int = 0,
-) -> Iterator[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
-    """Export keys, embeddings, opt_states, scores for a logical table.
-
-    Embeddings and optimizer states come out at the table's own precision
-    (``state.emb_dtype``), matching what ``incremental_dump`` yields, so a
-    checkpoint stores what the table actually holds instead of an fp32 widening
-    of it. Callers that want fp32 cast on their own.
-    """
-    emb_dim_t = state.table_emb_dims_cpu[table_id]
-    vdim = state.table_value_dims_cpu[table_id]
-    optim_state_dim = vdim - emb_dim_t
-
-    for (
-        keys,
-        named_scores,
-        indices,
-        slots,
-    ) in state.key_index_map._batched_export_keys_scores(
-        [state.score_policy.name],
-        state.device,
-        batch_size=batch_size,
-        return_index=True,
-        return_slots=True,
-        table_id=table_id,
-    ):
-        scores = named_scores[state.score_policy.name]
-        flat_rows = indices
-        values = load_from_flat_single_table(state, flat_rows, table_id)
-        embeddings = decode_table_values(
-            values[:, :emb_dim_t], checkpoint_dtype(state.emb_dtype)
-        ).contiguous()
-        if optim_state_dim != 0:
-            opt_states = values[:, -optim_state_dim:].contiguous().to(device)
-        else:
-            opt_states = None
-        # Multi-word score layouts (e.g. LruLfu: timestamp + frequency) must
-        # persist ALL words, not just the exported column, so the checkpoint can
-        # restore them exactly. Gather the full [N, num_scores] block at the
-        # exported slots; single-score tables keep the [N] shape unchanged.
-        if state.key_index_map.num_scores_ > 1:
-            # Score blocks are keyed by slot; ``indices`` are rows for a table
-            # that stores them.
-            out_scores = state.key_index_map.gather_score_blocks(table_id, slots)
-            # Reorder the physical device layout into the user's configured
-            # (logical) score-column order so both the checkpoint and callers of
-            # export_keys_values see scores in the order they configured. Identity
-            # when the logical order matches the physical layout.
-            dump_perm = score_dump_permutation(
-                state.options_list[table_id].score_strategy
-            )
-            if dump_perm != list(range(out_scores.size(1))):
-                out_scores = out_scores[:, dump_perm].contiguous()
-        else:
-            out_scores = scores.to(SCORE_TYPE)
-        yield (
-            keys.to(device),
-            embeddings.to(device),
-            opt_states,
-            out_scores.to(device),
-        )
-
-
-def _dump_table(
-    state: DynamicEmbTableState,
-    table_id: int,
-    meta_json_file_path: str,
-    emb_key_path: str,
-    embedding_file_path: str,
-    score_file_path: str,
-    opt_file_path: str,
-    include_optim: bool,
-    include_meta: bool,
-    timestamp: int,
-    current_score: Optional[int] = None,
-    append: bool = False,
-) -> None:
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    if not append and include_meta:
-        meta_data = {}
-        meta_data.update(state.optimizer.get_opt_args())
-        meta_data["evict_strategy"] = str(state.evict_strategy)
-        meta_data["dist_type"] = state.options_list[table_id].dist_type
-        # How to read the value files back. They carry no header, so without
-        # these a loader can only assume the historical fp32 and guess the row
-        # width from the file length. Note this dict is rebuilt and rewritten
-        # whole on every dump (by rank 0 only, and not by the appending second
-        # tier of a hybrid dump): anything a loader needs has to be contributed
-        # here, because there is no later pass that merges into the file.
-        meta_data[META_EMBEDDING_DTYPE] = dtype_to_meta_name(
-            checkpoint_dtype(state.emb_dtype)
-        )
-        meta_data[META_EMBEDDING_DIM] = int(state.table_emb_dims_cpu[table_id])
-        # Recorded separately from the embedding dtype because the two can
-        # differ: rowwise Adagrad keeps its accumulator in fp32 in any table.
-        meta_data[META_OPT_STATE_DTYPE] = dtype_to_meta_name(
-            state.optimizer.get_state_dtype(state.emb_dtype)
-        )
-
-        if current_score is not None:
-            meta_data["step_score"] = current_score
-
-        save_to_json(meta_data, meta_json_file_path)
-
-    mode = "ab" if append else "wb"
-    fkey = open(emb_key_path, mode)
-    fembedding = open(embedding_file_path, mode)
-    fscore = open(score_file_path, mode)
-    fopt_states = open(opt_file_path, mode) if include_optim else None
-
-    for keys, embeddings, opt_states_batch, scores in export_keys_values_iter(
-        state, device=device, table_id=table_id
-    ):
-        fkey.write(keys.cpu().numpy().tobytes())
-        fembedding.write(_raw_bytes(embeddings))
-        if state.evict_strategy == EvictStrategy.KLru:
-            scores = timestamp - scores
-        fscore.write(scores.cpu().numpy().tobytes())
-        if fopt_states and opt_states_batch is not None:
-            to_write = state.optimizer.states_for_checkpoint(
-                opt_states_batch,
-                state.table_emb_dims_cpu[table_id],
-            )
-            fopt_states.write(_raw_bytes(to_write))
-
-    fkey.close()
-    fembedding.close()
-    if fscore:
-        fscore.close()
-    if fopt_states:
-        fopt_states.close()
-
-
-def _resolve_shard(
-    shard_index: Optional[int], num_shards: Optional[int]
-) -> Tuple[int, int]:
-    """The table's own shard geometry, or the global rank and world size (the
-    row-wise answer) when either half is left ``None``."""
-    if num_shards is None or shard_index is None:
-        num_shards = dist.get_world_size() if dist.is_initialized() else 1
-        shard_index = dist.get_rank() if dist.is_initialized() else 0
-    return shard_index, num_shards
-
-
-def _count_owned_keys(
-    emb_key_path: str,
-    device: torch.device,
-    dist_type: str,
-    batch_size: int = 65536,
-    shard_index: Optional[int] = None,
-    num_shards: Optional[int] = None,
-    global_capacity: Optional[int] = None,
-    bucket_capacity: Optional[int] = None,
-) -> int:
-    """How many of a checkpoint file's keys this rank keeps.
-
-    Reads only the key file, with the filter :func:`_iter_batches_from_files`
-    applies. A checkpoint can hold many ranks' keys while a rank keeps only its
-    own share, so the file's size is not what a rank has to make room for.
-    """
-    num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
-    shard_index, num_shards = _resolve_shard(shard_index, num_shards)
-    if num_shards <= 1:
-        return num_keys
-    rule = OwnershipRule(dist_type, num_shards, global_capacity, bucket_capacity)
-    owned = 0
-    with open(emb_key_path, "rb") as fkey:
-        for start in range(0, num_keys, batch_size):
-            n = min(num_keys - start, batch_size)
-            keys = torch.tensor(
-                np.frombuffer(
-                    fkey.read(KEY_TYPE.itemsize * n),
-                    dtype=torch_dtype_to_np_dtype[KEY_TYPE],
-                ),
-                dtype=KEY_TYPE,
-                device=device,
-            )
-            mask = rule.mask(keys, shard_index)
-            owned += int(mask.sum().item()) if mask is not None else n
-    return owned
-
-
-@dataclass
-class _LoadParams:
-    meta_data: Dict[str, Any]
-    dim: int
-    runtime_optstate_dim: int
-    file_optstate_dim: int
-    include_optim: bool
-    num_keys: int
-    # The table's key -> rank rule, already checked against the checkpoint's,
-    # with the parameters hash_bucket needs (None for the other rules).
-    dist_type: str
-    global_capacity: Optional[int] = None
-    bucket_capacity: Optional[int] = None
-    # Precisions the value files were written at, resolved from meta (fp32 for
-    # checkpoints predating it). Pass both to ``_iter_batches_from_files``.
-    emb_dtype: torch.dtype = EMBEDDING_TYPE
-    opt_state_dtype: torch.dtype = OPT_STATE_TYPE
-
-
-def check_dist_type_migration(
-    ckpt_dist_type: str, runtime_dist_type: str, meta_json_file_path: str
-) -> None:
-    """Refuse a load across ``dist_type`` when either side is ``continuous``.
-
-    A ``continuous`` table stores shard-local ids (the bucketizer rewrites a key
-    to ``key % block_size``), so two source shards can hold the same id for
-    different rows: re-partitioning those ids by another rule would merge
-    distinct rows and attach values to the wrong keys even with no bucket
-    overflowing. The other rules store the global key, so a key says which
-    rank owns it under any of them, and a migration between them is allowed
-    (lossy only where a bucket overflows).
-    """
-    if ckpt_dist_type == runtime_dist_type:
-        return
-    if "continuous" in (ckpt_dist_type, runtime_dist_type):
-        raise ValueError(
-            f"{meta_json_file_path}: checkpoint was dumped with dist_type "
-            f"{ckpt_dist_type!r} but the table uses {runtime_dist_type!r}. A "
-            "'continuous' table stores shard-local ids, which no other rule can "
-            "re-partition. Load it into a table of the same dist_type."
-        )
-
-
-# Layout warnings are said once per checkpoint table in a process: a load reads
-# one file per source shard, and the warning is about the table, not the file.
-_LAYOUT_WARNED: Set[str] = set()
-_layout_warnings_suppressed = threading.local()
-
-
-@contextlib.contextmanager
-def suppress_layout_warnings():
-    """Silence the per-file layout warnings of ``Storage.load``.
-
-    For a caller that has already said it once -- ``BatchedDynamicEmbeddingTablesV2.load``
-    warns per table on shard 0 before it hands the files to the storage.
-    """
-    previous = getattr(_layout_warnings_suppressed, "depth", 0)
-    _layout_warnings_suppressed.depth = previous + 1
-    try:
-        yield
-    finally:
-        _layout_warnings_suppressed.depth = previous
-
-
-def _warn_layout_once(meta_json_file_path: str, message: str) -> None:
-    if getattr(_layout_warnings_suppressed, "depth", 0) > 0:
-        return
-    if meta_json_file_path in _LAYOUT_WARNED:
-        return
-    _LAYOUT_WARNED.add(meta_json_file_path)
-    warnings.warn(message, UserWarning, stacklevel=3)
-
-
-def _validate_load_meta(
-    state: DynamicEmbTableState,
-    table_id: int,
-    meta_json_file_path: str,
-    emb_key_path: str,
-    embedding_file_path: str,
-    score_file_path: Optional[str],
-    opt_file_path: Optional[str],
-    include_optim: bool,
-    routing_options: Optional[DynamicEmbTableOptions] = None,
-) -> _LoadParams:
-    """Shared validation for checkpoint loading.
-
-    Reads meta JSON, validates opt_type / evict_strategy / dist_type, resolves
-    the value files' precision and row width, resolves include_optim, and checks
-    file-size consistency.
-
-    *routing_options* are the options the key -> rank rule is read from; they
-    default to this state's own, and a storage whose state is a rescaled tier
-    (``HybridStorage``) passes the tier that kept the shard's bucket capacity.
-    """
-    meta_data = load_from_json(meta_json_file_path)
-    opt_type = meta_data.get("opt_type", None)
-    # The optimizer checks only matter when the caller asked for its states.
-    if (
-        include_optim
-        and opt_type
-        and state.optimizer.get_opt_args().get("opt_type", None) != opt_type
-    ):
-        include_optim = False
-        print(
-            f"Optimizer type mismatch: {opt_type} != {state.optimizer.get_opt_args().get('opt_type')}. Will not load optimizer states."
-        )
-
-    evict_strategy = meta_data.get("evict_strategy", None)
-    if evict_strategy and str(state.evict_strategy) != evict_strategy:
-        raise ValueError(
-            f"Evict strategy mismatch: {evict_strategy} != {state.evict_strategy}"
-        )
-    if routing_options is None:
-        routing_options = state.options_list[table_id]
-    ckpt_dist_type = meta_data.get("dist_type", "roundrobin")
-    runtime_dist_type = routing_options.dist_type
-    runtime_global_capacity = getattr(routing_options, "global_capacity", None)
-    if runtime_dist_type != ckpt_dist_type:
-        check_dist_type_migration(
-            ckpt_dist_type, runtime_dist_type, meta_json_file_path
-        )
-        # Ownership is recomputed from the key by the *table's* rule, so a
-        # checkpoint written under another rule still loads -- provided every
-        # rank reads every file (BatchedDynamicEmbeddingTablesV2.load reads
-        # all files when the rules differ). Keys then land in buckets the
-        # source never grouped them by, and a full bucket evicts: a one-time
-        # loss on migration, which is why this is a warning and not silent.
-        _warn_layout_once(
-            meta_json_file_path,
-            f"{meta_json_file_path}: checkpoint was dumped with dist_type "
-            f"{ckpt_dist_type!r} but the table uses {runtime_dist_type!r}; keys "
-            "are re-partitioned by the table's rule, and rows may be lost where "
-            "a bucket overflows. Every rank must read every shard file.",
-        )
-    elif runtime_dist_type == "hash_bucket" and (
-        meta_data.get("global_capacity") != runtime_global_capacity
-        or meta_data.get("bucket_capacity") != routing_options.bucket_capacity
-    ):
-        _warn_layout_once(
-            meta_json_file_path,
-            f"{meta_json_file_path}: checkpoint has global bucket layout "
-            f"(global_capacity={meta_data.get('global_capacity')}, "
-            f"bucket_capacity={meta_data.get('bucket_capacity')}) but the table "
-            f"has ({runtime_global_capacity}, {routing_options.bucket_capacity}); "
-            "keys are re-partitioned by the table's layout, and rows may be lost "
-            "where a bucket overflows. Every rank must read every shard file.",
-        )
-
-    if score_file_path is None:
-        print(
-            f"Score file {score_file_path} does not exist. Will not load score states."
-        )
-
-    if include_optim and (not opt_file_path or not os.path.exists(opt_file_path)):
-        include_optim = False
-        print(
-            f"Optimizer file {opt_file_path} does not exist. Will not load optimizer states."
-        )
-
-    dim = state.table_emb_dims_cpu[table_id]
-    runtime_optstate_dim = state.optimizer.get_state_dim(dim)
-
-    if runtime_optstate_dim == 0:
-        include_optim = False
-
-    if include_optim:
-        state.optimizer.set_opt_args(meta_data)
-
-    num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
-    emb_dtype, opt_state_dtype, ckpt_emb_dim = resolve_checkpoint_value_layout(
-        meta_data, embedding_file_path, num_keys, dim
-    )
-    if ckpt_emb_dim != dim:
-        raise ValueError(
-            f"Embedding dim mismatch: {embedding_file_path} holds rows of "
-            f"{ckpt_emb_dim} but the runtime table is configured with dim {dim}."
-        )
-    if emb_dtype not in (state.emb_dtype, checkpoint_dtype(state.emb_dtype)):
-        # Not fatal: the insert path casts, so this is a deliberate precision
-        # migration as often as it is a mistake. Say which way it goes, since
-        # narrowing loses bits that the checkpoint still has.
-        warnings.warn(
-            f"Checkpoint {embedding_file_path} stores {emb_dtype} embeddings but "
-            f"the runtime table is {state.emb_dtype}; values will be converted on "
-            "load.",
-            UserWarning,
-            stacklevel=2,
-        )
-    if score_file_path and os.path.exists(score_file_path):
-        # The score file holds num_scores words per key (e.g. LruLfu = 2:
-        # timestamp + frequency), so compare against num_keys * num_scores.
-        per_key = state.key_index_map.num_scores_
-        num_score_words = os.path.getsize(score_file_path) // SCORE_TYPE.itemsize
-        if num_score_words != num_keys * per_key:
-            raise ValueError(
-                f"The number of keys in {emb_key_path} does not match with number of scores in {score_file_path}."
-            )
-
-    file_optstate_dim = 0
-    if include_optim and opt_file_path and os.path.exists(opt_file_path):
-        file_bytes = os.path.getsize(opt_file_path)
-        if num_keys == 0:
-            if file_bytes != 0:
-                raise ValueError(
-                    f"Optimizer state file {opt_file_path} is non-empty but key file has no keys."
-                )
-        else:
-            row_block = num_keys * opt_state_dtype.itemsize
-            if file_bytes % row_block != 0:
-                raise ValueError(
-                    f"Optimizer state file {opt_file_path} size {file_bytes} is not divisible by "
-                    f"{row_block} (num_keys={num_keys}, dtype itemsize={opt_state_dtype.itemsize})."
-                )
-            file_optstate_dim = file_bytes // row_block
-            ckpt_dim = state.optimizer.get_ckpt_state_dim(dim)
-            if file_optstate_dim != ckpt_dim:
-                raise ValueError(
-                    f"Optimizer state width in checkpoint is {file_optstate_dim}; expected "
-                    f"{ckpt_dim}."
-                )
-
-    return _LoadParams(
-        meta_data=meta_data,
-        dim=dim,
-        runtime_optstate_dim=runtime_optstate_dim,
-        file_optstate_dim=file_optstate_dim,
-        include_optim=include_optim,
-        num_keys=num_keys,
-        dist_type=runtime_dist_type,
-        global_capacity=runtime_global_capacity,
-        bucket_capacity=routing_options.bucket_capacity,
-        emb_dtype=emb_dtype,
-        opt_state_dtype=opt_state_dtype,
-    )
-
-
-def _load_key_values(
-    state: DynamicEmbTableState,
-    keys: torch.Tensor,
-    embeddings: torch.Tensor,
-    scores: Optional[torch.Tensor] = None,
-    opt_states: Optional[torch.Tensor] = None,
-    table_id: int = 0,
-) -> None:
-    dim = embeddings.size(1)
-    emb_dim_cfg = state.table_emb_dims_cpu[table_id]
-    runtime_optstate_dim = state.optimizer.get_state_dim(emb_dim_cfg)
-    if not keys.is_cuda:
-        raise RuntimeError("Keys must be on GPU")
-    if not embeddings.is_cuda:
-        raise RuntimeError("Embeddings must be on GPU")
-    if scores is not None and not scores.is_cuda:
-        raise RuntimeError("Scores must be on GPU")
-    if opt_states is not None and not opt_states.is_cuda:
-        raise RuntimeError("Opt states must be on GPU")
-
-    # Normalize the embeddings to the table's precision up front. A checkpoint
-    # may carry a different precision than the table (load converts -- see
-    # _validate_load_meta). The optimizer state is deliberately left alone:
-    # optimizer.states_from_checkpoint owns its conversion, because it need not
-    # be the table's dtype (rowwise Adagrad keeps an fp32 accumulator), and an
-    # elementwise cast here would round that accumulator away. The branch below
-    # only calls it when the state is non-empty, which is the case it casts.
-    embeddings = encode_table_values(embeddings, state.emb_dtype)
-
-    if opt_states is None and runtime_optstate_dim > 0:
-        opt_states = torch.empty(
-            keys.numel(),
-            runtime_optstate_dim,
-            dtype=state.emb_dtype,
-            device=embeddings.device,
-        )
-        state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
-    elif opt_states is not None and runtime_optstate_dim > 0:
-        opt_states = state.optimizer.states_from_checkpoint(
-            opt_states,
-            emb_dim_cfg,
-            state.emb_dtype,
-            embeddings.device,
-        )
-
-    # Both halves are already state.emb_dtype (normalized above), so this cat
-    # cannot silently widen the row via type promotion.
-    values = (
-        torch.cat(
-            [embeddings.view(-1, dim), opt_states.view(-1, runtime_optstate_dim)],
-            dim=-1,
-        )
-        if opt_states is not None
-        else embeddings
-    )
-
-    # Multi-word score layouts (LruLfu: timestamp + frequency) cannot be restored
-    # by a single-value insert (which only writes word 0). Place the keys, then
-    # scatter the full [N, num_scores] block. Placement uses the table's own
-    # policy with a zero frequency delta so that a full bucket evicts through the
-    # ranked LruLfu evictor (honoring a custom score_function); the scatter then
-    # overwrites both words.
-    num_scores = state.key_index_map.num_scores_
-    if num_scores > 1:
-        # Validate the score-block shape before scatter_score_blocks writes it
-        # into device memory: a malformed checkpoint (e.g. a 1-D score tensor)
-        # would otherwise produce out-of-bounds / wrong writes. Use ValueError
-        # (not assert) so the check survives `python -O`.
-        if (
-            scores is None
-            or scores.dim() != 2
-            or scores.size(1) != num_scores
-            or scores.size(0) != keys.numel()
-        ):
-            raise ValueError(
-                f"multi-word load expects [{keys.numel()}, {num_scores}] scores, "
-                f"got {None if scores is None else tuple(scores.shape)}"
-            )
-        tid_tensor = torch.full(
-            (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
-        )
-        place_arg = ScoreArg(
-            name=state.score_policy.name,
-            value=torch.zeros(keys.numel(), dtype=SCORE_TYPE, device=keys.device),
-            policy=state.score_policy.policy,
-        )
-        indices = state.key_index_map.insert(keys, tid_tensor, place_arg)
-        # The score blocks are keyed by slot, the values by row (the same thing
-        # unless the table stores rows).
-        state.key_index_map.scatter_score_blocks(
-            table_id,
-            state.key_index_map.slots_of(keys, tid_tensor),
-            scores.to(SCORE_TYPE).contiguous(),
-        )
-        store_to_flat_single_table(state, indices, table_id, values)
-        return
-
-    policy = ScorePolicy.ASSIGN
-    tid_tensor = torch.full(
-        (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
-    )
-
-    if state.score_policy.policy == ScorePolicy.FLAG:
-        # A table that keeps no score (NO_EVICTION alone): none is restored, but the
-        # keys loaded set their flag like any new key.
-        policy, scores = ScorePolicy.FLAG, None
-    elif scores is None:
-        assert (
-            state.evict_strategy == EvictStrategy.KLru
-        ), "scores is None for KLru evict strategy is allowed but will be deprecated in future."
-        policy = ScorePolicy.GLOBAL_TIMER
-    else:
-        scores = scores.to(SCORE_TYPE)
-
-    score_arg_insert = ScoreArg(
-        name=state.score_policy.name,
-        value=scores,
-        policy=policy,
-    )
-
-    indices = state.key_index_map.insert(keys, tid_tensor, score_arg_insert)
-    store_to_flat_single_table(state, indices, table_id, values)
-
-
 # ---------------------------------------------------------------------------
 # Replay – write an incremental_dump delta back into a table
 # ---------------------------------------------------------------------------
@@ -2141,196 +1398,6 @@ def _load_key_values(
 def _slice(t: Optional[torch.Tensor], start: int, end: int) -> Optional[torch.Tensor]:
     """Slice an optional column, keeping ``None`` as ``None``."""
     return None if t is None else t[start:end]
-
-
-def _replay_write_values(
-    state: DynamicEmbTableState,
-    table_id: int,
-    rows: torch.Tensor,
-    embeddings: torch.Tensor,
-    optimizer_states: Optional[torch.Tensor],
-    keep_optimizer: torch.Tensor,
-    content: ReplayContent,
-) -> None:
-    """Write a replayed row's value columns, per :class:`ReplayContent`.
-
-    A value row is an embedding followed by the optimizer state, and the two are
-    written together or not at all -- ``store_to_flat_single_table`` copies from
-    the row base, so there is no way to write the tail without the head. The
-    embedding is therefore always written, and the only choice is what the tail
-    gets:
-
-    - **With ``OPTIMIZER_STATE``**, the delta carries the whole row; write it as
-      it was dumped. Nothing is inferred.
-    - **Without it**, rows that already belonged to this same key keep their
-      state, because writing just the embedding columns leaves the tail
-      untouched. Every other row is new to this key, so its tail still holds the
-      previous occupant's moments and has to be reset by the optimizer.
-    """
-    if rows.numel() == 0:
-        return
-    emb_dim_cfg = state.table_emb_dims_cpu[table_id]
-    optstate_dim = state.optimizer.get_state_dim(emb_dim_cfg)
-    embeddings = encode_table_values(embeddings, state.emb_dtype)
-    want_opt = ReplayContent.OPTIMIZER_STATE in content and optstate_dim > 0
-
-    if optstate_dim == 0:
-        store_to_flat_single_table(state, rows, table_id, embeddings)
-        return
-
-    if want_opt:
-        if optimizer_states is None:
-            raise ValueError(
-                f"replay_increment: table {table_id} keeps optimizer state per "
-                "row, but the delta carries none. Drop "
-                "ReplayContent.OPTIMIZER_STATE, or replay a delta dumped from a "
-                "table with the same optimizer."
-            )
-        ckpt_dim = state.optimizer.get_ckpt_state_dim(emb_dim_cfg)
-        if optimizer_states.dim() != 2 or optimizer_states.size(1) != ckpt_dim:
-            raise ValueError(
-                f"replay_increment: table {table_id} dumps {ckpt_dim} "
-                f"optimizer-state column(s) per row, but the delta carries a "
-                f"block of shape {tuple(optimizer_states.shape)}."
-            )
-        # Back to the runtime width the fused value row expects.
-        opt = state.optimizer.states_from_checkpoint(
-            optimizer_states.to(device=embeddings.device),
-            emb_dim_cfg,
-            state.emb_dtype,
-            embeddings.device,
-        )
-        store_to_flat_single_table(
-            state, rows, table_id, torch.cat([embeddings, opt], dim=-1)
-        )
-        return
-
-    keep = keep_optimizer
-    if bool(keep.any()):
-        store_to_flat_single_table(state, rows[keep], table_id, embeddings[keep])
-    fresh = torch.logical_not(keep)
-    if bool(fresh.any()):
-        fresh_emb = embeddings[fresh]
-        opt_states = torch.empty(
-            (fresh_emb.size(0), optstate_dim),
-            dtype=state.emb_dtype,
-            device=fresh_emb.device,
-        )
-        state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
-        store_to_flat_single_table(
-            state,
-            rows[fresh],
-            table_id,
-            torch.cat([fresh_emb, opt_states], dim=-1),
-        )
-
-
-def _replay_at_slots(
-    state: DynamicEmbTableState,
-    table_id: int,
-    keys: torch.Tensor,
-    embeddings: torch.Tensor,
-    optimizer_states: Optional[torch.Tensor],
-    scores: Optional[torch.Tensor],
-    slot_index: torch.Tensor,
-    timestamp: int,
-    insert_score: int,
-    content: ReplayContent,
-) -> int:
-    """Write keys at the exact slots they held in the source table.
-
-    Every key must land: the caller has already established that this table's
-    layout matches the source's, so a slot that does not fall inside its key's
-    home bucket means the two have diverged anyway and the replay would silently
-    lose that key. Raises rather than writing a partial result.
-
-    Returns the number of keys written (always all of them, or it raised).
-    """
-    n = keys.numel()
-    device = state.device
-    if n == 0:
-        return 0
-    tids = torch.full((n,), table_id, dtype=torch.int64, device=device)
-
-    if _row_differs_from_slot(state):
-        # ``use_rows`` tables carry (key slot, value row) as ``[n, 2]``; every
-        # other table uses one index for both.
-        key_slots = slot_index[:, 0].contiguous()
-        value_rows = slot_index[:, 1].contiguous()
-    else:
-        key_slots = slot_index
-        value_rows = slot_index
-
-    # The score words are written with the key, so they are chosen here: either
-    # restored from the delta or minted as if the key had just been inserted.
-    if ReplayContent.SCORE in content and scores is not None:
-        score_block = _replay_score_block(state, table_id, scores, timestamp)
-    else:
-        score_block = _fresh_score_block(state, table_id, n, timestamp, insert_score)
-    status, same_key = state.key_index_map.scatter_keys_at_slots(
-        keys, tids, key_slots, score_block
-    )
-    placed = status >= 0
-    num_unplaced = int(n - placed.sum().item())
-    if num_unplaced:
-        example = int(keys[torch.logical_not(placed)][0].item())
-        raise RuntimeError(
-            f"replay_increment: {num_unplaced} of {n} keys could not be written "
-            f"at their source slot on table {table_id} (e.g. key {example}). "
-            "Either the slot falls outside its key's home bucket -- where no "
-            "lookup would ever probe it, meaning the target's hash layout "
-            "differs from the source's despite matching metadata -- or the slot "
-            "was held by another writer, meaning something ran against this "
-            "table concurrently with the replay. Replaying past either would "
-            "silently drop those keys."
-        )
-
-    if state.key_index_map.use_rows_:
-        # The key now sits at the source's slot; make it own the source's row.
-        # The row counter is set by the caller from the delta's metadata -- the
-        # rows named here are only the ones that changed.
-        state.key_index_map.set_rows(key_slots, table_id, value_rows)
-
-    _replay_write_values(
-        state, table_id, value_rows, embeddings, optimizer_states, same_key, content
-    )
-    return n
-
-
-def _replay_state_increment(
-    state: DynamicEmbTableState,
-    table_id: int,
-    keys: torch.Tensor,
-    values: torch.Tensor,
-    optimizer_states: Optional[torch.Tensor],
-    scores: Optional[torch.Tensor],
-    slot_index: torch.Tensor,
-    timestamp: int,
-    insert_score: int,
-    content: ReplayContent,
-) -> ReplayStats:
-    """Replay one delta batch into a single table state (one storage tier)."""
-    stats = ReplayStats()
-    n = keys.numel()
-    if n == 0:
-        return stats
-    device = state.device
-    keys = keys.to(device=device, dtype=state.key_index_map.key_type)
-    embeddings = encode_table_values(values.to(device=device), state.emb_dtype)
-    slots = slot_index.to(device=device, dtype=torch.int64)
-    stats.upserted = _replay_at_slots(
-        state,
-        table_id,
-        keys,
-        embeddings,
-        optimizer_states,
-        scores,
-        slots,
-        timestamp,
-        insert_score,
-        content,
-    )
-    return stats
 
 
 def _erase_state_keys(

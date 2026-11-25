@@ -16,8 +16,8 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from .key_ownership import OwnershipRule
-from .types import (
+from dynamicemb.key_ownership import OwnershipRule
+from dynamicemb.types import (
     EMBEDDING_TYPE,
     KEY_TYPE,
     OPT_STATE_TYPE,
@@ -452,3 +452,34 @@ def _iter_batches_from_files(
             fscore.close()
         if fopt:
             fopt.close()
+
+
+def save_to_json(data: Dict[str, Any], file_path: str) -> None:
+    try:
+        with open(file_path, "w") as json_file:
+            json.dump(data, json_file, indent=4)
+    except Exception as e:
+        raise RuntimeError(f"Error saving data to JSON file: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint value layout
+#
+# Key / embedding / score / optimizer-state files are bare row-major blobs with
+# no header, so the table's meta JSON is the only record of how to read them
+# back. Embeddings and optimizer states are dumped at the table's own precision
+# (``DynamicEmbTableState.emb_dtype``) rather than being upcast to fp32, which
+# makes ``embedding_dtype`` and ``embedding_dim`` load-bearing rather than
+# decorative. Checkpoints written before those keys existed are always fp32, and
+# their dim is recoverable from the file size -- see
+# :func:`resolve_checkpoint_value_layout`.
+# ---------------------------------------------------------------------------
+
+
+def _raw_bytes(tensor: torch.Tensor) -> bytes:
+    """Little-endian raw bytes of *tensor*, for any dtype it can hold.
+
+    Views as uint8 instead of going through ``numpy().tobytes()`` because numpy
+    has no bfloat16, and value files now carry the table's own precision.
+    """
+    return tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
