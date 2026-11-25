@@ -368,7 +368,7 @@ class LinearBucketTable(ScoredHashTable):
         # cubin; ensure the packaged fatbins are loaded into the C++ side before
         # any eviction. The default (Lex) evictor needs no numba.
         if len(self.score_types_) > 1:
-            from dynamicemb.jit.score_jit import ensure_lex_fatbin_loaded
+            from dynamicemb.score.jit import ensure_lex_fatbin_loaded
 
             ensure_lex_fatbin_loaded()
 

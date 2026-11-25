@@ -317,7 +317,7 @@ def compile_evict_fatbins():
 
     nvcc = os.path.join(CUDA_HOME or "/usr/local/cuda", "bin", "nvcc")
     src = str(root_path / EVICT_TU)
-    out_dir = root_path / library_name / "jit"
+    out_dir = root_path / library_name / "score" / "fatbin"
     out_dir.mkdir(parents=True, exist_ok=True)
     # Match the main extension's nvcc flags (get_extensions): the fatbin TU
     # compiles the same kernels.cuh / <cub/cub.cuh> / cooperative_groups headers,
@@ -472,8 +472,8 @@ class NinjaBuildExtension(BuildExtension):
         # wheel/install -- copy them in now. Inplace builds import straight from
         # the source tree and don't need this.
         if not self.inplace:
-            src_dir = root_path / library_name / "jit"
-            dst_dir = os.path.join(self.build_lib, library_name, "jit")
+            src_dir = root_path / library_name / "score" / "fatbin"
+            dst_dir = os.path.join(self.build_lib, library_name, "score", "fatbin")
             os.makedirs(dst_dir, exist_ok=True)
             for fb in sorted(src_dir.glob("*.fatbin")):
                 shutil.copy2(str(fb), dst_dir)
@@ -503,7 +503,7 @@ setup(
     ),
     options={} if BUILD_TRAINING else {"build": {"build_base": "build_cpu"}},
     package_data={
-        f"{library_name}.jit": ["*.fatbin"] if BUILD_TRAINING else [],
+        f"{library_name}.score": ["fatbin/*.fatbin"] if BUILD_TRAINING else [],
         f"{library_name}.exportable_embedding": [
             "_C.so",
             "_C_legacy.so",

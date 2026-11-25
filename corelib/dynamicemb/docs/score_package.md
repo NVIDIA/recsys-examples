@@ -12,6 +12,8 @@ checkpoint.
 | `args.py` | `ScoreArg` (the score one call is given), `score_source`, `get_find_score_arg`, `get_insert_score_arg` |
 | `checkpoint_columns.py` | the score columns of a dump and of a replay: ages instead of timestamps, logical column order |
 | `kjt.py` | `ScoredKeyedJaggedTensor`, the input that carries one score per key |
+| `jit.py` | the JIT glue of the `(TIMESTAMP, LFU)` eviction kernel: it links a user's score function into the packaged fatbins |
+| `fatbin/` | the eviction fatbins `setup.py` builds from `src/jit/` (generated, not in git) |
 
 The old import paths (`dynamicemb_config`, `key_value_table`, `scored_hashtable`)
 still re-export the names that moved, so existing code keeps working.

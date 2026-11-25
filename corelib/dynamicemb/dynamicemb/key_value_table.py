@@ -375,7 +375,7 @@ def create_table_state(
         score_policy.policy == ScorePolicy.LRU_LFU
         and base_opt.score_function is not None
     ):
-        from dynamicemb.jit.score_jit import register_score_function
+        from dynamicemb.score.jit import register_score_function
 
         cc_major, cc_minor = torch.cuda.get_device_capability(device_idx)
         score_fn_key = register_score_function(
