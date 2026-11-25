@@ -440,7 +440,7 @@ def checkpoint_table_capacities(
     table_sizes: Dict[str, int],
 ) -> Dict[str, int]:
     """Reserve every saved sparse row; training capacity estimates can be smaller."""
-    from dynamicemb.checkpoint_io import find_files, list_checkpoint_files
+    from dynamicemb.checkpoint.files import find_files, list_checkpoint_files
 
     directory = os.path.join(
         checkpoint_dir,
