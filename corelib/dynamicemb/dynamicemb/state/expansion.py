@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Growing the key map and the value buffers of a state when a table fills up."""
+"""Growing the key map and the value buffers of a state when a table fills up.
+
+A state is expanded before an insert when needed. Used in: the HBM-direct prefetch,
+the cache write-back, the generic forward path and ``HybridStorage.load``.
+"""
 
 import math
 from typing import List, Optional, Tuple
