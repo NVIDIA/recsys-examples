@@ -49,7 +49,6 @@ from dynamicemb.checkpoint.files import (  # noqa: F401 - preserve checkpoint he
     list_checkpoint_files,
 )
 from dynamicemb.dynamicemb_config import (
-    _budget_capacity,
     DynamicEmbCheckMode,
     DynamicEmbEvictStrategy,
     DynamicEmbPoolingMode,
@@ -57,6 +56,7 @@ from dynamicemb.dynamicemb_config import (
     DynamicEmbTableOptions,
     EvictedItemMode,
     ReplayContent,
+    _budget_capacity,
     get_eviction_score_strategy,
     get_physical_score_order,
     get_score_part,
@@ -80,7 +80,7 @@ from dynamicemb.key_value_table import (
     load_from_json,
     suppress_layout_warnings,
 )
-from dynamicemb.lookup_layout import EmbeddingLayout
+from dynamicemb.lookup.embedding_layout import EmbeddingLayout
 from dynamicemb.optimizer import (
     AdaGradDynamicEmbeddingOptimizer,
     AdamDynamicEmbeddingOptimizer,
@@ -1246,7 +1246,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             feature_batch_size // self.feature_num if self.feature_num > 0 else 0
         )
         # Built per call because batch_size comes from the input; see
-        # dynamicemb/lookup_layout.py for what the fields mean.
+        # dynamicemb/lookup/embedding_layout.py for what the fields mean.
         layout = EmbeddingLayout(
             pooling_mode=self.pooling_mode,
             batch_size=batch_size,

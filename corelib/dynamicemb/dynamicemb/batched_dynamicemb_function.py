@@ -38,7 +38,7 @@ from dynamicemb.key_value_table import (
     score_source,
     store_to_flat,
 )
-from dynamicemb.lookup_layout import EmbeddingLayout
+from dynamicemb.lookup.embedding_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.state.storage_layout import CachePolicy, StorageLayout
 from dynamicemb.types import CopyMode, MultiTableAdmitter
@@ -971,7 +971,7 @@ def dynamicemb_prefetch(
             if storage_layout.caching:
                 if storage_layout.cache_policy == CachePolicy.NINE:
                     # Imported here: the path module imports helpers from this one.
-                    from dynamicemb.lookup_paths.nine_cache_path import (
+                    from dynamicemb.lookup.nine_cache_path import (
                         prefetch_nine_cache_path,
                     )
 
