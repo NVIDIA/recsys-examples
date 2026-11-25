@@ -40,7 +40,7 @@ from dynamicemb.key_value_table import (
 )
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
-from dynamicemb.state.storage_layout import CachePath, StorageLayout
+from dynamicemb.state.storage_layout import CachePolicy, StorageLayout
 from dynamicemb.types import CopyMode, MultiTableAdmitter
 from dynamicemb.utils import decode_table_values, gradient_dtype
 from dynamicemb_extensions import (
@@ -496,7 +496,7 @@ def _prefetch_inclusive_cache_path(
     external_storage: Optional[Storage] = None,
     key_scores: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Cache prefetch with counter protection and overflow buffer (CachePath.INCLUSIVE).
+    """Cache prefetch with counter protection and overflow buffer (CachePolicy.INCLUSIVE).
 
     ``storage`` is the tier that owns every key's score; the cache above it
     ranks by timestamp only, and holds the freshest value of a key until it is
@@ -901,7 +901,7 @@ def dynamicemb_prefetch(
     """Unified prefetch for all storage types (cache, HBM-direct, generic).
 
     ``storage_layout`` says where the values are (see :class:`StorageLayout`); its
-    ``cache_path`` says what a cache sits on: under NINE, ``storage`` is the
+    ``cache_policy`` says what a cache sits on: under NINE, ``storage`` is the
     external store itself and ``external_storage`` is unused.
 
     Returns a PrefetchState containing unique embeddings + optimizer states
@@ -969,7 +969,7 @@ def dynamicemb_prefetch(
                 storage.expand_if_need(unique_size_per_table)
 
             if storage_layout.caching:
-                if storage_layout.cache_path == CachePath.NINE:
+                if storage_layout.cache_policy == CachePolicy.NINE:
                     # Imported here: the path module imports helpers from this one.
                     from dynamicemb.lookup_paths.nine_cache_path import (
                         prefetch_nine_cache_path,

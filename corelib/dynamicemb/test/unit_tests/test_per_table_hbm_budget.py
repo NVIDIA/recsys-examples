@@ -33,7 +33,7 @@ from dynamicemb import (
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.extendable_tensor import DeviceExtendableBuffer
-from dynamicemb.state.storage_layout import CachePath, StorageLayout, StorageTier
+from dynamicemb.state.storage_layout import CachePolicy, StorageLayout, StorageTier
 
 DIM = 16
 ROWS = 64 * 1024  # a multiple of every bucket width involved, so nothing rounds
@@ -106,7 +106,7 @@ def test_each_table_keeps_its_own_share(current_device, caching):
     )
     assert model._storage_layout == StorageLayout(
         StorageTier.HBM | StorageTier.DDR,
-        CachePath.INCLUSIVE if caching else None,
+        CachePolicy.INCLUSIVE if caching else None,
     )
 
     hbm = hbm_tier(model)

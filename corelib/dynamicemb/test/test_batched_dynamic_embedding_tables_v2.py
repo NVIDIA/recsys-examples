@@ -59,7 +59,7 @@ from dynamicemb.optimizer import (
     RowWiseAdaGradDynamicEmbeddingOptimizer,
     get_optimizer_ckpt_state_dim,
 )
-from dynamicemb.state.storage_layout import CachePath, StorageLayout, StorageTier
+from dynamicemb.state.storage_layout import CachePolicy, StorageLayout, StorageTier
 from dynamicemb.types import KEY_TYPE, CopyMode
 from dynamicemb.utils import FP8_STORAGE_DTYPE
 from fbgemm_gpu.split_embedding_configs import SparseType
@@ -1548,7 +1548,7 @@ def test_forward_train_eval(
     if PS is not None:
         # No ddr budget: the PS is the cache's only backing (NINE), so there is
         # no storage of ours, and evaluation reads cache and PS.
-        assert bdebt._storage_layout.cache_path == CachePath.NINE
+        assert bdebt._storage_layout.cache_policy == CachePolicy.NINE
         assert bdebt._external_storage is None
         assert isinstance(bdebt._storage, PyDictStorage)
         bdebt.eval()
@@ -4183,7 +4183,7 @@ def test_caching_ps_takes_the_evictions(nine):
     )
     if nine:
         assert bdebt._storage_layout == StorageLayout(
-            StorageTier.HBM | StorageTier.EXTERNAL, CachePath.NINE
+            StorageTier.HBM | StorageTier.EXTERNAL, CachePolicy.NINE
         )
         # The PS is the storage; there is no tier of ours between it and the
         # cache, and the cache keeps the table's own strategy.
@@ -4193,7 +4193,7 @@ def test_caching_ps_takes_the_evictions(nine):
     else:
         assert bdebt._storage_layout == StorageLayout(
             StorageTier.HBM | StorageTier.DDR | StorageTier.EXTERNAL,
-            CachePath.INCLUSIVE,
+            CachePolicy.INCLUSIVE,
         )
         ps = bdebt._external_storage
     assert isinstance(ps, PyDictStorage)
@@ -4255,7 +4255,7 @@ def test_caching_nine_ps_lfu_admission_carries_the_accumulated_count():
         use_index_dedup=True,
         learning_rate=0.1,
     )
-    assert bdebt._storage_layout.cache_path == CachePath.NINE
+    assert bdebt._storage_layout.cache_policy == CachePolicy.NINE
     ps = bdebt._storage
     assert isinstance(ps, PyDictStorage)
 
@@ -4324,7 +4324,7 @@ def test_caching_nine_ps_checkpoint_round_trip(tmp_path):
     offsets = torch.tensor([0, keys.numel()], dtype=torch.int64, device=device)
 
     src = build()
-    assert src._storage_layout.cache_path == CachePath.NINE
+    assert src._storage_layout.cache_policy == CachePolicy.NINE
     # One SGD step moves the rows off their initial draw, so a loaded row that
     # was re-initialized instead would differ.
     src(keys, offsets).mean().backward()
@@ -4399,9 +4399,9 @@ def test_ddr_budget_without_ps_is_ignored_with_a_warning():
             use_index_dedup=True,
             learning_rate=0.1,
         )
-    assert bdebt._storage_layout.cache_path == CachePath.INCLUSIVE
+    assert bdebt._storage_layout.cache_policy == CachePolicy.INCLUSIVE
     assert bdebt._storage_layout == StorageLayout(
-        StorageTier.HBM | StorageTier.DDR, CachePath.INCLUSIVE
+        StorageTier.HBM | StorageTier.DDR, CachePolicy.INCLUSIVE
     )
     assert bdebt._external_storage is None
     assert bdebt._storage._state.options_list[0].max_capacity == 256
@@ -4440,7 +4440,7 @@ def test_caching_ps_compound_score_needs_a_ddr_budget(local_ddr_for_values):
         with pytest.raises(NotImplementedError, match="compound score_strategy"):
             build()
     else:
-        assert build()._storage_layout.cache_path == CachePath.INCLUSIVE
+        assert build()._storage_layout.cache_policy == CachePolicy.INCLUSIVE
 
 
 def test_caching_ps_rejects_no_eviction():

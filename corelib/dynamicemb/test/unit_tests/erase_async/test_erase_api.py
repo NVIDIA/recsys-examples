@@ -29,7 +29,7 @@ import torch
 from dynamicemb import DynamicEmbScoreStrategy, erase_by_score_async
 from dynamicemb.async_erase import EraseHandle, EraseHandleGroup
 from dynamicemb.key_value_table import ERASE_CHUNK_SLOTS, ERASE_MAX_CHUNKS_IN_FLIGHT
-from dynamicemb.state.storage_layout import CachePath, StorageLayout, StorageTier
+from dynamicemb.state.storage_layout import CachePolicy, StorageLayout, StorageTier
 from helpers import DIM, build_de_table, size, train_step
 from torch import nn
 
@@ -158,13 +158,13 @@ def test_the_chunk_and_the_limit_in_flight_given_are_the_ones_the_scan_gets(devi
         (
             StorageLayout(
                 StorageTier.HBM | StorageTier.DDR | StorageTier.EXTERNAL,
-                CachePath.INCLUSIVE,
+                CachePolicy.INCLUSIVE,
             ),
             {},
             True,
         ),
         (
-            StorageLayout(StorageTier.HBM | StorageTier.EXTERNAL, CachePath.NINE),
+            StorageLayout(StorageTier.HBM | StorageTier.EXTERNAL, CachePolicy.NINE),
             {},
             True,
         ),

@@ -94,7 +94,7 @@ from dynamicemb.optimizer import (
     SGDDynamicEmbeddingOptimizer,
     get_optimizer_state_dim,
 )
-from dynamicemb.state.storage_layout import CachePath, StorageLayout, StorageTier
+from dynamicemb.state.storage_layout import CachePolicy, StorageLayout, StorageTier
 from dynamicemb.types import ReplayStats
 from dynamicemb.utils import (
     DTYPE_NUM_BYTES,
@@ -737,13 +737,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 local_ddr = sum(
                     option.local_ddr_for_values for option in self._dynamicemb_options
                 )
-                # What a cache sits on, from the options (see CachePath): our own
+                # What a cache sits on, from the options (see CachePolicy): our own
                 # storage whenever there is no PS, or the PS comes with a DDR
                 # budget for it; else the PS alone.
-                cache_path = (
-                    CachePath.NINE if PS and local_ddr <= 0 else CachePath.INCLUSIVE
+                cache_policy = (
+                    CachePolicy.NINE if PS and local_ddr <= 0 else CachePolicy.INCLUSIVE
                 )
-                if cache_path == CachePath.NINE and any(
+                if cache_policy == CachePolicy.NINE and any(
                     isinstance(option.score_strategy, tuple)
                     for option in self._dynamicemb_options
                 ):
@@ -777,7 +777,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     cache_option.max_capacity = min(cache_option.max_capacity, cap)
                     cache_option.init_capacity = min(cache_option.max_capacity, cap)
 
-                if cache_path == CachePath.INCLUSIVE:
+                if cache_policy == CachePolicy.INCLUSIVE:
                     # The cache ranks by timestamp only; the storage below it is
                     # a superset and owns every key's score (and the no-eviction
                     # mode, which cache overflow rejects, see create_table_state).
@@ -792,11 +792,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 storage_options = deepcopy(self._dynamicemb_options)
                 for storage_option in storage_options:
                     storage_option.local_hbm_for_values = 0
-                if cache_path == CachePath.NINE:
+                if cache_policy == CachePolicy.NINE:
                     # No storage of ours: the PS is the tier below the cache.
                     self._storage = PS(storage_options, self._optimizer)
                     self._storage_layout = StorageLayout(
-                        StorageTier.HBM | StorageTier.EXTERNAL, cache_path
+                        StorageTier.HBM | StorageTier.EXTERNAL, cache_policy
                     )
                 else:
                     # The PS (if any) is built on the whole table's options, as
@@ -836,7 +836,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         StorageTier.HBM
                         | StorageTier.DDR
                         | (StorageTier.EXTERNAL if PS else StorageTier(0)),
-                        cache_path,
+                        cache_policy,
                     )
             else:
                 # No caching and no HBM budget for values: single-tier host/PS storage.
@@ -1165,7 +1165,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._cache,
                 self._storage,
                 self._external_storage,
-                cache_owns_scores=self._storage_layout.cache_path == CachePath.NINE,
+                cache_owns_scores=self._storage_layout.cache_policy == CachePolicy.NINE,
             )
 
     def reset_cache_states(self) -> None:

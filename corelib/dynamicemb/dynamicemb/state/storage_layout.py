@@ -20,7 +20,7 @@ from enum import Enum, Flag, auto
 from typing import Optional
 
 
-class CachePath(Enum):
+class CachePolicy(Enum):
     """How a caching table's cache relates to what is below it.
 
     INCLUSIVE: the cache is a subset of a ``DynamicEmbStorage``, which owns every
@@ -51,13 +51,13 @@ class StorageLayout:
     """Where a module keeps its values: which tiers, and whether HBM is a cache.
 
     ``tiers`` holds the tiers actually in use (an ``external_storage`` a layout
-    ignores is not in it). ``cache_path`` is None when nothing is cached; else HBM
+    ignores is not in it). ``cache_policy`` is None when nothing is cached; else HBM
     is a cache, and the path says how it relates to what is below it (see
-    ``CachePath``). The tiers alone do not tell a cache from a split of the rows:
+    ``CachePolicy``). The tiers alone do not tell a cache from a split of the rows:
     HBM | DDR is both ``HybridStorage`` (no cache) and a cache over host storage.
 
     =============================  =========================  ==========
-    layout                         tiers                      cache_path
+    layout                         tiers                      cache_policy
     =============================  =========================  ==========
     HBM only                       HBM                        None
     host only                      DDR                        None
@@ -70,11 +70,11 @@ class StorageLayout:
     """
 
     tiers: StorageTier
-    cache_path: Optional[CachePath] = None
+    cache_policy: Optional[CachePolicy] = None
 
     @property
     def caching(self) -> bool:
-        return self.cache_path is not None
+        return self.cache_policy is not None
 
     @property
     def erasable(self) -> bool:
@@ -84,10 +84,10 @@ class StorageLayout:
         key map the erase can scan; the others keep their keys where it cannot
         (host values read by the generic path, two tiers, an external store).
         """
-        if self.cache_path is None:
+        if self.cache_policy is None:
             return self.tiers == StorageTier.HBM
         return (
-            self.cache_path == CachePath.INCLUSIVE
+            self.cache_policy == CachePolicy.INCLUSIVE
             and StorageTier.EXTERNAL not in self.tiers
         )
 
@@ -95,10 +95,10 @@ class StorageLayout:
     def hbm_direct(self) -> bool:
         """Whether the values are read and written in place in GPU memory: one
         tier, HBM, no cache."""
-        return self.cache_path is None and self.tiers == StorageTier.HBM
+        return self.cache_policy is None and self.tiers == StorageTier.HBM
 
     def __str__(self) -> str:
         names = "+".join(tier.name for tier in StorageTier if tier in self.tiers)
-        if self.cache_path is None:
+        if self.cache_policy is None:
             return names
-        return f"{names} (HBM caches, {self.cache_path.name})"
+        return f"{names} (HBM caches, {self.cache_policy.name})"

@@ -46,7 +46,7 @@ def prefetch_nine_cache_path(
     admitter: Optional[MultiTableAdmitter],
     key_scores: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Cache prefetch with counter protection and overflow buffer (CachePath.NINE).
+    """Cache prefetch with counter protection and overflow buffer (CachePolicy.NINE).
 
     ``storage`` is the external store (e.g. a PS), the only tier below the
     cache and opaque to it. The cache owns the scores -- one word per key, the table's

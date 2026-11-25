@@ -24,7 +24,7 @@ import time
 import torch
 from dynamicemb import DynamicEmbScoreStrategy
 from dynamicemb.async_erase import EraseHandle
-from dynamicemb.state.storage_layout import CachePath, StorageLayout, StorageTier
+from dynamicemb.state.storage_layout import CachePolicy, StorageLayout, StorageTier
 from dynamicemb_extensions import device_timestamp
 from helpers import DIM, build_de_table, found, size, train_step
 
@@ -184,7 +184,7 @@ def test_with_a_cache_only_the_storage_behind_it_is_erased(device):
         local_hbm_for_values=int(max_capacity * DIM * 4 * 0.02),
     )
     assert module._storage_layout == StorageLayout(
-        StorageTier.HBM | StorageTier.DDR, CachePath.INCLUSIVE
+        StorageTier.HBM | StorageTier.DDR, CachePolicy.INCLUSIVE
     )
     old, new = key_range(1, 2000), key_range(2001, 2000)
     for keys, score in ((old, 10), (new, 200)):
