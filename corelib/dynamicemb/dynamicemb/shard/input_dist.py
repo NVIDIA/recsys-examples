@@ -37,7 +37,7 @@ from torchrec.distributed.types import Awaitable
 from torchrec.fx.utils import assert_fx_safe
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-from ..scored_kjt import ScoredKeyedJaggedTensor
+from ..score.kjt import ScoredKeyedJaggedTensor
 from .hier_output_dist import DynamicEmbSequenceShardingContext, HierDist
 
 torch.fx.wrap("len")
@@ -388,7 +388,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             ``feature_hash_sizes`` -- the kernel indexes both with the same
             ``t``, and building them together here is what keeps them aligned.
         per_key_score: the sparse features carry a score per key
-            (:class:`~dynamicemb.scored_kjt.ScoredKeyedJaggedTensor`), sent by
+            (:class:`~dynamicemb.score.kjt.ScoredKeyedJaggedTensor`), sent by
             an all2all of their own beside the keys', and handed on with the
             received keys.
         hier: the sharding's hierarchical dist (``shard/hier_output_dist.py``),

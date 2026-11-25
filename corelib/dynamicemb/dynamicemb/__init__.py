@@ -20,7 +20,7 @@ from importlib import import_module
 _EXPORTS = {
     "EraseHandle": "async_erase",
     "erase_by_score_async": "async_erase",
-    "ScoredKeyedJaggedTensor": "scored_kjt",
+    "ScoredKeyedJaggedTensor": "score.kjt",
     "DynamicEmbDump": "dump_load",
     "DynamicEmbLoad": "dump_load",
     "BATCH_SIZE_PER_DUMP": "dynamicemb_config",

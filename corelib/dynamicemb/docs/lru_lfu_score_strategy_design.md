@@ -295,8 +295,9 @@ For dynamicemb the reference `apply` entry becomes our three entries —
 | Evict TU | new `src/.../evict_lrulfu.cu` + `setup.py` | instantiate insert_and_evict for both comparators; `user_score_fn` extern-undefined; build **prebuilt Lex cubin** + **custom LTO-IR fatbin** (`nvcc --fatbin code=lto_XX`), ship as package_data |
 | JIT link/launch | new `src/.../jit_link.{h,cpp}` (C++, `-lnvJitLink -lcuda`) | link user LTO-IR into fatbin → cubin; `cuModuleLoadData`/`cuModuleGetFunction`; per-(arch,fn) module cache; `cuLaunchKernel` on torch stream (both cubins) |
 | Bindings | `table.cu`/bindings | expose `link(fatbin, ltoir, cc)` + the driver-launched insert-and-evict entry |
-| Config | `dynamicemb_config.py` | compound `(TIMESTAMP, LFU)` validation (`normalize_score_strategy`), `score_function`, `get_grouped_key` |
-| Policy select | `key_value_table.py` `get_score_policy` | map `{TIMESTAMP, LFU}` → `LruLfu`; route `num_scores==2` tables (plain insert AND insert_and_evict) to the cubin (custom vs prebuilt Lex); `evict_strategy=LFU` |
+| Config | `dynamicemb_config.py` | `score_function`, `get_grouped_key` |
+| Strategy | `score/strategy.py` | compound `(TIMESTAMP, LFU)` validation (`normalize_score_strategy`) |
+| Policy select | `score/spec.py` `get_score_policy` | map `{TIMESTAMP, LFU}` → `LruLfu`; route `num_scores==2` tables (plain insert AND insert_and_evict) to the cubin (custom vs prebuilt Lex); `evict_strategy=LFU` |
 | Python JIT glue | `dynamicemb/jit/score_jit.py` | logical→physical subscript remap; `torch.cuda.get_device_capability()`; numba `cuda.compile(...,output='ltoir')`; hand bytes to C++; module cache |
 | Batched | `batched_dynamicemb_tables.py` | `_create_score` compound `{TIMESTAMP,LFU}` → evict=LFU; `get_score` returns `device_timestamp()` for these tables |
 

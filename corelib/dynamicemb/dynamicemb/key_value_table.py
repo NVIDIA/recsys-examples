@@ -74,6 +74,20 @@ from dynamicemb.scored_hashtable import (
     ScoreSpec,
     get_scored_table,
 )
+from dynamicemb.score.checkpoint_columns import (  # noqa: F401 (re-exported)
+    _age_to_scores,
+    _dump_score_block,
+    _fresh_score_block,
+    _replay_score_block,
+    _scores_to_age,
+    _timestamp_score_columns,
+)
+from dynamicemb.score.args import (  # noqa: F401 (re-exported)
+    get_find_score_arg,
+    get_insert_score_arg,
+    score_source,
+)
+from dynamicemb.score.spec import get_score_policy  # noqa: F401 (re-exported)
 from dynamicemb.types import (
     EMBEDDING_TYPE,
     KEY_TYPE,
@@ -141,59 +155,6 @@ def _all_gather_dumped_columns(
     return out
 
 
-def _timestamp_score_columns(score_strategy: ScoreStrategy) -> List[int]:
-    """Logical score-column indices holding a device timestamp.
-
-    ``%globaltimer`` is per-device and resets across boots, so a raw timestamp is
-    meaningless anywhere but the rank that produced it. These columns are dumped
-    as an *age* (``cur_ts - score``) -- the same convention the file checkpoint
-    uses for single-column LRU tables. Every other column (LFU frequency, STEP,
-    CUSTOMIZED) is carried verbatim.
-    """
-    if isinstance(score_strategy, tuple):
-        return [
-            i
-            for i, s in enumerate(score_strategy)
-            if s == DynamicEmbScoreStrategy.TIMESTAMP
-        ]
-    return [0] if score_strategy == DynamicEmbScoreStrategy.TIMESTAMP else []
-
-
-def _scores_to_age(
-    score_strategy: ScoreStrategy, scores: Tensor, cur_ts: int
-) -> Tensor:
-    """Convert timestamp columns to ages, for dumping.
-
-    *scores* is a ``[N, W]`` block in logical (configured) column order. When
-    there is nothing to convert (no timestamp column, or an empty block) the
-    input is returned unchanged rather than copied -- callers must not mutate the
-    result in place. Otherwise a clone is returned.
-    """
-    ts_cols = _timestamp_score_columns(score_strategy)
-    if not ts_cols or scores.numel() == 0:
-        return scores
-    out = scores.clone()
-    for c in ts_cols:
-        out[:, c] = torch.clamp(cur_ts - scores[:, c], min=0)
-    return out
-
-
-def _age_to_scores(
-    score_strategy: ScoreStrategy, ages: Tensor, target_ts: int
-) -> Tensor:
-    """Inverse of :func:`_scores_to_age`, for replay.
-
-    Same aliasing note: returns *ages* itself when there is nothing to convert.
-    """
-    ts_cols = _timestamp_score_columns(score_strategy)
-    if not ts_cols or ages.numel() == 0:
-        return ages
-    out = ages.clone()
-    for c in ts_cols:
-        out[:, c] = torch.clamp(target_ts - ages[:, c], min=0)
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Utility helpers (continued)
 # ---------------------------------------------------------------------------
@@ -228,58 +189,6 @@ def _raw_bytes(tensor: torch.Tensor) -> bytes:
     has no bfloat16, and value files now carry the table's own precision.
     """
     return tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
-
-
-def get_score_policy(score_strategy):
-    """Build the physical :class:`ScoreSpec` for a (validated) score strategy.
-
-    *score_strategy* is either a single :class:`DynamicEmbScoreStrategy` or a
-    supported compound tuple (currently only ``{TIMESTAMP, LFU}`` in either order).
-    A compound strategy maps to the ``LruLfu`` policy whose physical layout is
-    fixed at ``(timestamp, frequency)`` regardless of the user's tuple order; the
-    user's ordering only affects checkpoint column order (see
-    :func:`score_dump_permutation`). The no-eviction mode adds no score of its own:
-    ``NO_EVICTION`` alone keeps none: its one word is a ``FLAG`` (1 while a key
-    occupies the slot, 0 after an erase), which is not a score a user sets but
-    what lets a full bucket give up an erased slot before a key in use. In a
-    compound the score is the other strategy's.
-    """
-    score_strategy = get_score_part(score_strategy)
-    if score_strategy is None:
-        return ScoreSpec(name="no_eviction", policy=ScorePolicy.FLAG)
-    if isinstance(score_strategy, tuple):
-        # Only the {TIMESTAMP, LFU} compound is supported (validated at config
-        # construction). Two adjacent AoS score words per key -- word 0 =
-        # last-access timestamp (selects keys for a time-based incremental dump),
-        # word 1 = frequency (drives LFU eviction). num_scores is derived from the
-        # policy. The spec name maps to word 0 (score_index 0), i.e. the timestamp
-        # column incremental_dump thresholds on -- hence "lru_lfu".
-        if frozenset(score_strategy) == frozenset(
-            {DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU}
-        ):
-            return ScoreSpec(
-                name="lru_lfu",
-                policy=ScorePolicy.LRU_LFU,
-                dtype=torch.uint64,
-                is_reduction=True,
-            )
-        raise NotImplementedError(
-            f"Unsupported compound score_strategy {score_strategy}."
-        )
-    if score_strategy == DynamicEmbScoreStrategy.TIMESTAMP:
-        return ScoreSpec(name="timestamp", policy=ScorePolicy.GLOBAL_TIMER)
-    elif score_strategy == DynamicEmbScoreStrategy.STEP:
-        return ScoreSpec(name="step", policy=ScorePolicy.ASSIGN)
-    elif score_strategy in (
-        DynamicEmbScoreStrategy.CUSTOMIZED,
-        DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
-    ):
-        # Stored the same way: what differs is only where a score comes from.
-        return ScoreSpec(name="customized", policy=ScorePolicy.ASSIGN)
-    elif score_strategy == DynamicEmbScoreStrategy.LFU:
-        return ScoreSpec(name="frequency", policy=ScorePolicy.ACCUMULATE)
-    else:
-        raise RuntimeError("Not supported score strategy.")
 
 
 def get_uvm_tensor(dim, dtype, device, is_managed=False):
@@ -1251,111 +1160,6 @@ def _encode_slot_index(
     return torch.stack([slot_indices, flat_rows], dim=1)
 
 
-def _fresh_score_block(
-    state: DynamicEmbTableState,
-    table_id: int,
-    n: int,
-    timestamp: int,
-    insert_score: int,
-) -> torch.Tensor:
-    """``[N, num_scores]`` physical score block for keys written by replay.
-
-    Used when the caller did not ask for ``ReplayContent.SCORE``. The delta does
-    carry the source's scores, but they were not loaded, so a replayed key is
-    scored as if it had just been inserted here instead: recency words get
-    *timestamp*, every other word gets *insert_score*. The replica then ranks its
-    restored keys by when it received them rather than by how the source ranked
-    them -- acceptable because the score only orders future evictions, and a
-    replica that evicts on its own schedule still holds correct embeddings.
-    Ask for ``SCORE`` to inherit the source's ranking instead.
-
-    *insert_score* is passed in rather than read off ``state.score``: that field
-    is populated by the forward pass, and replay is the one write path that can
-    run before a target has ever done a forward. The caller owns the table's
-    score bookkeeping and always has a value. *n* is the number of keys.
-    """
-    device = state.device
-    num_scores = state.key_index_map.num_scores_
-    # Zeros, not ``empty``: the loop below fills one column per configured
-    # strategy, while the width comes from the score policy. The two agree for
-    # every strategy there is, but they are derived from different places, so a
-    # future divergence should leave a quiet zero rather than whatever the
-    # allocator handed back.
-    block = torch.zeros((n, num_scores), device=device, dtype=SCORE_TYPE)
-    physical = get_physical_score_order(state.options_list[table_id].score_strategy)
-    for word, strategy in enumerate(physical):
-        block[:, word] = (
-            timestamp if strategy == DynamicEmbScoreStrategy.TIMESTAMP else insert_score
-        )
-    return block
-
-
-def _dump_score_block(
-    state: DynamicEmbTableState,
-    table_id: int,
-    slot_indices: torch.Tensor,
-    primary_scores: torch.Tensor,
-    cur_ts: int,
-) -> torch.Tensor:
-    """``[N, num_scores]`` per-key score block for a dumped table.
-
-    Columns are in the user's configured (logical) order -- the same order the
-    file checkpoint uses -- and timestamp columns are converted to an age
-    relative to *cur_ts* so they survive the trip to another device or host.
-    Single-score tables reuse the score column the dump already thresholded on;
-    multi-word layouts gather every word from the slots.
-    """
-    device = state.device
-    num_scores = state.key_index_map.num_scores_
-    score_strategy = state.options_list[table_id].score_strategy
-    if num_scores > 1:
-        block = state.key_index_map.gather_score_blocks(
-            table_id, slot_indices.to(device=device, dtype=torch.int64)
-        )
-        perm = score_dump_permutation(score_strategy)
-        if perm != list(range(block.size(1))):
-            block = block[:, perm].contiguous()
-    else:
-        block = primary_scores.to(device=device, dtype=SCORE_TYPE).view(-1, 1)
-    return _scores_to_age(score_strategy, block, cur_ts)
-
-
-def _replay_score_block(
-    state: DynamicEmbTableState,
-    table_id: int,
-    scores: torch.Tensor,
-    target_ts: int,
-) -> torch.Tensor:
-    """Inverse of :func:`_dump_score_block`: logical ages -> physical scores.
-
-    Takes the ``[N, num_scores]`` logical block carried in the delta, restores
-    timestamp columns against this device's *target_ts*, and permutes back into
-    the physical device layout.
-
-    Both steps index by *column*, so a block that is not exactly as wide as this
-    table's score layout would silently transform or permute the wrong words --
-    e.g. writing a frequency into the timestamp column. The width is validated
-    here rather than trusted.
-    """
-    device = state.device
-    score_strategy = state.options_list[table_id].score_strategy
-    num_scores = state.key_index_map.num_scores_
-    block = scores.to(device=device, dtype=SCORE_TYPE)
-    if block.dim() == 1:
-        block = block.view(-1, 1)
-    if block.dim() != 2 or block.size(1) != num_scores:
-        raise ValueError(
-            f"replay_increment: table {table_id} has {num_scores} score word(s) "
-            f"per key, but the delta carries a score block of shape "
-            f"{tuple(scores.shape)}."
-        )
-    block = _age_to_scores(score_strategy, block, target_ts)
-    perm = score_load_permutation(score_strategy)
-    if perm != list(range(num_scores)):
-        block = block[:, perm]
-    return block.contiguous()
-
-
 def _split_value_row(
     state: DynamicEmbTableState, table_id: int, values: torch.Tensor
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -1509,138 +1313,6 @@ def store_to_flat_single_table(
         state.emb_dim,
         state.all_dims_vec4,
     )
-
-
-def score_source(
-    evict_strategy: Optional[EvictStrategy],
-    frequency: Optional[torch.Tensor] = None,
-    key_scores: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
-    """The per-key values a table's score is made from, or ``None`` if it has none.
-
-    The two inputs a key can carry are separate channels -- ``frequency``, how
-    often the batch counted it, and ``key_scores``, what the input scored it
-    with -- and this is the one place that says which of them a table takes: an
-    LFU table the frequency, a CUSTOMIZED table the score of the input. A caller
-    chooses here, once, and hands the table's finds and inserts that one tensor
-    (``score_input``); the tables and stores below it never see the other.
-
-    ``None`` means "the table's own default" -- ``get_find_score_arg`` and
-    ``get_insert_score_arg`` supply it.
-    """
-    if evict_strategy == EvictStrategy.KLfu:
-        return frequency
-    if evict_strategy == EvictStrategy.KCustomized:
-        return key_scores
-    return None
-
-
-def get_find_score_arg(
-    state: DynamicEmbTableState,
-    num_keys: int,
-    device: torch.device,
-    score_input: Optional[torch.Tensor] = None,
-    *,
-    const_lookup: bool = False,
-) -> ScoreArg:
-    """Build a ScoreArg for find/lookup operations.
-
-    When ``state.training`` is False (eval), returns CONST policy so that
-    existing scores in the hash table are never modified.
-
-    When *const_lookup* is True (e.g. flush-time verification), always use the
-    same read-only CONST policy regardless of ``state.training``.
-
-    When ``state.training`` is True:
-      - LFU: ACCUMULATE with provided or default (ones) frequency.
-      - LRU (GLOBAL_TIMER): no explicit value needed.
-      - CUSTOMIZED / STEP: ASSIGN with ``state.score``; a CUSTOMIZED table that
-        takes a score per key is given those scores instead, one per key, and
-        assigns each key its own.
-
-    ``score_input`` is what :func:`score_source` chose for the table -- the
-    frequency of an LFU table, the scores of the input for a CUSTOMIZED one --
-    so this takes one tensor, whichever it is.
-    """
-    # A table that keeps no score (NO_EVICTION alone) has nothing to update.
-    if state.score_policy.policy == ScorePolicy.FLAG:
-        return ScoreArg(
-            name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
-        )
-
-    if const_lookup or not state.training:
-        return ScoreArg(
-            name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
-        )
-
-    # LFU: use provided frequency for ACCUMULATE; must have length num_keys for lookup.
-    if state.evict_strategy == EvictStrategy.KLfu:
-        if score_input is not None and score_input.numel() == num_keys:
-            scores = score_input.contiguous()
-        else:
-            # Fallback: each key counts as 1 so score accumulates by 1 per lookup
-            scores = torch.ones(num_keys, device=device, dtype=torch.long)
-    elif state.evict_strategy == EvictStrategy.KCustomized:
-        if score_input is not None:
-            assert score_input.numel() == num_keys
-            scores = score_input.contiguous()
-        else:
-            scores = torch.empty(num_keys, device=device, dtype=torch.long)
-            scores.fill_(state.score)
-    else:
-        scores = None
-
-    return ScoreArg(
-        name=state.score_policy.name,
-        value=scores,
-        policy=state.score_policy.policy,
-    )
-
-
-def get_insert_score_arg(
-    state: DynamicEmbTableState,
-    num_keys: int,
-    device: torch.device,
-    scores: Optional[torch.Tensor] = None,
-    preserve_existing: bool = False,
-) -> ScoreArg:
-    """Build a ScoreArg for insert operations (new keys).
-
-    *preserve_existing* should be True when re-inserting keys that already
-    exist in the table (e.g. backward embedding update) so that their scores
-    are not overwritten.  This fixes the bug where backward re-inserts
-    incorrectly assigned new scores.
-
-    When *preserve_existing* is False (the common case for genuinely new keys):
-      - LRU: GLOBAL_TIMER (no explicit value).
-      - LFU / CUSTOMIZED / STEP: ASSIGN with provided *scores* or
-        ``state.score`` as default.
-      - ACCUMULATE policy is converted to ASSIGN for inserts.
-    """
-    if preserve_existing:
-        return ScoreArg(
-            name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
-        )
-
-    if state.score_policy.policy == ScorePolicy.FLAG:
-        # NO_EVICTION alone keeps no score a user could set, but a new key still
-        # sets its flag, so that it ranks above the slots an erase left.
-        return ScoreArg(
-            name=state.score_policy.name, value=None, policy=ScorePolicy.FLAG
-        )
-
-    is_lru = state.evict_strategy == EvictStrategy.KLru
-    if not is_lru and scores is None:
-        scores = torch.empty(num_keys, device=device, dtype=torch.uint64)
-        scores.fill_(state.score)
-
-    policy = state.score_policy.policy
-    if policy == ScorePolicy.ACCUMULATE:
-        policy = ScorePolicy.ASSIGN
-    if is_lru and scores is not None:
-        policy = ScorePolicy.ASSIGN
-
-    return ScoreArg(name=state.score_policy.name, value=scores, policy=policy)
 
 
 def _find_keys(
