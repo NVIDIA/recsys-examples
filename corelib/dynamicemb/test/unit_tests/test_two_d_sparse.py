@@ -37,7 +37,7 @@ Modes:
 import argparse
 import os
 import sys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -85,6 +85,7 @@ SCORES = {
 }
 OPTIMIZERS = {
     "adagrad": EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+    "adam": EmbOptimType.ADAM,
     "sgd": EmbOptimType.EXACT_SGD,
 }
 # What one replica holds of one table: key -> (embedding, optimizer state, frequency).
@@ -119,9 +120,15 @@ def _build(args) -> DMPCollection:
                 global_hbm_for_values=1024**3,
                 init_capacity=GROW_CAPACITY if args.grow else None,
                 embedding_dtype=DTYPES[args.embedding_dtype],
+                index_type=torch.uint64 if args.uint64_keys else torch.int64,
                 score_strategy=SCORES[args.score_strategy],
                 initializer_args=DynamicEmbInitializerArgs(
-                    mode=DynamicEmbInitializerMode.CONSTANT, value=INIT_VALUE
+                    mode=(
+                        DynamicEmbInitializerMode.NORMAL
+                        if args.random_initializer
+                        else DynamicEmbInitializerMode.CONSTANT
+                    ),
+                    value=INIT_VALUE,
                 ),
             ),
         )
@@ -132,6 +139,7 @@ def _build(args) -> DMPCollection:
             "output_dtype": SparseType.FP32,
             "optimizer": OPTIMIZERS[args.optimizer],
             "learning_rate": 0.05,
+            "initial_accumulator_value": 0.375 if args.optimizer == "adagrad" else 0.0,
         }
     )
     # The plan is for one sharding group; DMPCollection remaps it to each replica.
@@ -174,12 +182,13 @@ def _replica_keys(args, replica: int) -> List[int]:
     return [10 + 2 * replica + i for i in range(KEYS_PER_REPLICA)]
 
 
-def _train(args, model: DMPCollection) -> None:
+def _train(args, model: DMPCollection, keys: Optional[List[int]] = None) -> None:
     # Every rank of a replica feeds the replica's keys; the fused optimizer
     # steps inside backward. One step under --grow: the table counts a batch's
     # keys toward its load before it knows how many are new.
     steps = 1 if args.grow else 2
-    keys = _replica_keys(args, dist.get_rank(_replica_group(model)))
+    if keys is None:
+        keys = _replica_keys(args, dist.get_rank(_replica_group(model)))
     device = torch.device("cuda", torch.cuda.current_device())
     kjt = torchrec.KeyedJaggedTensor(
         keys=[_feature(table) for table in TABLES],
@@ -231,18 +240,7 @@ def _at_table_precision(values: torch.Tensor, dtype: torch.dtype) -> torch.Tenso
     return decode_table_values(encode_table_values(values.cuda(), dtype), torch.float32)
 
 
-def check_sync(args) -> None:
-    model = _build(args)
-    _train(args, model)
-    sync = DynamicEmbReplicaSync(model)
-    before = _gather_replicas(model, _rows(model))
-    states = [kernel.tables.tables[0] for kernel in get_dynamic_emb_module(model)]
-    generations = [state.key_map_generation for state in states]
-    stats = {table.table_name: table for table in sync.sync()}
-    if args.grow:
-        grew = [state.key_map_generation for state in states] != generations
-        assert grew, "no table grew during the sync; --grow tested nothing"
-    after = _gather_replicas(model, _rows(model))
+def _check_rows(args, model, before, after, stats, touched=None) -> None:
     replica_count = len(before)
     dtype = DTYPES[args.embedding_dtype]
     fresh_emb = _at_table_precision(torch.tensor([INIT_VALUE]), dtype).item()
@@ -255,17 +253,25 @@ def check_sync(args) -> None:
         union = sorted(set().union(*(replica[name] for replica in before)))
         assert union, f"{name}: this shard holds no key; nothing was compared"
         mine = before[dist.get_rank(_replica_group(model))][name]
-        assert stats[name].union_keys == len(union), (name, stats[name], union)
-        assert stats[name].local_keys == len(mine), (name, stats[name], mine)
+        merged = set(union) if touched is None else set(union) & touched
+        assert stats[name].union_keys == len(merged), (name, stats[name], merged)
+        assert stats[name].local_keys == len(merged.intersection(mine)), (
+            name, stats[name], mine
+        )
         for replica in after:
             assert sorted(replica[name]) == union, (name, sorted(replica[name]))
         for key in union:
-            held = [
-                replica[name].get(key, ([fresh_emb] * EMBEDDING_DIM, fresh_opt, 0))
-                for replica in before
-            ]
-            emb = torch.tensor([row[0] for row in held]).sum(0) / replica_count
-            opt = torch.tensor([row[1] for row in held]).sum(0) / replica_count
+            if key not in merged:
+                for prev, cur in zip(before, after):
+                    assert cur[name][key] == prev[name][key], (name, key)
+                continue
+            held = [replica[name][key] for replica in before if key in replica[name]]
+            if not args.random_initializer:
+                fresh_row = ([fresh_emb] * EMBEDDING_DIM, fresh_opt, 0)
+                held += [fresh_row] * (replica_count - len(held))
+            emb = torch.tensor([row[0] for row in held]).mean(0)
+            opt = torch.tensor([row[1] for row in held]).mean(0)
+            opt = opt.to(kernel.optimizer.get_state_dtype(dtype)).float()
             frequency = max(1, sum(row[2] for row in held) // replica_count)
             got_emb, got_opt, got_frequency = after[0][name][key]
             torch.testing.assert_close(
@@ -279,6 +285,35 @@ def check_sync(args) -> None:
                 assert got_frequency == frequency, (name, key, got_frequency, held)
             for replica in after[1:]:
                 assert replica[name][key] == after[0][name][key], (name, key)
+
+
+def check_sync(args) -> None:
+    model = _build(args)
+    _train(args, model)
+    sync = DynamicEmbReplicaSync(model)
+    before = _gather_replicas(model, _rows(model))
+    states = [kernel.tables.tables[0] for kernel in get_dynamic_emb_module(model)]
+    generations = [state.key_map_generation for state in states]
+    stats = {table.table_name: table for table in sync.sync()}
+    if args.grow:
+        grew = [state.key_map_generation for state in states] != generations
+        assert grew, "no table grew during the sync; --grow tested nothing"
+    after = _gather_replicas(model, _rows(model))
+    _check_rows(args, model, before, after, stats)
+    if args.resync:
+        # All replicas touch the entire union twice to populate and reuse
+        # the dense route. Then just a subset changes, with a new private
+        # key on each replica, so a stale route would lose updates.
+        rank = dist.get_rank(_replica_group(model))
+        replicas = dist.get_world_size(_replica_group(model))
+        shared = sorted(set().union(*(_replica_keys(args, r) for r in range(replicas))))
+        for keys in (shared, shared, [10 + rank, 1000 + rank]):
+            _train(args, model, keys)
+            touched = set().union(*_gather_replicas(model, keys))
+            before = _gather_replicas(model, _rows(model))
+            stats = {table.table_name: table for table in sync.sync()}
+            after = _gather_replicas(model, _rows(model))
+            _check_rows(args, model, before, after, stats, touched)
 
     again = sync.sync()
     assert all(table.union_keys == 0 for table in again), again
@@ -337,6 +372,9 @@ def main(argv) -> None:
     )
     parser.add_argument("--embedding-dtype", choices=sorted(DTYPES), default="fp32")
     parser.add_argument("--score-strategy", choices=sorted(SCORES), default="lru_lfu")
+    parser.add_argument("--uint64-keys", action="store_true")
+    parser.add_argument("--random-initializer", action="store_true")
+    parser.add_argument("--resync", action="store_true")
     parser.add_argument("--optimizer", choices=sorted(OPTIMIZERS), default="adagrad")
     parser.add_argument(
         "--grow",
