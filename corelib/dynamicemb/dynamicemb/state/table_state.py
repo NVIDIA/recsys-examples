@@ -25,14 +25,14 @@ from dynamicemb.dynamicemb_config import (
     EvictedItemMode,
     has_no_eviction,
 )
-from dynamicemb.extendable_tensor import (
+from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb.score.spec import get_score_policy
+from dynamicemb.scored_hashtable import ScorePolicy, ScoreSpec, get_scored_table
+from dynamicemb.state.extendable_buffer import (
     DeviceExtendableBuffer,
     ExtendableBuffer,
     HostExtendableBuffer,
 )
-from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
-from dynamicemb.score.spec import get_score_policy
-from dynamicemb.scored_hashtable import ScorePolicy, ScoreSpec, get_scored_table
 from dynamicemb_extensions import EvictStrategy, segmented_sum_cuda
 
 

@@ -32,7 +32,7 @@ from dynamicemb import (
     EmbOptimType,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.extendable_tensor import DeviceExtendableBuffer
+from dynamicemb.state.extendable_buffer import DeviceExtendableBuffer
 from dynamicemb.state.storage_layout import CachePolicy, StorageLayout, StorageTier
 
 DIM = 16
