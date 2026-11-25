@@ -348,6 +348,17 @@ def test_lru_lfu_storage_dump_load_roundtrip(current_device, tmp_path, score_str
     ), "dump/load must preserve both score words (timestamp + frequency)"
 
 
+    # A checkpoint crossing GPUs may load under an earlier device clock.
+    # Rebase the timestamp column and keep the frequency in its logical slot.
+    writer_now = int(blocks_src[:, 0].max().item()) + 100
+    reader_now = 1_000_000
+    src.dump(0, *paths, include_optim=False, timestamp=writer_now)
+    dst.load(0, *paths, include_optim=False, timestamp=reader_now)
+    expected = blocks_src.clone()
+    expected[:, 0] = (reader_now - (writer_now - blocks_src[:, 0])).clamp_min(0)
+    torch.testing.assert_close(_read_score_blocks(dst, keys, tids), expected)
+
+
 def test_lru_lfu_storage_rehash_preserves_frequency(current_device):
     """Growing the table (_expand_tables_impl re-hashes keys into more buckets)
     must preserve both LruLfu score words -- a single-value re-insert would reset

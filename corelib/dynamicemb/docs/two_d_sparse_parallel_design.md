@@ -51,18 +51,21 @@ replica_sync.mark_synced()
 
 For each table, in chunks of keys that bound the staging buffers:
 
-1. **Touched keys.** `incremental_dump` over the table's timestamp score finds
-   the keys touched since the last sync, whose device time is the threshold.
-2. **Union.** The keys are all-gathered over the replica group and made unique.
-   `torch.unique` sorts them, so every replica merges them in the same order.
-3. **Read.** A const lookup (scores unchanged) finds which keys this replica
-   holds. Their embeddings are read at the precision a checkpoint holds them at,
-   which is lossless (fp16 for an fp8 table). The optimizer state is read at
-   checkpoint width (row-wise Adagrad's fp32 accumulator), along with all score
-   words.
-4. **Exchange.** Each replica sends a held mask per key (one byte) and only the
-   rows it holds. The sync is bound by bandwidth, and a replica that lacks a key
-   sends no row for it.
+1. **Touched keys.** Scan the timestamp column on the GPU and retain keys
+   touched since the last sync.
+2. **Union.** Gather the keys over the replica group and take their sorted
+   union. A const lookup maps the union to local value rows and hash slots.
+   After a dense sync, ranks can reuse this mapping when the live key count
+   and every cached key, slot, row and timestamp pass validation on all replicas.
+3. **Pack.** A CUDA kernel reads the held rows directly from the table and
+   packs their embedding bytes, live optimizer state and optional LFU counters.
+   FP8 values retain their stored encoding and packed Adagrad accumulators
+   retain their fp32 precision.
+4. **Exchange.** The general path all-gathers packed buffers over the replica
+   group. Each chunk is padded to the largest local held count. Sparse chunks
+   include a separate held mask. For dense chunks the next all-gather can
+   overlap the previous merge. Two local peers can also use symmetric memory
+   to exchange aligned embedding-only rows.
 5. **Merge.** Sums are taken in fp32. With a `CONSTANT` initializer, a replica
    without the key counts as a fresh row (the initial value at table precision
    and a fresh optimizer state), and the sum is divided by R. That is the average
@@ -74,8 +77,9 @@ For each table, in chunks of keys that bound the staging buffers:
    least 1, as for a fresh insert), and any other word sum // R.
 7. **Mark.** The threshold becomes the device time after the sync.
 
-A sync costs in proportion to the keys touched since the last one, not to the
-size of the table.
+The timestamp scan visits the hash table. Row traffic depends on touched keys,
+row widths, the number of holders and padding. The packed transport bounds its
+staging memory with `max_staging_bytes` per rank.
 
 ## 5. Checkpoints
 
@@ -92,7 +96,7 @@ count as any other.
 ## 6. Constraints, checked when `DynamicEmbReplicaSync` is built
 
 - **Values in HBM:** a `DynamicEmbStorage`, with no cache and no host tier. The
-  sync reads and writes rows through the flat-table operations.
+  CUDA kernels read and write rows through the flat value buffer.
 - **A timestamp score:** `TIMESTAMP` or `(TIMESTAMP, LFU)`. It is how the sync
   finds the touched keys.
 - **Row-wise tables of the default context:** a table must be sharded over this

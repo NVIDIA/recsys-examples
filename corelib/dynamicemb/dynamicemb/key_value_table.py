@@ -1997,6 +1997,10 @@ def _dump_table(
     append: bool = False,
 ) -> None:
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    # A multi-word score file historically held raw device clocks. Mark the
+    # age representation explicitly so existing checkpoints still load. A
+    # low-level raw dump (timestamp=0) retains its exact score round-trip.
+    compound_age = timestamp != 0 and state.key_index_map.num_scores_ > 1
     if not append and include_meta:
         meta_data = {}
         meta_data.update(state.optimizer.get_opt_args())
@@ -2018,6 +2022,9 @@ def _dump_table(
             state.optimizer.get_state_dtype(state.emb_dtype)
         )
 
+        if compound_age:
+            meta_data["timestamp_score_as_age"] = True
+
         if current_score is not None:
             meta_data["step_score"] = current_score
 
@@ -2034,7 +2041,11 @@ def _dump_table(
     ):
         fkey.write(keys.cpu().numpy().tobytes())
         fembedding.write(_raw_bytes(embeddings))
-        if state.evict_strategy == EvictStrategy.KLru:
+        if compound_age:
+            scores = _scores_to_age(
+                state.options_list[table_id].score_strategy, scores, timestamp
+            )
+        elif state.evict_strategy == EvictStrategy.KLru:
             scores = timestamp - scores
         fscore.write(scores.cpu().numpy().tobytes())
         if fopt_states and opt_states_batch is not None:
@@ -3264,6 +3275,18 @@ class DynamicEmbStorage(Storage):
             global_capacity=params.global_capacity,
             bucket_capacity=params.bucket_capacity,
         ):
+            if scores is not None and num_scores > 1:
+                strategy = self._state.options_list[table_id].score_strategy
+                if params.meta_data.get("timestamp_score_as_age"):
+                    scores = _age_to_scores(
+                        strategy, scores, timestamp or device_timestamp()
+                    )
+                elif timestamp:
+                    # With no saved clock anchor, preserve all historical
+                    # timestamps up to now. A future timestamp from another
+                    # GPU would keep resurfacing in every incremental scan.
+                    for col in _timestamp_score_columns(strategy):
+                        scores[:, col].clamp_(max=timestamp)
             if (
                 scores is not None
                 and load_perm is not None
