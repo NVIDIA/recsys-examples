@@ -31,7 +31,7 @@ from dynamicemb.types import SCORE_TYPE
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from dynamicemb.key_value_table import DynamicEmbTableState
+    from dynamicemb.state.table_state import DynamicEmbTableState
 
 
 def _timestamp_score_columns(score_strategy: ScoreStrategy) -> List[int]:

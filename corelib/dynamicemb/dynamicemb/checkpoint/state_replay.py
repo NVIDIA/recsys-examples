@@ -30,7 +30,7 @@ from dynamicemb.types import ReplayStats
 from dynamicemb.utils import encode_table_values
 
 if TYPE_CHECKING:
-    from dynamicemb.key_value_table import DynamicEmbTableState
+    from dynamicemb.state.table_state import DynamicEmbTableState
 
 
 def _replay_write_values(

@@ -43,7 +43,7 @@ from dynamicemb.utils import checkpoint_dtype, encode_table_values
 from dynamicemb_extensions import EvictStrategy, ScorePolicy
 
 if TYPE_CHECKING:
-    from dynamicemb.key_value_table import DynamicEmbTableState
+    from dynamicemb.state.table_state import DynamicEmbTableState
 
 
 def _resolve_shard(

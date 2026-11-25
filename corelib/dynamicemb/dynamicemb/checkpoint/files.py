@@ -14,8 +14,6 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch import Tensor
-
 from dynamicemb.key_ownership import OwnershipRule
 from dynamicemb.types import (
     EMBEDDING_TYPE,
@@ -24,6 +22,7 @@ from dynamicemb.types import (
     SCORE_TYPE,
     torch_dtype_to_np_dtype,
 )
+from torch import Tensor
 
 META_EMBEDDING_DTYPE = "embedding_dtype"
 META_EMBEDDING_DIM = "embedding_dim"

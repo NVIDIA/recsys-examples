@@ -24,7 +24,7 @@ import torch
 from dynamicemb_extensions import EvictStrategy, ScorePolicy
 
 if TYPE_CHECKING:
-    from dynamicemb.key_value_table import DynamicEmbTableState
+    from dynamicemb.state.table_state import DynamicEmbTableState
 
 
 @dataclass

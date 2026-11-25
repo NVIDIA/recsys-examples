@@ -37,7 +37,7 @@ from dynamicemb_extensions import EvictStrategy
 from torch import Tensor
 
 if TYPE_CHECKING:
-    from dynamicemb.key_value_table import DynamicEmbTableState
+    from dynamicemb.state.table_state import DynamicEmbTableState
 
 
 def export_keys_values_iter(
