@@ -1087,12 +1087,15 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         opt_file_path: Optional[str],
         include_optim: bool = False,
         include_meta: bool = False,
+        current_score: Optional[int] = None,
         timestamp: int = 0,
     ) -> None:
         if include_meta:
             meta_data = {}
             meta_data.update(self.optimizer.get_opt_args())
             meta_data["dist_type"] = self.options[table_id].dist_type
+            if current_score is not None:
+                meta_data["step_score"] = current_score
             with open(meta_file_path, "w") as f:
                 json.dump(meta_data, f)
 
@@ -1139,10 +1142,12 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         # which a table-row-wise table does not share.
         shard_index: Optional[int] = None,
         num_shards: Optional[int] = None,
-    ) -> None:
+    ) -> Optional[int]:
+        loaded_score = None
         if meta_file_path and os.path.exists(meta_file_path):
             with open(meta_file_path, "r") as f:
                 meta_data = json.load(f)
+            loaded_score = meta_data.get("step_score", None)
             opt_type = meta_data.get("opt_type", None)
             if (
                 opt_type
@@ -1268,6 +1273,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             fscore.close()
         if fopt_states:
             fopt_states.close()
+        return loaded_score
 
     def export_keys_values(
         self,
@@ -4284,6 +4290,58 @@ def test_caching_nine_ps_lfu_admission_carries_the_accumulated_count():
     lookup([hot, hot, hot])
     bdebt.flush()
     assert score(hot) == 6, f"back with {score(hot)}, expected 3 + 3"
+
+
+def test_caching_nine_ps_checkpoint_round_trip(tmp_path):
+    """NINE has no storage of ours, so the module's dump and load go to the PS
+    itself: what a trained table dumped comes back from a fresh one, whose cache
+    starts empty and reads the PS."""
+    device = torch.device("cuda:0")
+
+    def build():
+        options = DynamicEmbTableOptions(
+            dim=8,
+            max_capacity=256,
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=0,
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+            caching=True,
+            local_hbm_for_values=1024,
+            external_storage=PyDictStorage,
+        )
+        return BatchedDynamicEmbeddingTablesV2(
+            table_names=["t0"],
+            table_options=[options],
+            feature_table_map=[0],
+            pooling_mode=DynamicEmbPoolingMode.NONE,
+            optimizer=EmbOptimType.SGD,
+            use_index_dedup=True,
+            learning_rate=0.1,
+        )
+
+    keys = torch.arange(32, dtype=torch.int64, device=device)
+    offsets = torch.tensor([0, keys.numel()], dtype=torch.int64, device=device)
+
+    src = build()
+    assert src._storage_layout.cache_path == CachePath.NINE
+    # One SGD step moves the rows off their initial draw, so a loaded row that
+    # was re-initialized instead would differ.
+    src(keys, offsets).mean().backward()
+    torch.cuda.synchronize()
+    src.eval()
+    with torch.no_grad():
+        ref = src(keys, offsets).detach().clone()
+
+    src.dump(str(tmp_path))
+
+    dst = build()
+    assert dst._storage.size() == 0
+    dst.load(str(tmp_path))
+    assert dst._storage.size() >= keys.numel()
+    dst.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(dst(keys, offsets), ref)
 
 
 def test_caching_ps_below_storage_is_not_evaluated():

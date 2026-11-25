@@ -274,8 +274,25 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         embedding_file_path: str,
         score_file_path: Optional[str],
         opt_file_path: Optional[str],
-        timestamp: int,
+        include_optim: bool = True,
+        include_meta: bool = True,
+        current_score: Optional[int] = None,
+        timestamp: int = 0,
     ) -> None:
+        """Write one checkpoint shard of *table_id*.
+
+        ``BatchedDynamicEmbeddingTablesV2.dump`` passes all of these by keyword,
+        on whichever store is the module's ``_storage`` -- an external store too,
+        when it is the cache's only backing (NINE).
+
+        Args:
+            include_optim: also write the optimizer states.
+            include_meta: write the meta file (one shard per table does).
+            current_score: the module's running score for the table (the step
+                of a STEP table); record it in the meta as ``step_score`` so
+                that :meth:`load` can hand it back.
+            timestamp: the device timestamp the dump is taken at.
+        """
         pass
 
     @abc.abstractmethod
@@ -291,8 +308,10 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         timestamp: int,
         shard_index: Optional[int] = None,
         num_shards: Optional[int] = None,
-    ) -> None:
+    ) -> Optional[int]:
         """Read one checkpoint shard of *table_id* back into this store.
+
+        Returns the ``step_score`` the meta recorded, or None if it has none.
 
         Args:
             shard_index (Optional[int]): this shard's position among the ranks
