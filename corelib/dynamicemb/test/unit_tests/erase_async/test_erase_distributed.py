@@ -226,7 +226,7 @@ def check_host_only_is_refused() -> None:
     try:
         erase_by_score_async(model, S.CUSTOMIZED, THRESHOLD)
     except NotImplementedError as error:
-        assert "HOST_ONLY" in str(error), str(error)
+        assert "DDR" in str(error), str(error)
     else:
         raise AssertionError("an erase of a host-only table was not refused")
     _expect(model, table_names, OLD_KEYS, "host only")

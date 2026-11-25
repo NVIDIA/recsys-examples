@@ -1385,22 +1385,22 @@ def init_embedding_tables(stbe, bdet):
         table_ids = torch.full(
             (num_emb,), table_idx, dtype=torch.int64, device=split.device
         )
-        if isinstance(storage, DynamicEmbStorage):
-            max_emb_dim = storage.max_embedding_dim()
-            max_value_dim = storage.max_value_dim()
-            values = torch.zeros(
-                num_emb, max_value_dim, dtype=split.dtype, device=split.device
+        # Any Storage takes the rows: ours, or the PS that is the only tier below
+        # a NINE cache.
+        max_emb_dim = storage.max_embedding_dim()
+        max_value_dim = storage.max_value_dim()
+        values = torch.zeros(
+            num_emb, max_value_dim, dtype=split.dtype, device=split.device
+        )
+        values[:, :emb_dim] = split
+        if opt_state_dim > 0:
+            optimizer.reset_optimizer_states(
+                values[:, max_emb_dim : max_emb_dim + opt_state_dim],
+                emb_dims=emb_dim,
             )
-            values[:, :emb_dim] = split
-            if opt_state_dim > 0:
-                optimizer.reset_optimizer_states(
-                    values[:, max_emb_dim : max_emb_dim + opt_state_dim],
-                    emb_dims=emb_dim,
-                )
+        if isinstance(storage, DynamicEmbStorage):
             storage.set_score(1)
-            storage.insert(indices, table_ids, values)
-        else:
-            raise ValueError("Not support table type")
+        storage.insert(indices, table_ids, values)
 
 
 @pytest.mark.parametrize(
@@ -4189,7 +4189,7 @@ def test_caching_ps_takes_the_evictions(nine):
         # cache, and the cache keeps the table's own strategy.
         assert bdebt._external_storage is None
         ps = bdebt._storage
-        assert bdebt._cache._state.score_policy.name == "TIMESTAMP"
+        assert bdebt._cache._state.score_policy.name == "timestamp"
     else:
         assert bdebt._storage_layout == StorageLayout(
             StorageTier.HBM | StorageTier.DDR | StorageTier.EXTERNAL,
@@ -4201,7 +4201,11 @@ def test_caching_ps_takes_the_evictions(nine):
     def lookup(keys):
         keys = torch.tensor(keys, dtype=torch.int64, device=device)
         offsets = torch.tensor([0, keys.numel()], dtype=torch.int64, device=device)
-        return bdebt(keys, offsets).detach().clone()
+        # Under no_grad the batch's pins on the cache are released after the
+        # gather: a grad-mode forward keeps them until a backward that never
+        # comes here, and a pinned key is never evicted.
+        with torch.no_grad():
+            return bdebt(keys, offsets).detach().clone()
 
     first = list(range(32))
     # One SGD step moves the values off their initial draw, so what comes back
