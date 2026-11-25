@@ -32,6 +32,39 @@ bash ./run_example.sh --dist_type hash_roundrobin
 
 `hash_roundrobin` is an opt-in routing mode intended to reduce sensitivity to pathological raw-key patterns that can break plain modulo-based `roundrobin`.
 
+## 2D sparse parallelism
+
+Run the MovieLens example on four GPUs with two shards per replica. Each rank
+trains on its own slice of the data. Ranks 0 and 1 shard one copy of the
+embedding collection, and ranks 2 and 3 shard the other.
+
+```shell
+torchrun --standalone --nproc_per_node=4 example.py --train --epochs 1 \
+    --sharding_group_size 2 --replica_sync_interval 10
+```
+
+`--sharding_group_size` must divide the total number of ranks. Omitting it
+uses a single embedding collection sharded across the world. On multiple
+nodes, setting it to the GPUs per node keeps sharding within each node and
+merges corresponding shards across nodes.
+
+The dense model uses data parallelism across all ranks. After every
+`--replica_sync_interval` local optimizer steps (default 1), the example calls
+`DynamicEmbReplicaSync.sync()` to merge changed rows and their optimizer states
+by key. It also merges the final partial interval before evaluation or a full
+checkpoint. To train, save a full checkpoint, reload it, and evaluate it, run
+
+```shell
+torchrun --standalone --nproc_per_node=4 example.py --dump --load --epochs 1 \
+    --sharding_group_size 2 --save_dir ./movielens-2d-checkpoint
+```
+
+All replicas participate in the dump and load. Only the first replica writes
+embedding shards. The example's load demonstration removes its checkpoint
+directory after evaluation. The 2D path uses uncached HBM tables and defaults
+to timestamp scores. Incremental checkpointing and erase-by-score are
+unsupported in this mode.
+
 - Multi-worker data loading (`--num_workers`):
 ```shell
 export NGPU=2

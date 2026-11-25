@@ -20,6 +20,7 @@ from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbLoad,
+    DynamicEmbReplicaSync,
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     FrequencyAdmissionStrategy,
@@ -46,7 +47,7 @@ from torchrec.distributed.fbgemm_qcomm_codec import (
     QCommsConfig,
     get_qcomm_codecs_registry,
 )
-from torchrec.distributed.model_parallel import DistributedModelParallel
+from torchrec.distributed.model_parallel import DistributedModelParallel, DMPCollection
 from torchrec.distributed.planner import Topology
 from torchrec.distributed.planner.types import ShardingPlan
 from torchrec.distributed.types import ShardingType
@@ -184,13 +185,26 @@ def parse_args():
     parser.add_argument(
         "--score_strategy",
         type=str,
-        default="step",
+        default=None,
         choices=["step", "timestamp", "lru_lfu"],
-        help="Per-table eviction score strategy. 'lru_lfu' uses the compound "
+        help="Per-table eviction score strategy (default: step, or timestamp for 2D). "
+        "'lru_lfu' uses the compound "
         "(TIMESTAMP, LFU) tuple with the custom time-decayed-LFU score_function "
         "(requires numba-cuda).",
     )
 
+    parser.add_argument(
+        "--sharding_group_size",
+        type=int,
+        help="Enable 2D sparse parallelism and shard each replica across this many "
+        "consecutive global ranks. The group size must divide WORLD_SIZE.",
+    )
+    parser.add_argument(
+        "--replica_sync_interval",
+        type=int,
+        default=1,
+        help="In 2D training, merge replicas every N optimizer steps and at epoch end.",
+    )
     parser.add_argument(
         "--erase_interval",
         type=int,
@@ -262,6 +276,26 @@ def parse_args():
         "cloning the parent's CUDA context.",
     )
     args = parser.parse_args()
+    if args.score_strategy is None:
+        args.score_strategy = (
+            "timestamp" if args.sharding_group_size is not None else "step"
+        )
+    if args.replica_sync_interval < 1:
+        parser.error("--replica_sync_interval must be positive")
+    if args.sharding_group_size is not None:
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+        if args.sharding_group_size < 1 or world_size % args.sharding_group_size:
+            parser.error(
+                "--sharding_group_size must be a positive divisor of WORLD_SIZE"
+            )
+        if args.score_strategy == "step":
+            parser.error("2D replica sync needs --score_strategy timestamp or lru_lfu")
+        if args.caching or args.external_storage:
+            parser.error("2D replica sync requires uncached tables in HBM")
+        if args.incremental_dump or args.incremental_load or args.erase_interval:
+            parser.error(
+                "2D replica sync does not support incremental checkpoints or erase"
+            )
     if args.num_workers < 0:
         parser.error("--num_workers must be >= 0")
     if args.erase_interval < 0:
@@ -593,7 +627,8 @@ def get_planner(
     ddr_cap_per_node = 512 * 1024 * 1024 * 1024
     intra_host_bw = 450e9  # Nvlink bandwidth
     inter_host_bw = 25e9  # NIC bandwidth
-    world_size = dist.get_world_size()
+    # Each replica holds a complete copy distributed over its sharding group.
+    world_size = args.sharding_group_size or dist.get_world_size()
     bucket_capacity = 128
     # KVCounter hash bucket width (not ``DynamicEmbTableOptions.bucket_capacity``).
     kv_counter_bucket_capacity = 1024
@@ -675,13 +710,13 @@ def get_planner(
 
         dict_const[eb_config.name] = const
 
-    local_world_size = get_local_size()
+    local_world_size = min(get_local_size(), world_size)
     topology = Topology(
         local_world_size=local_world_size,
-        world_size=dist.get_world_size(),
+        world_size=world_size,
         compute_device=device.type,
         hbm_cap=hbm_cap,  # per GPU already
-        ddr_cap=ddr_cap_per_node // local_world_size,
+        ddr_cap=ddr_cap_per_node // get_local_size(),
         intra_host_bw=intra_host_bw,
         inter_host_bw=inter_host_bw,
     )
@@ -748,6 +783,18 @@ def apply_dmp(model, args, runtime: RuntimeContext, training):
         who will implement the sharded plan through `sharder` and hold the `ShardedDynamicEmbeddingCollection` after sharding.
     Then you can use `dmp` for **training** and **evaluation**, just like using `EmbeddingCollection`.
     """
+    if args.sharding_group_size is not None:
+        return DMPCollection(
+            module=model,
+            device=runtime.device,
+            sharders=[sharder],
+            plan=plan,
+            world_size=runtime.world_size,
+            sharding_group_size=args.sharding_group_size,
+            node_group_size=min(get_local_size(), args.sharding_group_size),
+            global_pg=dist.group.WORLD,
+            use_inter_host_allreduce=True,
+        )
     dmp = DistributedModelParallel(
         module=model,
         device=runtime.device,
@@ -858,6 +905,7 @@ def train_one_epoch(
     total_epochs,
     runtime: RuntimeContext,
     args=None,
+    replica_sync: Optional[DynamicEmbReplicaSync] = None,
 ):
     model.train()
     total_loss = 0
@@ -875,6 +923,13 @@ def train_one_epoch(
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+        step = batch_idx + 1
+        if replica_sync is not None and (
+            step % args.replica_sync_interval == 0 or step == len(train_loader)
+        ):
+            model.sync(include_optimizer_state=True)
+            replica_sync.sync()
 
         total_loss += loss.item()
 
@@ -941,6 +996,9 @@ def train(args, runtime: RuntimeContext):
 
     model = create_model(args, runtime)
     model.to(runtime.device)
+    replica_sync = (
+        DynamicEmbReplicaSync(model) if isinstance(model, DMPCollection) else None
+    )
 
     optimizer = Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
@@ -956,6 +1014,7 @@ def train(args, runtime: RuntimeContext):
             args.epochs,
             runtime,
             args,
+            replica_sync,
         )
         test_one_epoch(model, test_loader, criterion, epoch, args.epochs, runtime)
 
@@ -972,6 +1031,9 @@ def dump(args, runtime: RuntimeContext):
 
     model = create_model(args, runtime)
     model.to(runtime.device)
+    replica_sync = (
+        DynamicEmbReplicaSync(model) if isinstance(model, DMPCollection) else None
+    )
 
     optimizer = Adam(model.parameters(), lr=args.lr)
     criterion = nn.MSELoss()
@@ -987,6 +1049,7 @@ def dump(args, runtime: RuntimeContext):
             args.epochs,
             runtime,
             args,
+            replica_sync,
         )
 
         # ShardedDyanmicEmbeddingCollection.state_dict() will return a dummy tensor.
