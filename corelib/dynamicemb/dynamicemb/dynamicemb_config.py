@@ -1381,6 +1381,19 @@ def get_sharded_table_capacity(
     return int(num_buckets * effective_bucket)
 
 
+def _budget_capacity(max_capacity: int, frac: float, bucket_capacity: int) -> int:
+    """Rows a ``frac`` share of a table's ``max_capacity`` buys, in whole buckets.
+
+    The hash table rounds a capacity up to whole buckets, so a share that is not
+    one would hold more than its budget: round down, but to one bucket at least
+    (a table cannot have fewer, so a share of 0 is one bucket, not one row).
+    """
+    return max(
+        bucket_capacity,
+        int(max_capacity * frac) // bucket_capacity * bucket_capacity,
+    )
+
+
 def get_group_value_bytes_by_tier(
     members: "List[Tuple[DynamicEmbTableOptions, Optional[OptimType]]]",
 ) -> Tuple[int, int]:
@@ -1453,7 +1466,17 @@ def get_group_value_bytes_by_tier(
         table_bytes = options.max_capacity * DTYPE_NUM_BYTES[dtype] * (dim + state_dim)
         total += table_bytes
         hbm_kept += min(table_bytes, budget)
-        ddr_kept += min(table_bytes, ddr)
+        if ddr > 0:
+            # What the runtime allocates: the share the budget buys, rounded to
+            # whole buckets and never below one bucket (a MAX_BUCKET_CAPACITY
+            # table is one bucket the size of its shard).
+            bucket = min(options.bucket_capacity, options.max_capacity)
+            kept_rows = _budget_capacity(
+                options.max_capacity, min(1.0, ddr / table_bytes), bucket
+            )
+            ddr_kept += min(
+                table_bytes, kept_rows * (table_bytes // options.max_capacity)
+            )
 
     first = members[0][0]
     caching = first.caching

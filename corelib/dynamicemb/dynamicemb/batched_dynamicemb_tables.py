@@ -49,6 +49,7 @@ from dynamicemb.checkpoint_io import (  # noqa: F401 - preserve checkpoint helpe
     list_checkpoint_files,
 )
 from dynamicemb.dynamicemb_config import (
+    _budget_capacity,
     DynamicEmbCheckMode,
     DynamicEmbEvictStrategy,
     DynamicEmbPoolingMode,
@@ -109,19 +110,6 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     WeightDecayMode,
 )
 from torch import Tensor, nn  # usort:skip
-
-
-def _budget_capacity(max_capacity: int, frac: float, bucket_capacity: int) -> int:
-    """Rows a ``frac`` share of a table's ``max_capacity`` buys, in whole buckets.
-
-    The hash table rounds a capacity up to whole buckets, so a share that is not
-    one would hold more than its budget: round down, but to one bucket at least
-    (a table cannot have fewer, so a share of 0 is one bucket, not one row).
-    """
-    return max(
-        bucket_capacity,
-        int(max_capacity * frac) // bucket_capacity * bucket_capacity,
-    )
 
 
 def _tier_bytes_from_state(state) -> List[Tuple[int, int, int, int, int, int]]:

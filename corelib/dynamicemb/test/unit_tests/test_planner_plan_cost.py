@@ -771,7 +771,25 @@ class TestGroupedTiers:
         # Without a PS the storage holds the whole table whatever the budget.
         o = caching(rows_bytes // 2)
         o.external_storage = None
-        assert get_group_value_bytes_by_tier([(o, None)]) == (rows_bytes // 4, rows_bytes)
+        assert get_group_value_bytes_by_tier([(o, None)]) == (
+            rows_bytes // 4,
+            rows_bytes,
+        )
+
+    def test_a_ddr_budget_below_one_bucket_costs_the_whole_bucket(self):
+        """The storage rounds its share to whole buckets and keeps one at
+        least, so a budget smaller than a bucket still takes the bucket: with
+        one bucket spanning the shard (MAX_BUCKET_CAPACITY) that is the table."""
+        rows_bytes = ROWS * DIM * 4
+        o = _options(hbm_budget=rows_bytes // 4)
+        o.caching = True
+        o.external_storage = object()
+        o.bucket_capacity = o.max_capacity  # one bucket spans the shard
+        o.local_ddr_for_values = rows_bytes // 16
+        assert get_group_value_bytes_by_tier([(o, None)]) == (
+            rows_bytes // 4,
+            rows_bytes,
+        )
 
     def test_an_unsized_table_reports_its_budget(self):
         """No dim or capacity means nothing to size from, so it fills its own
