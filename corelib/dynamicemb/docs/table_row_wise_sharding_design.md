@@ -196,7 +196,7 @@ independently wherever ownership matters:
 |---|---|---|
 | `_block_bucketize_sparse_features_cuda_kernel1/2` | `idx % my_size`, `murmur(idx) % my_size`, or block | yes |
 | `batched_dynamicemb_tables.owned_key_mask` | same three, in numpy | yes |
-| `key_value_table._iter_batches_from_files` (checkpoint load) | `keys % world_size == rank` | **no** |
+| `checkpoint.files._iter_batches_from_files` (checkpoint load) | `keys % world_size == rank` | **no** |
 | `scored_hashtable.LinearBucketTable.load` (counter load) | `keys % world_size == rank` | **no** |
 | `construct_twin_module.init_twin_embedding_model` | `indices % self._world_size == self._rank` | **no** |
 

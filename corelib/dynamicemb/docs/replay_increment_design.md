@@ -328,7 +328,9 @@ class ReplayStats:
 | `src/table_operation/insert.cu` | `table_scatter_keys_at_slots` implementation |
 | `src/table_operation/table.cuh` / `table.cu` | declaration + pybind registration |
 | `dynamicemb/scored_hashtable.py` | `LinearBucketTable.scatter_keys_at_slots` |
-| `dynamicemb/key_value_table.py` | dump-side `slot_index` / `_split_value_row`; storage-level `replay_increment` / `erase_keys`; generalised all-gather |
+| `dynamicemb/state/value_rows.py` | dump-side `slot_index` / `_split_value_row` |
+| `dynamicemb/checkpoint/state_dump.py` | generalised all-gather |
+| `dynamicemb/key_value_table.py` | storage-level `replay_increment` / `erase_keys` |
 | `dynamicemb/score/checkpoint_columns.py` | `_dump_score_block` (+ age transform); `_fresh_score_block` |
 | `dynamicemb/batched_dynamicemb_tables.py` | module-level `replay_increment`; `meta` layout fields; single `cur_ts` |
 | `dynamicemb/incremental_dump.py` | model-level `replay_increment`; `DeltaDumpResult` doc |

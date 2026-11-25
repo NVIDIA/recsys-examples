@@ -496,7 +496,7 @@ reader from seeing a half-filled buffer.
 | Kernel, one slot at a time: read the key; if live and `score < threshold`, `try_lock`, re-read the score under the lock, spare a pinned slot (`slot_is_pinned`, a volatile read of the counter), else clear the score block, write the reclaimed digest, unlock with `reclaimed_key`, `atomicSub(bucket_sizes)`; counts by ballot; grid-stride, 64-bit | `src/table_operation/kernels.cuh` (`table_erase_by_score_kernel`), `erase_by_score.cu`; binding releases the GIL |
 | A reclaimed slot has a digest of its own (`reclaimed_digest`, apart from the empty one), written by every place that makes one: erase, erase by score, rehash placement, replay restore | `types.cuh`, `table_rows.cu`, `kernels.cuh` (`4ec7d48`) |
 | Python wrapper of the kernel over a slot range `[begin, end)` of one table | `scored_hashtable.py`: `LinearBucketTable.erase_by_score` |
-| Chunks, `key_map_generation`, the in-flight limit | `key_value_table.py`: `next_erase_chunk_end`, `_erase_state_by_score`, `DynamicEmbStorage.erase_by_score`, `ERASE_CHUNK_SLOTS`, `ERASE_MAX_CHUNKS_IN_FLIGHT` |
+| Chunks, `key_map_generation`, the in-flight limit | `state/erase.py`: `next_erase_chunk_end`, `_erase_state_by_score`, `ERASE_CHUNK_SLOTS`, `ERASE_MAX_CHUNKS_IN_FLIGHT`; `key_value_table.py`: `DynamicEmbStorage.erase_by_score` |
 | `FairLock`, `TableAccessGate`, `AsyncEraser`, `EraseHandle`, `EraseHandleGroup`, `check_erase_arguments`, `erase_by_score_async` | `async_erase.py` |
 | Prefetch's section | `batched_dynamicemb_function.py`: `dynamicemb_prefetch(table_gate=...)` |
 | The module's gate and worker, `erasable_table_ids`, the method | `batched_dynamicemb_tables.py` |
