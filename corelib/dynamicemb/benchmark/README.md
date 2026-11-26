@@ -987,3 +987,89 @@ once). So NVLink moves about 7 times as much per GPU as one NIC (50 GB/s).
 
 The hierarchical dist's output dist needs the plans its own input dist makes,
 so this benchmark times it in place (`--kernel_times`, `--trace`).
+
+## Replica sync bandwidth
+
+Run inside `corelib/dynamicemb` with two replicas. Each replica has half the
+world as its contiguous row-wise sharding group. The benchmark runs every
+pair of replica peers concurrently. For example, use these launches on an
+H100 SXM NVSwitch node and on two such nodes with a dedicated 400 Gb/s
+InfiniBand rail per GPU, respectively.
+
+```bash
+torchrun --standalone --nproc-per-node=8 benchmark/benchmark_replica_sync.py \
+    --fabric nvlink --peak-gbps 450
+srun -N2 --ntasks-per-node=8 python benchmark/benchmark_replica_sync.py \
+    --fabric ib --peak-gbps 50
+```
+
+Set `--peak-gbps` to the physical bandwidth in **decimal GB/s per GPU in
+one direction** for the tested topology. Account for GPUs sharing a NIC.
+Record the GPU and NIC topology (`nvidia-smi topo -m`, `nvidia-smi nvlink -s`,
+`ibstat`) and confirm the NCCL transport for the peer groups with
+`NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=GRAPH,NET,P2P`. The JSON lists hostnames
+and peer ranks. For these single-node NVLink and two-node IB configurations,
+the benchmark checks that NVLink pairs share a host and IB pairs span hosts.
+
+The default workload uses 131072 touched keys per shard, 256 FP32 values
+per key, SGD and timestamp scores. Both replicas hold every measured key.
+They write different values and fresh timestamps before each call. The
+timer surrounds the complete `DynamicEmbReplicaSync.sync()`, including key
+discovery, communication, merge and writeback. Setup, rank alignment and
+the independent readback of every averaged row fall outside this interval.
+The benchmark checks touched and held counts on every call.
+
+Effective bandwidth is `rows × dim × element_size / mean(max_rank_seconds)`.
+The numerator counts each embedding sent to the peer once. Padding, local
+traffic, control bytes and receive-side duplicates are excluded. The JSON
+also reports the bandwidth of a payload-only NCCL all-gather on the same
+concurrent replica pairs. The strict pass condition is end-to-end effective
+bandwidth greater than 80% of the specified physical peak. A miss prints the
+measurement and exits nonzero. Results apply to the reported shape, dtype,
+key overlap and topology.
+
+### Measured H100 InfiniBand run
+
+Two DGX H100 nodes with eight GPUs and eight 400 Gb/s NDR ports per node
+achieved **40.38 GB/s per GPU (80.76%)** on the full sync. The payload-only
+NCCL baseline reached 48.82 GB/s. Each of the eight concurrent replica pairs
+exchanged 2 GiB per GPU per direction. The run used three warmup and ten
+measured iterations. Mean slowest-rank time was 53.18 ms. Run the same
+case on an allocation with the corresponding topology using
+
+```bash
+srun -N2 --ntasks-per-node=8 env LOCAL_WORLD_SIZE=8 \
+    NCCL_CROSS_NIC=0 NCCL_NET_PLUGIN=none NCCL_MIN_NCHANNELS=8 \
+    NCCL_MAX_NCHANNELS=8 NCCL_BUFFSIZE=8388608 \
+    python benchmark/benchmark_replica_sync.py --fabric ib --peak-gbps 50 \
+    --rows 2097152 --dim 256 --dtype fp32 --staging-mib 1536
+```
+
+The 1536 MiB staging budget permits 256 MiB packets on this two-replica
+workload. Smaller payloads spend a larger fraction of wall time validating
+keys, dispatching collectives and finishing writeback.
+
+### Measured H100 and H200 NVLink runs
+
+Each run used two SXM GPUs on a single host with 18 active NVLinks per GPU
+and a 450 GB/s one-direction rating. The table reports full replica sync and
+the payload-only NCCL comparison at four warmups and ten measured iterations.
+
+| GPU | Rows per shard | FP32 dimension | Payload per GPU | Staging MiB | Sync GB/s | Utilization | NCCL GB/s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| H100 | 131072 | 256 | 128 MiB | 6500 | 162.53 | 36.12% | 234.18 |
+| H100 | 786432 | 2048 | 6 GiB | 6500 | 368.91 | 81.98% | 295.20 |
+| H200 | 786432 | 2048 | 6 GiB | 6500 | 370.10 | 82.24% | 296.21 |
+| H200 | 10485760 | 256 | 10 GiB | 12800 | 361.43 | 80.32% | 320.07 |
+
+To reproduce the 6 GiB measurement on either platform, run
+
+```bash
+torchrun --standalone --nproc-per-node=2 benchmark/benchmark_replica_sync.py \
+    --fabric nvlink --peak-gbps 450 --rows 786432 --dim 2048 \
+    --staging-mib 6500 --warmup 4 --iterations 10
+```
+
+For the H200 10 GiB case, set `--rows 10485760 --dim 256 --staging-mib 12800`.
+For the H100 128 MiB case, set `--rows 131072 --dim 256`. Its measured 36.12%
+falls below the strict acceptance threshold.
