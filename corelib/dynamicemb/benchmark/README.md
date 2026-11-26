@@ -1045,11 +1045,11 @@ calls. Payload is the total over tables per GPU per direction.
 | NVLink | 2 | 2 | 393216 | 2048 | 6 GiB | 12600 | 364.66 | 81.04% |
 | NVLink | 2 | 2 | 786432 | 2048 | 12 GiB | 12600 | 91.88 | 20.42% |
 | NVLink | 8 | 1 | 786432 | 2048 | 6 GiB | 6500 | 368.90 | 81.98% |
-| NVLink | 8 | 2 | 393216 | 2048 | 6 GiB | 6500 | 363.46 | 80.77% |
+| NVLink | 8 | 2 | 393216 | 2048 | 6 GiB | 6500 | 362.46 | 80.55% |
 | NVLink | 8 | 4 | 262144 | 2048 | 8 GiB | 8500 | 359.87 | 79.97% |
 | NVLink | 8 | 2 | 131072 | 256 | 256 MiB | 6500 | 195.52 | 43.45% |
 | IB | 16 | 1 | 2097152 | 256 | 2 GiB | 1536 | 40.53 | 81.05% |
-| IB | 16 | 2 | 2097152 | 256 | 4 GiB | 1536 | 40.61 | 81.22% |
+| IB | 16 | 2 | 2097152 | 256 | 4 GiB | 1536 | 40.69 | 81.38% |
 
 With two GPUs, two tables, 6 GiB payload and 6500 MiB staging, the earlier
 per-table implementation at `abd303fc` measured 357.10 GB/s (79.36%) on a
