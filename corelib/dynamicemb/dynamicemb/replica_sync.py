@@ -35,6 +35,7 @@ from dynamicemb.key_value_table import (
     DynamicEmbStorage,
     get_find_score_arg,
 )
+from dynamicemb.replica_peer import ReplicaPeer
 from dynamicemb.types import DynamicEmbInitializerMode
 from dynamicemb.utils import encode_table_values
 from dynamicemb_extensions import device_timestamp
@@ -163,19 +164,27 @@ class DynamicEmbReplicaSync:
         be sharded row-wise over the default context's sharding group, keep their
         values in HBM (no cache, no host tier), and keep a timestamp score.
     max_staging_bytes : int
-        Per-rank budget for packed NCCL send/receive slabs (default 256 MiB).
-        At least one row is exchanged per slab. Set the same value on all ranks.
+        Per-rank budget for communication payloads (default 256 MiB). All
+        replicas use the smallest requested budget. A packed NCCL slab holds
+        at least one row.
     """
 
     def __init__(
         self, model: DMPCollection, *, max_staging_bytes: int = SYNC_CHUNK_BYTES
     ) -> None:
-        if max_staging_bytes <= 0:
-            raise ValueError("max_staging_bytes must be positive")
-        self.max_staging_bytes = max_staging_bytes
         mesh = model.device_mesh
         self.replica_group = mesh.get_group("replicate")
         self.replica_count = dist.get_world_size(self.replica_group)
+        budget = torch.tensor(max_staging_bytes, dtype=torch.long, device="cuda")
+        dist.all_reduce(budget, op=dist.ReduceOp.MIN, group=self.replica_group)
+        self.max_staging_bytes = budget.item()
+        if self.max_staging_bytes <= 0:
+            raise ValueError("max_staging_bytes must be positive on every replica")
+        self._peer = (
+            ReplicaPeer(self.replica_group, self.max_staging_bytes)
+            if self.replica_count == 2
+            else None
+        )
         self.kernels = get_dynamic_emb_module(model)
         shard_ranks = dist.get_process_group_ranks(mesh.get_group("shard"))
         if errors := replica_sync_errors(self.kernels, shard_ranks):
@@ -237,6 +246,8 @@ class DynamicEmbReplicaSync:
                 ]
                 return keys, None, rows, slots, counts
             del self._dense_routes[token]
+            if self._peer is not None:
+                self._peer.routes.pop(token, None)
 
         # Consume the same threshold scan as incremental_dump directly on the
         # device. Checkpoint-oriented incremental_dump stages its output on CPU.
@@ -319,6 +330,27 @@ class DynamicEmbReplicaSync:
             return TableSyncStats(name, 0, 0)
         replica = dist.get_rank(self.replica_group)
         local_keys = sum(c[replica] for c in counts)
+        if (
+            self._peer is not None
+            and layout.scores == 1
+            and (not layout.opt_columns or layout.opt_bytes == fresh.element_size())
+            and payload == fresh.numel() * fresh.element_size()
+            and state.emb_dtype in (torch.float32, torch.float16, torch.bfloat16)
+            and payload % 16 == 0
+            and payload * keys.numel() >= 8 << 20
+            and all(sum(c[r] for c in counts) == keys.numel() for r in range(2))
+            and self._peer.sync(
+                (kernel, table_id),
+                state.tables[table_id].tensor(),
+                _buckets(state, table_id),
+                rows,
+                slots,
+                layout.bucket_capacity,
+            )
+        ):
+            return TableSyncStats(name, keys.numel(), local_keys)
+        if self._peer is not None:
+            self._peer.release_workspace()
         lookup = get_find_score_arg(
             state, keys.numel(), state.device, const_lookup=True
         )

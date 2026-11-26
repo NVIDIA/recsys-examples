@@ -1046,7 +1046,8 @@ srun -N2 --ntasks-per-node=8 env LOCAL_WORLD_SIZE=8 \
 ```
 
 The 1536 MiB staging budget permits 256 MiB packets on this two-replica
-workload. Smaller payloads spend a larger fraction of wall time validating
+workload. A second two-node run on the integrated build achieved 40.48 GB/s
+(80.97%) with the same settings. Smaller payloads spend a larger fraction of wall time validating
 keys, dispatching collectives and finishing writeback.
 
 ### Measured H100 and H200 NVLink runs
@@ -1073,3 +1074,8 @@ torchrun --standalone --nproc-per-node=2 benchmark/benchmark_replica_sync.py \
 For the H200 10 GiB case, set `--rows 10485760 --dim 256 --staging-mib 12800`.
 For the H100 128 MiB case, set `--rows 131072 --dim 256`. Its measured 36.12%
 falls below the strict acceptance threshold.
+
+The same 6 GiB H100 workload with `--nproc-per-node=4` (two replicas of two
+shards) reached 367.95 GB/s per GPU (81.77%). With `--nproc-per-node=8`
+(two replicas of four shards), all four peer pairs ran concurrently and
+reached 367.54 GB/s per GPU (81.67%).

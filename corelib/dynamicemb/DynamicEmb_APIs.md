@@ -1186,8 +1186,10 @@ Keep the DynamicEmb tables of a TorchRec 2D sparse parallelism model (`DMPCollec
                 the default context's sharding group, keep their values in HBM (no cache, no host tier), and keep a
                 timestamp score (TIMESTAMP or (TIMESTAMP, LFU)). Raises ValueError otherwise.
             max_staging_bytes : int
-                Per-rank budget for the packed NCCL send and receive buffers. Use the same positive value
-                on every rank. Larger slabs can improve bandwidth on high-latency links.
+                Per-rank payload staging budget in bytes. Each replica group uses the smallest requested
+                value. This bounds the symmetric-memory inbox and the packed NCCL slabs (at least one
+                row per slab). Hash-table coordinates and the CUDA allocator's internal metadata are
+                additional. Larger budgets can improve throughput for large syncs.
             """
 
         def sync(self) -> List[TableSyncStats]:

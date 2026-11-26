@@ -78,8 +78,15 @@ For each table, in chunks of keys that bound the staging buffers:
 7. **Mark.** The threshold becomes the device time after the sync.
 
 The timestamp scan visits the hash table. Row traffic depends on touched keys,
-row widths, the number of holders and padding. The packed transport bounds its
-staging memory with `max_staging_bytes` per rank.
+row widths, the number of holders and padding. Each replica group uses the
+smallest `max_staging_bytes` among its ranks for payload staging. For two local
+GPUs with mutual P2P atomic access and both devices visible to each process,
+an aligned, fully held table with a single timestamp score can use one
+symmetric-memory inbox. A compact table that fits can DMA directly into it.
+Other layouts reuse two slabs in the same workspace. When either peer cannot
+allocate the inbox the pair tries the slab path, then packed NCCL. Falling
+back to NCCL releases the peer workspace. The budget excludes cached key and
+row coordinates. NCCL processes at least one row per slab.
 
 ## 5. Checkpoints
 
@@ -87,8 +94,11 @@ A DynamicEmb kernel names its checkpoint files by its own shard index and shard
 count, read off the placements TorchRec planned. Under 2D, shard s of every
 replica therefore writes the same file names. `DynamicEmbDump` given a
 `DMPCollection` has the first replica dump, over its sharding group, while the
-others wait at `pg`. `DynamicEmbLoad` needs no change: every replica reads its
-own shard's files. A shard's meta records `sharding_type: table_row_wise`,
+others wait at `pg`. Each replica loads its own shard's files. Checkpoints
+with a compound score store the timestamp column as an age and preserve the
+LFU column. Loading reconstructs the timestamp using the reader GPU's clock.
+For older compound checkpoints that store raw timestamps, the loader clamps
+future timestamps to the local time. A shard's meta records `sharding_type: table_row_wise`,
 because the table is on fewer ranks than the world. That field is informational,
 and a checkpoint written under 2D loads into a row-wise world of the same shard
 count as any other.
