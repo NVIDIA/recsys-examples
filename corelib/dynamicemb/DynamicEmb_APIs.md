@@ -978,9 +978,19 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             (same ``bucket_capacity`` you pass into ``get_sharded_table_capacity``, e.g. ``128`` or ``MAX_BUCKET_CAPACITY``),
             then multiply by a cache ratio or scale if desired. The planner overwrites **per-rank**
             ``local_hbm_for_values`` to ``ceil(global_hbm_for_values / world_size)``.
+        global_ddr_for_values : int
+            Total host memory (DDR) for the values of the ``DynamicEmbStorage`` tier of a caching table, in bytes.
+            Default is 0 (unset). Only read with ``caching=True`` **and** an ``external_storage``, where it selects the
+            cache path (see ``external_storage``); ignored, with a warning, without one. The planner overwrites
+            **per-rank** ``local_ddr_for_values`` to ``ceil(global_ddr_for_values / fanout)``.
         external_storage: Storage
             The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
             If not provided, will using DynamicEmbeddingTable as the Storage.
+            With ``caching=True`` the cache path follows from it: without an ``external_storage``, or with one and a
+            ``global_ddr_for_values``, the **inclusive** path (HBM cache ⊂ ``DynamicEmbStorage``, which owns the scores;
+            the PS, if any, sits below the storage and receives what it evicts); with one and no
+            ``global_ddr_for_values``, the **NINE** path (HBM cache + PS, no ``DynamicEmbStorage``; the cache owns the
+            scores). ``NO_EVICTION`` is not supported with an ``external_storage``.
         index_type : Optional[torch.dtype], optional
             Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
         admit_strategy : Optional[AdmissionStrategy], optional
@@ -1901,6 +1911,16 @@ dynamicemb supports caching hot embeddings on GPU memory, and you can prefetch k
 
 dynamicemb supports external storage once `external_storage` in `DynamicEmbTableOptions` inherits the `Storage` interface under [types.py](./dynamicemb/types.py). 
 Refer to demo `PyDictStorage` in [unit test](./test/test_batched_dynamic_embedding_tables_v2.py) for detailed usage.
+
+With `caching=True` an `external_storage` takes one of two places, chosen by `global_ddr_for_values`:
+
+| `external_storage` | `global_ddr_for_values` | Cache path | Tiers | Scores owned by |
+|---|---|---|---|---|
+| unset | (ignored) | inclusive | cache ⊂ `DynamicEmbStorage` (whole table) | the storage |
+| set | > 0 | inclusive | cache ⊂ `DynamicEmbStorage` (`local_ddr_for_values`) ⊂ PS | the storage |
+| set | unset | NINE | cache + PS | the cache (a single `score_strategy`; not a compound one) |
+
+The inclusive path ranks the cache by timestamp only. The NINE path (non-inclusive, non-exclusive: the PS is opaque, so a key can be in both) keeps the table's own `score_strategy` in the cache and writes each evicted key to the PS with its score. `NO_EVICTION` is not supported with an `external_storage`, and neither is a compound `score_strategy` (e.g. `(TIMESTAMP, LFU)`) on the NINE path, which keeps one score word per key; evaluation does not read a PS that sits below the storage (inclusive + PS) and raises, while NINE evaluates through cache and PS. Async erase and `incremental_dump` support the inclusive path without a PS only.
 
 
 ## Table expansion

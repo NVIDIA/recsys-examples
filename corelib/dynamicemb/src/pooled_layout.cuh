@@ -23,7 +23,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 
 // Bag geometry of a pooled lookup, device side. The spec lives in
-// dynamicemb/lookup_layout.py -- read that first; this mirrors the pooled
+// dynamicemb/lookup/embedding_layout.py -- read that first; this mirrors the pooled
 // subset of its EmbeddingLayout, member for member, so the two cannot drift.
 // Only the pooled subset: a sequence lookup emits one row per key, has no bags
 // to number, and never reads any of this.

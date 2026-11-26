@@ -125,7 +125,7 @@ def assert_batched_dynamicemb_storage_class(
     - Must be :class:`DynamicEmbStorage` or :class:`HybridStorage`.
     - With ``--caching``: expect ``DynamicEmbStorage`` (backing store under cache).
     - No cache and ``global_hbm_budget_scale < 1``: expect ``HybridStorage``
-      (StorageMode DEFAULT / two-tier).
+      (the generic prefetch path / two-tier).
     - No cache and full budget: expect single-tier ``DynamicEmbStorage``.
     """
     for _, _, sharded_module in find_sharded_modules(model, ""):

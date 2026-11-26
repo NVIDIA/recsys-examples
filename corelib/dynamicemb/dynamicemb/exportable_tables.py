@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from dynamicemb.checkpoint_io import (
+from dynamicemb.checkpoint.files import (
     _iter_batches_from_files,
     encode_meta_json_file_path,
     get_loading_files,

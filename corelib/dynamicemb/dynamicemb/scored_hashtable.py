@@ -17,7 +17,6 @@ import abc
 import enum
 import os
 import warnings
-from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import numpy as np
@@ -25,6 +24,11 @@ import torch
 import torch.distributed as dist
 from dynamicemb.dynamicemb_config import dtype_to_bytes
 from dynamicemb.key_ownership import OwnershipRule, murmur3_hash_64bits
+from dynamicemb.score.args import ScoreArg  # noqa: F401 (re-exported)
+from dynamicemb.score.spec import (  # noqa: F401 (re-exported)
+    ScoreSpec,
+    score_policy_num_scores,
+)
 from dynamicemb.types import KEY_TYPE, SCORE_TYPE, MemoryType, torch_dtype_to_np_dtype
 from dynamicemb_extensions import (
     ScorePolicy,
@@ -49,31 +53,6 @@ from dynamicemb_extensions import (
     table_scatter_score_blocks,
     table_update_counter_with_layout,
 )
-
-
-@dataclass(frozen=True)
-class ScoreSpec:
-    name: str
-    policy: ScorePolicy  # How to set the new score, this is the default behavior.
-    dtype: torch.dtype = torch.uint64
-    priority: int = 0  # If multiple scores exist, the one with lower priority will be reduced first.
-    is_reduction: bool = True  # Whether it is reduced
-
-
-@dataclass
-class ScoreArg:
-    name: str
-    value: Optional[torch.Tensor] = None
-    policy: Optional[
-        ScorePolicy
-    ] = None  # How to set the new score, and providing this will override the default.
-
-
-def score_policy_num_scores(policy) -> int:
-    """Number of contiguous score words a policy occupies per key. LRU_LFU stores
-    a (timestamp, frequency) pair; every other policy is a single word. Mirrors
-    ``score_policy_num_scores`` on the C++ side."""
-    return 2 if policy == ScorePolicy.LRU_LFU else 1
 
 
 @enum.unique
@@ -389,7 +368,7 @@ class LinearBucketTable(ScoredHashTable):
         # cubin; ensure the packaged fatbins are loaded into the C++ side before
         # any eviction. The default (Lex) evictor needs no numba.
         if len(self.score_types_) > 1:
-            from dynamicemb.jit.score_jit import ensure_lex_fatbin_loaded
+            from dynamicemb.score.jit import ensure_lex_fatbin_loaded
 
             ensure_lex_fatbin_loaded()
 

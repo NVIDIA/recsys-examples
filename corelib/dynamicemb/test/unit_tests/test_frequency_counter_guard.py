@@ -22,6 +22,7 @@ has no use for it, such as CUSTOMIZED tables next to LFU ones.
 asked for frequencies would have them misread as scores.
 """
 
+import inspect
 import dynamicemb.batched_dynamicemb_tables as tables_module
 import pytest
 import torch
@@ -86,11 +87,12 @@ def _spy_prefetch(monkeypatch):
     """Record the ``frequency_counters`` each ``dynamicemb_prefetch`` call gets."""
     seen = []
     real = tables_module.dynamicemb_prefetch
+    signature = inspect.signature(real)
 
     def spy(*args, **kwargs):
-        # Positional order: indices, offsets, cache, storage, feature_offsets,
-        # initializer, forward_stream, evict_strategy, frequency_counters, ...
-        seen.append(args[8])
+        # By name: the parameters' positions move with the signature.
+        bound = signature.bind(*args, **kwargs)
+        seen.append(bound.arguments.get("frequency_counters"))
         return real(*args, **kwargs)
 
     monkeypatch.setattr(tables_module, "dynamicemb_prefetch", spy)

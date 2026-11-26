@@ -494,6 +494,7 @@ def _prepare_dynemb_table_options(
         aligned_per_rank_rows = num_buckets * effective_bucket_capacity
         opts.max_capacity = aligned_per_rank_rows
         opts.local_hbm_for_values = math.ceil(opts.global_hbm_for_values / fanout)
+        opts.local_ddr_for_values = math.ceil(opts.global_ddr_for_values / fanout)
         # A cache is an HBM tier: a table whose budget resolved to zero cannot
         # have one, and this is the last moment before the options are grouped
         # and costed -- both read `caching` to decide a layout.

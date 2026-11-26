@@ -63,7 +63,7 @@ from ..dynamicemb_config import (
     TORCHREC_OUTPUT_DIST,
     DynamicEmbTableOptions,
 )
-from ..scored_kjt import get_scores
+from ..score.kjt import get_scores
 from .hier_output_dist import HierDist, RwSequenceHierEmbeddingDist
 from .input_dist import RwSparseFeaturesDist
 
