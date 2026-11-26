@@ -440,7 +440,7 @@ def _initialize_rows(
         )
     if max_val_dim != max_emb_dim:
         state.optimizer.reset_optimizer_states(
-            rows[:, max_emb_dim:], emb_dims=state.table_emb_dims[table_ids]
+            rows[:, max_emb_dim:], emb_dims=state.buffers.emb_dims[table_ids]
         )
     return rows
 
@@ -819,7 +819,7 @@ def _prefetch_hbm_direct_path(
         if admitted_keys.numel() > 0:
             n_admitted = admitted_keys.numel()
             init_values = torch.empty(
-                n_admitted, max_val_dim, dtype=state.emb_dtype, device=device
+                n_admitted, max_val_dim, dtype=state.buffers.dtype, device=device
             )
             init_idx = torch.arange(n_admitted, dtype=torch.int64, device=device)
             with torch.cuda.nvtx.range("op:initializer"):
@@ -833,7 +833,7 @@ def _prefetch_hbm_direct_path(
             if max_val_dim != max_emb_dim:
                 state.optimizer.reset_optimizer_states(
                     init_values[:, max_emb_dim:],
-                    emb_dims=state.table_emb_dims[admitted_tids],
+                    emb_dims=state.buffers.emb_dims[admitted_tids],
                 )
 
             score_arg = get_insert_score_arg(state, n_admitted, device, admitted_scores)
@@ -1379,7 +1379,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 direct = (
                     not is_pooling
                     and prefetch_state.non_admitted_positions is None
-                    and output_dtype == state.emb_dtype
+                    and output_dtype == state.buffers.dtype
                 )
                 if not direct:
                     with torch.cuda.nvtx.range("op:load_from_flat"):
@@ -1570,13 +1570,13 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                             ),
                             # Writes into the value buffer -> rows.
                             ctx.update_value_rows,
-                            state.table_ptrs_dev,
+                            state.buffers.ptrs,
                             unique_table_ids,
-                            state.table_value_dims,
-                            state.table_emb_dims,
-                            state.max_emb_dim,
-                            state.all_dims_vec4,
-                            state.emb_dtype,
+                            state.buffers.value_dims,
+                            state.buffers.emb_dims,
+                            state.buffers.max_emb_dim,
+                            state.buffers.all_dims_vec4,
+                            state.buffers.dtype,
                         )
 
                     release_slot_pins(

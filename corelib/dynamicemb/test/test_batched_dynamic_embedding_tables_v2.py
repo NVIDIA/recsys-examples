@@ -521,7 +521,7 @@ def _assert_storage_export_matches_find_embeddings(
                 state.options_list[tid].initializer_args.mode
                 == DynamicEmbInitializerMode.DEBUG
             )
-            emb_dim_t = state.table_emb_dims_cpu[tid]
+            emb_dim_t = state.buffers.emb_dims_list[tid]
             for keys, emb_exp, _, _ in storage.export_keys_values(
                 device, batch_size, tid
             ):
@@ -634,7 +634,7 @@ def _kim_scan_keys_embeddings_dict(
     out: Dict[Tuple[int, int], torch.Tensor] = {}
     score_name = state.score_policy.name
     for tid in range(state.num_tables):
-        emb_dim_t = state.table_emb_dims_cpu[tid]
+        emb_dim_t = state.buffers.emb_dims_list[tid]
         for (
             keys,
             named_scores,

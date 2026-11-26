@@ -59,9 +59,9 @@ def _replay_write_values(
     """
     if rows.numel() == 0:
         return
-    emb_dim_cfg = state.table_emb_dims_cpu[table_id]
+    emb_dim_cfg = state.buffers.emb_dims_list[table_id]
     optstate_dim = state.optimizer.get_state_dim(emb_dim_cfg)
-    embeddings = encode_table_values(embeddings, state.emb_dtype)
+    embeddings = encode_table_values(embeddings, state.buffers.dtype)
     want_opt = ReplayContent.OPTIMIZER_STATE in content and optstate_dim > 0
 
     if optstate_dim == 0:
@@ -87,7 +87,7 @@ def _replay_write_values(
         opt = state.optimizer.states_from_checkpoint(
             optimizer_states.to(device=embeddings.device),
             emb_dim_cfg,
-            state.emb_dtype,
+            state.buffers.dtype,
             embeddings.device,
         )
         store_to_flat_single_table(
@@ -103,7 +103,7 @@ def _replay_write_values(
         fresh_emb = embeddings[fresh]
         opt_states = torch.empty(
             (fresh_emb.size(0), optstate_dim),
-            dtype=state.emb_dtype,
+            dtype=state.buffers.dtype,
             device=fresh_emb.device,
         )
         state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
@@ -206,7 +206,7 @@ def _replay_state_increment(
         return stats
     device = state.device
     keys = keys.to(device=device, dtype=state.key_index_map.key_type)
-    embeddings = encode_table_values(values.to(device=device), state.emb_dtype)
+    embeddings = encode_table_values(values.to(device=device), state.buffers.dtype)
     slots = slot_index.to(device=device, dtype=torch.int64)
     stats.upserted = _replay_at_slots(
         state,

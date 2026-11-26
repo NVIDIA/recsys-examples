@@ -51,22 +51,22 @@ def load_from_flat(
     indices = indices.to(device=state.device, dtype=torch.int64)
     N = indices.numel()
     if copy_mode == CopyMode.EMBEDDING:
-        max_dim = state.emb_dim
+        max_dim = state.buffers.max_emb_dim
         _load = _load_emb
     else:
-        max_dim = state.value_dim
+        max_dim = state.buffers.max_value_dim
         _load = _load_value
-    output = torch.empty(N, max_dim, dtype=state.emb_dtype, device=state.device)
+    output = torch.empty(N, max_dim, dtype=state.buffers.dtype, device=state.device)
     if N > 0:
         _load(
-            state.table_ptrs_dev,
+            state.buffers.ptrs,
             indices,
             table_ids,
             output,
-            state.table_value_dims,
-            state.table_emb_dims,
-            state.emb_dim,
-            state.all_dims_vec4,
+            state.buffers.value_dims,
+            state.buffers.emb_dims,
+            state.buffers.max_emb_dim,
+            state.buffers.all_dims_vec4,
         )
     return output
 
@@ -84,14 +84,14 @@ def load_from_flat_by(
     of row ``indices[entry_of_row[i]]`` of table ``table_ids[entry_of_row[i]]``;
     rows whose index is negative are left as they are."""
     _load_emb(
-        state.table_ptrs_dev,
+        state.buffers.ptrs,
         indices,
         table_ids,
         out,
-        state.table_value_dims,
-        state.table_emb_dims,
-        state.emb_dim,
-        state.all_dims_vec4,
+        state.buffers.value_dims,
+        state.buffers.emb_dims,
+        state.buffers.max_emb_dim,
+        state.buffers.all_dims_vec4,
         entry_of_row,
         out_rows,
     )
@@ -106,14 +106,14 @@ def store_to_flat(
     if values.dim() == 1:
         values = values.unsqueeze(1)
     _store_value(
-        state.table_ptrs_dev,
+        state.buffers.ptrs,
         indices,
         table_ids,
-        encode_table_values(values, state.emb_dtype),
-        state.table_value_dims,
-        state.table_emb_dims,
-        state.emb_dim,
-        state.all_dims_vec4,
+        encode_table_values(values, state.buffers.dtype),
+        state.buffers.value_dims,
+        state.buffers.emb_dims,
+        state.buffers.max_emb_dim,
+        state.buffers.all_dims_vec4,
     )
 
 
@@ -125,18 +125,18 @@ def load_from_flat_single_table(
     """Load full values for a single table. Returns compact [N, value_dim_t]."""
     indices = indices.to(device=state.device, dtype=torch.int64)
     N = indices.numel()
-    vdim = state.table_value_dims_cpu[table_id]
-    output = torch.empty(N, vdim, dtype=state.emb_dtype, device=state.device)
+    vdim = state.buffers.value_dims_list[table_id]
+    output = torch.empty(N, vdim, dtype=state.buffers.dtype, device=state.device)
     if N > 0:
         _load_contiguous(
-            state.table_ptrs_dev,
+            state.buffers.ptrs,
             indices,
             table_id,
             output,
-            state.table_value_dims,
-            state.table_emb_dims,
-            state.emb_dim,
-            state.all_dims_vec4,
+            state.buffers.value_dims,
+            state.buffers.emb_dims,
+            state.buffers.max_emb_dim,
+            state.buffers.all_dims_vec4,
         )
     return output
 
@@ -155,14 +155,14 @@ def store_to_flat_single_table(
     if values.dim() == 1:
         values = values.unsqueeze(1)
     _store_contiguous(
-        state.table_ptrs_dev,
+        state.buffers.ptrs,
         indices,
         table_id,
-        encode_table_values(values, state.emb_dtype),
-        state.table_value_dims,
-        state.table_emb_dims,
-        state.emb_dim,
-        state.all_dims_vec4,
+        encode_table_values(values, state.buffers.dtype),
+        state.buffers.value_dims,
+        state.buffers.emb_dims,
+        state.buffers.max_emb_dim,
+        state.buffers.all_dims_vec4,
     )
 
 
@@ -220,9 +220,11 @@ def _split_value_row(
     Tables whose optimizer keeps no per-row state (e.g. plain SGD) get ``None``
     rather than a zero-width tensor, matching :func:`export_keys_values_iter`.
     """
-    emb_dim = state.table_emb_dims_cpu[table_id]
-    optim_state_dim = state.table_value_dims_cpu[table_id] - emb_dim
-    emb = decode_table_values(values[:, :emb_dim], checkpoint_dtype(state.emb_dtype))
+    emb_dim = state.buffers.emb_dims_list[table_id]
+    optim_state_dim = state.buffers.value_dims_list[table_id] - emb_dim
+    emb = decode_table_values(
+        values[:, :emb_dim], checkpoint_dtype(state.buffers.dtype)
+    )
     if optim_state_dim <= 0:
         return emb, None
     opt = values[:, -optim_state_dim:]

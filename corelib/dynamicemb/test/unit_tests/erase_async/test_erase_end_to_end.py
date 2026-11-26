@@ -60,7 +60,7 @@ def test_a_sliding_window_of_keys_does_not_grow_the_table(device):
         assert (erased, spared) == (per_round if r > keep else 0, 0), f"round {r}"
         assert size(module) == min(r, keep) * per_round, f"round {r}"
         shapes.append(
-            (key_map.main_capacity(0), module._storage._state.tables[0].shape[0])
+            (key_map.main_capacity(0), module._storage._state.buffers.num_rows(0))
         )
         # Keys of the rounds the window has left are gone, those inside are there.
         first = max(1, r - keep + 1)

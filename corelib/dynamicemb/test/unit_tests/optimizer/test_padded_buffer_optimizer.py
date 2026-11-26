@@ -31,7 +31,7 @@ write the velocity slot with the momentum (beta1) formula, corrupting v.
 A second corruption path is covered too: the vectorized (vec4) kernel writes m
 in 4-element chunks, so when a table's ``edim`` is not a multiple of 4 the final
 m store would spill into the start of v with the beta1 rule. ``all_dims_vec4``
-must therefore reflect *per-table* dims (as ``state.all_dims_vec4`` does), not
+must therefore reflect *per-table* dims (as ``state.buffers.all_dims_vec4`` does), not
 just ``max_emb_dim``; a misaligned table must fall back to the scalar kernel.
 
 FTRL has the same shape of exposure: it keeps ``linear`` then ``accum``, each

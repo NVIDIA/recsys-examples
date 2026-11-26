@@ -57,7 +57,7 @@ def test_expansion_value_capacity(on_host, max_capacity, score_strategy):
 
     key_rows = state.key_index_map.per_table_capacity_[0]
     assert key_rows == 384
-    assert state.tables[0].shape[0] == key_rows
+    assert state.buffers.num_rows(0) == key_rows
 
     _, found, new_indices = state.key_index_map.lookup(keys, table_ids, score)
     assert bool(found.all())

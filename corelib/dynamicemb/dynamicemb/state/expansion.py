@@ -31,7 +31,6 @@ from dynamicemb.state.table_state import (
     collect_row_counts_to_device,
     collect_table_sizes_for_state,
     collect_table_sizes_to_device,
-    get_table_ptrs,
 )
 from dynamicemb.state.value_rows import (
     load_from_flat_single_table,
@@ -122,12 +121,10 @@ def _expand_tables_impl(
                 # Hash buckets can round the requested target up. Grow values
                 # by the actual key-map capacity change, including that padding.
                 add_rows = new_key_index_map.per_table_capacity_[i] - key_caps[i]
-                vd = state.table_value_dims_cpu[i]
                 if add_rows > 0:
-                    state.tables[i].extend((add_rows, vd))
+                    state.buffers.grow_to(i, state.buffers.num_rows(i) + add_rows)
             else:
-                state.tables[i].extend(state.tables[i].shape)
-    state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, device))
+                state.buffers.grow_to(i, 2 * state.buffers.num_rows(i))
 
     old_key_index_map = state.key_index_map
     for table_id in range(state.num_tables):
@@ -205,7 +202,9 @@ def _expand_tables_impl(
     state.key_map_generation += 1
     state.capacity = new_key_index_map.capacity()
     if new_key_index_map.use_rows_:
-        new_key_index_map.set_row_limits([t.shape[0] for t in state.tables])
+        new_key_index_map.set_row_limits(
+            [state.buffers.num_rows(i) for i in range(state.num_tables)]
+        )
 
 
 def _value_rows_target(current_rows: int, need_rows: int, key_capacity: int) -> int:
@@ -226,16 +225,17 @@ def _grow_values_only(state: DynamicEmbTableState, need_rows: List[int]) -> None
     """
     grown = False
     for i in range(state.num_tables):
-        rows = state.tables[i].shape[0]
+        rows = state.buffers.num_rows(i)
         target = _value_rows_target(
             rows, need_rows[i], state.key_index_map.per_table_capacity_[i]
         )
         if target > rows:
-            state.tables[i].extend((target - rows, state.table_value_dims_cpu[i]))
+            state.buffers.grow_to(i, target)
             grown = True
     if grown:
-        state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, state.device))
-        state.key_index_map.set_row_limits([t.shape[0] for t in state.tables])
+        state.key_index_map.set_row_limits(
+            [state.buffers.num_rows(i) for i in range(state.num_tables)]
+        )
 
 
 def get_expand_info(
@@ -355,8 +355,8 @@ def _expand_if_need_no_eviction(
         # buffer is short of slots again.
         need = rows + unique_size_per_table
         return any(
-            int(need[i]) > state.tables[i].shape[0]
-            and state.tables[i].shape[0] < state.key_index_map.per_table_capacity_[i]
+            int(need[i]) > state.buffers.num_rows(i)
+            and state.buffers.num_rows(i) < state.key_index_map.per_table_capacity_[i]
             for i in range(state.num_tables)
         )
 

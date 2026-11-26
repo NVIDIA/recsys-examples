@@ -28,11 +28,7 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.score.spec import get_score_policy
 from dynamicemb.scored_hashtable import ScorePolicy, ScoreSpec, get_scored_table
-from dynamicemb.state.extendable_buffer import (
-    DeviceExtendableBuffer,
-    ExtendableBuffer,
-    HostExtendableBuffer,
-)
+from dynamicemb.state.mixed_dim_buffers import MixedDimBuffers
 from dynamicemb_extensions import EvictStrategy, segmented_sum_cuda
 
 
@@ -47,22 +43,6 @@ def get_uvm_tensor(dim, dtype, device, is_managed=False):
     )
 
 
-def get_table_ptrs(
-    tables: List[ExtendableBuffer], device: torch.device
-) -> torch.Tensor:
-    """Build a device tensor of current value-buffer base pointers for *tables*.
-
-    Uses ``buffer.tensor().data_ptr()`` so results stay valid until the next
-    ``ExtendableBuffer.extend()``; after extend, rebuild into ``table_ptrs_dev``
-    (or another buffer) via this function.
-    """
-    return torch.tensor(
-        [b.tensor().data_ptr() for b in tables],
-        dtype=torch.int64,
-        device=device,
-    )
-
-
 @dataclass
 class DynamicEmbTableState:
     options_list: List[DynamicEmbTableOptions]
@@ -72,21 +52,10 @@ class DynamicEmbTableState:
     evict_strategy: EvictStrategy
     key_index_map: Any
     capacity: int
-    tables: List[ExtendableBuffer]
-    # Per-table value buffer base pointers on ``device``; refreshed on init and expand.
-    table_ptrs_dev: torch.Tensor
-    table_emb_dims: torch.Tensor
-    # Persistent host (CPU) copy of table_emb_dims as a tensor (the ``_cpu`` field
-    # below is the Python int list); long-lived so callers get a stable host tensor.
-    table_emb_dims_host: torch.Tensor
-    table_value_dims: torch.Tensor
-    table_emb_dims_cpu: List[int]
-    table_value_dims_cpu: List[int]
-    max_emb_dim: int
-    emb_dim: int
-    value_dim: int
-    emb_dtype: torch.dtype
-    all_dims_vec4: bool
+    # The per-table value buffers and what the row kernels need of them: base pointers,
+    # embedding and value dims (a table's value row is its embedding then its optimizer
+    # state), the widest of each, the storage dtype, whether every dim allows vec4.
+    buffers: MixedDimBuffers
     optimizer: BaseDynamicEmbeddingOptimizer
     threads_in_wave: int
     score: Optional[int] = None
@@ -272,20 +241,8 @@ def create_table_state(
     capacity = key_index_map.capacity()
 
     dims = [opt.dim for opt in options]
-    max_emb_dim = max(dims)
-    emb_dtype = base_opt.embedding_dtype
-    emb_dim = max(dims)
-
     optim_state_dims = [optimizer.get_state_dim(d) for d in dims]
     value_dims = [d + s for d, s in zip(dims, optim_state_dims)]
-    value_dim = max(value_dims)
-    all_dims_vec4 = all((d % 4) == 0 for d in dims) and all(
-        (v % 4) == 0 for v in value_dims
-    )
-
-    table_emb_dims = torch.tensor(dims, dtype=torch.int64, device=device)
-    table_emb_dims_host = torch.tensor(dims, dtype=torch.int64)
-    table_value_dims = torch.tensor(value_dims, dtype=torch.int64, device=device)
 
     key_index_map_caps = key_index_map.per_table_capacity_
 
@@ -310,19 +267,21 @@ def create_table_state(
     # budget: a host tier zeroes every table's budget, while an HBM tier may
     # hold a table with no budget of its own beside one that has some.
     on_host = all(opt.local_hbm_for_values == 0 for opt in options)
-    tables: List[ExtendableBuffer] = []
-    for i, (cap, vd) in enumerate(zip(table_caps, value_dims)):
-        total_cap = cap
-        if enable_overflow:
-            total_cap += overflow_caps_list[i]
-        shape = (total_cap, vd)
-        if on_host:
-            tables.append(HostExtendableBuffer(shape, emb_dtype, device))
-        else:
-            tables.append(DeviceExtendableBuffer(shape, emb_dtype, device))
+    row_capacities = [
+        cap + (overflow_caps_list[i] if enable_overflow else 0)
+        for i, cap in enumerate(table_caps)
+    ]
+    buffers = MixedDimBuffers(
+        dims,
+        value_dims,
+        row_capacities,
+        base_opt.embedding_dtype,
+        device,
+        "host" if on_host else "device",
+    )
 
     if use_rows:
-        key_index_map.set_row_limits([t.shape[0] for t in tables])
+        key_index_map.set_row_limits([buffers.num_rows(i) for i in range(num_tables)])
 
     props = torch.cuda.get_device_properties(device_idx)
     threads_in_wave = (
@@ -338,18 +297,7 @@ def create_table_state(
         evict_strategy=evict_strategy,
         key_index_map=key_index_map,
         capacity=capacity,
-        tables=tables,
-        table_ptrs_dev=get_table_ptrs(tables, device),
-        table_emb_dims=table_emb_dims,
-        table_emb_dims_host=table_emb_dims_host,
-        table_value_dims=table_value_dims,
-        table_emb_dims_cpu=dims,
-        table_value_dims_cpu=value_dims,
-        max_emb_dim=max_emb_dim,
-        emb_dim=emb_dim,
-        value_dim=value_dim,
-        emb_dtype=emb_dtype,
-        all_dims_vec4=all_dims_vec4,
+        buffers=buffers,
         optimizer=optimizer,
         threads_in_wave=threads_in_wave,
         score=None,

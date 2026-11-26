@@ -101,16 +101,20 @@ class MixedDimBuffers:
             v % 4 == 0 for v in self.value_dims_list
         )
         # The dims as the kernels take them: on the device, and one copy on the host.
-        self.emb_dims = torch.tensor(self.emb_dims_list, dtype=torch.int64, device=device)
+        self.emb_dims = torch.tensor(
+            self.emb_dims_list, dtype=torch.int64, device=device
+        )
         self.emb_dims_host = torch.tensor(self.emb_dims_list, dtype=torch.int64)
-        self.value_dims = torch.tensor(self.value_dims_list, dtype=torch.int64, device=device)
+        self.value_dims = torch.tensor(
+            self.value_dims_list, dtype=torch.int64, device=device
+        )
 
         make = {
             "device": DeviceExtendableBuffer,
             "host": HostExtendableBuffer,
             "fixed": FixedDeviceBuffer,
         }[kind]
-        self.buffers: List[ExtendableBuffer] = [
+        self._buffers: List[ExtendableBuffer] = [
             make((int(rows), vd), dtype, device)
             for rows, vd in zip(row_capacities, self.value_dims_list)
         ]
@@ -132,7 +136,7 @@ class MixedDimBuffers:
 
     def _base_pointers(self) -> torch.Tensor:
         return torch.tensor(
-            [b.tensor().data_ptr() for b in self.buffers],
+            [b.tensor().data_ptr() for b in self._buffers],
             dtype=torch.int64,
             device=self.device,
         )
@@ -144,22 +148,27 @@ class MixedDimBuffers:
 
     @property
     def on_device(self) -> bool:
-        return self.buffers[0].is_device_buffer()
+        return self._buffers[0].is_device_buffer()
 
     def tensor(self, table: int) -> torch.Tensor:
-        return self.buffers[table].tensor()
+        return self._buffers[table].tensor()
 
     def num_rows(self, table: int) -> int:
-        return int(self.buffers[table].tensor().size(0))
+        return int(self._buffers[table].tensor().size(0))
+
+    def num_bytes(self, table: int) -> int:
+        """The size of a table's buffer in bytes, rows and optimizer state both."""
+        return self._buffers[table].num_bytes()
 
     def grow_to(self, table: int, num_rows: int) -> bool:
         """Grow a table's buffer to at least ``num_rows`` rows (a target, not an increment);
         nothing happens if it has that many. Returns whether it grew; its pointer, and with
-        it ``ptrs``, is refreshed. A ``"fixed"`` buffer raises if it would have to grow."""
+        it ``ptrs``, is refreshed. A ``"fixed"`` buffer raises if it would have to grow.
+        """
         have = self.num_rows(table)
         if num_rows <= have:
             return False
-        self.buffers[table].extend((num_rows - have, self.value_dims_list[table]))
+        self._buffers[table].extend((num_rows - have, self.value_dims_list[table]))
         self.ptrs.copy_(self._base_pointers())
         return True
 
@@ -222,7 +231,10 @@ class MixedDimBuffers:
         """The whole value rows of one table at exactly its width, no padding: ``[n, value_dim]``."""
         rows = self._on_device_rows(rows)
         out = torch.empty(
-            rows.numel(), self.value_dims_list[table], dtype=self.dtype, device=self.device
+            rows.numel(),
+            self.value_dims_list[table],
+            dtype=self.dtype,
+            device=self.device,
         )
         if rows.numel() > 0:
             _load_contiguous(
