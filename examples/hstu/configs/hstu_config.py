@@ -133,9 +133,16 @@ class HSTUConfig(TransformerConfig):
     fuse_norm_mul_dropout: bool = True
     scaling_seqlen: int = -1
     disable_contextual_mask: bool = False
+    attention_quant_mode: int = -1
+    linear_fp8: bool = False
+    linear_fp8_backward: bool = True
 
     def __post_init__(self):
         super().__post_init__()
+        if (self.attention_quant_mode != -1 or self.linear_fp8) and (
+            self.hstu_layer_type != HSTULayerType.FUSED or not self.bf16
+        ):
+            raise ValueError("HSTU FP8 requires BF16 fused training (TP=1)")
 
 
 def get_hstu_config(
@@ -164,6 +171,9 @@ def get_hstu_config(
     fuse_norm_mul_dropout: bool = True,
     scaling_seqlen: int = -1,
     disable_contextual_mask: bool = False,
+    attention_quant_mode: int = -1,
+    linear_fp8: bool = False,
+    linear_fp8_backward: bool = True,
 ) -> HSTUConfig:
     """
     Create the HSTU configuration.
@@ -241,4 +251,7 @@ def get_hstu_config(
         fuse_norm_mul_dropout=fuse_norm_mul_dropout,
         scaling_seqlen=scaling_seqlen,
         disable_contextual_mask=disable_contextual_mask,
+        attention_quant_mode=attention_quant_mode,
+        linear_fp8=linear_fp8,
+        linear_fp8_backward=linear_fp8_backward,
     )

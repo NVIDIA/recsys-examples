@@ -29,6 +29,8 @@ import triton
 import triton.language as tl
 from commons.ops.triton_ops.common import triton_autotune
 
+from ops.pt_ops.te_addmm import te_fp8_linear_bwd
+
 ENABLE_FULL_TURNING_SPACE = False
 
 try:
@@ -284,6 +286,7 @@ def triton_addmm_silu_bwd(
     silu: bool = False,
     wgrad_stream: Optional[torch.cuda.Stream] = None,
     wgrad_event: Optional[torch.cuda.Event] = None,
+    linear_fp8: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if silu:
         assert z is not None, "z is required for silu"
@@ -294,6 +297,9 @@ def triton_addmm_silu_bwd(
         dy = torch.sum(dz, dim=0)
     else:
         dy = dz
+    if linear_fp8:
+        dx, dw = te_fp8_linear_bwd(x, w, dz)
+        return dx, dw, dy
     if wgrad_stream is not None:
         wgrad_event.record(torch.cuda.current_stream())
         # wait for dz and x to be ready

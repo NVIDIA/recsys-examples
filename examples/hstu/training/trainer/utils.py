@@ -33,6 +33,7 @@ from utils import (
     DatasetArgs,
     DynamicEmbeddingArgs,
     EmbeddingArgs,
+    MixedPrecisionArgs,
     NetworkArgs,
     OptimizerArgs,
     TensorModelParallelArgs,
@@ -51,7 +52,9 @@ def get_embedding_vector_storage_multiplier(optimizer_type: str) -> int:
 
 
 def create_hstu_config(
-    network_args: NetworkArgs, tensor_model_parallel_args: TensorModelParallelArgs
+    network_args: NetworkArgs,
+    tensor_model_parallel_args: TensorModelParallelArgs,
+    mixed_precision_args: MixedPrecisionArgs | None = None,
 ):
     dtype = None
     if network_args.dtype_str == "bfloat16":
@@ -107,6 +110,19 @@ def create_hstu_config(
         recompute_input_silu=network_args.recompute_input_silu,
         scaling_seqlen=network_args.scaling_seqlen,
         disable_contextual_mask=network_args.disable_contextual_mask,
+        attention_quant_mode=(
+            5
+            if mixed_precision_args is not None
+            and mixed_precision_args.hstu_attn_quantization_mode == "per-tensor"
+            else -1
+        ),
+        linear_fp8=(
+            mixed_precision_args is not None
+            and mixed_precision_args.mixed_precision_dtype == "fp8"
+        ),
+        linear_fp8_backward=(
+            mixed_precision_args is None or mixed_precision_args.linear_fp8_backward
+        ),
     )
 
 

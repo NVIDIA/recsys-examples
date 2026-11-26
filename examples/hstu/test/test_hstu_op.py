@@ -710,3 +710,163 @@ def test_fused_hstu_op(
         # torch.testing.assert_close(grad_ref, grad_fused)
     # torch.testing.assert_close(ref_input.grad, input.grad)
     assert_hstu_close(input.grad, ref_input.grad, fp32_ref_input.grad, fwd=False)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="FP8 fused HSTU training requires Hopper",
+)
+@pytest.mark.parametrize(
+    "linear_fp8,attention_quant_mode,linear_fp8_backward",
+    [(False, 5, True), (True, -1, True), (True, 5, True), (True, -1, False)],
+    ids=["attention", "projections", "combined", "projection-forward-only"],
+)
+def test_fused_hstu_op_fp8_attention(
+    monkeypatch, linear_fp8, attention_quant_mode, linear_fp8_backward
+):
+    device = torch.device("cuda", torch.cuda.current_device())
+    dtype = torch.bfloat16
+    num_heads = 4
+    head_dim = 64
+    hidden_size = num_heads * head_dim
+    # Cross both Hopper FP8 tile boundaries with an unaligned packed token count.
+    lengths = (23, 65, 129, 201)
+    offsets = length_to_complete_offsets(
+        torch.tensor(lengths, device=device, dtype=torch.int32)
+    )
+    with torch.random.fork_rng(devices=[device.index]), torch.no_grad():
+        torch.manual_seed(1234)
+        weights = generate_or_copy_parameters(
+            embedding_dim=hidden_size,
+            num_heads=num_heads,
+            hidden_dim_per_head=head_dim,
+            dtype=dtype,
+            device=device,
+            learnable_ln=True,
+        )
+        inputs = torch.empty(
+            (sum(lengths), hidden_size), device=device, dtype=dtype
+        ).uniform_(-0.1, 0.1)
+        dout = torch.empty_like(inputs).uniform_(-0.1, 0.1)
+    tensor_names = (
+        "input",
+        "input_norm_weight",
+        "input_norm_bias",
+        "output_norm_weight",
+        "output_norm_bias",
+        "linear_uvqk_weight",
+        "linear_uvqk_bias",
+        "linear_proj_weight",
+    )
+
+    def run(*, empty_eval=False, **kwargs):
+        tensors = {
+            name: tensor.detach().clone().requires_grad_()
+            for name, tensor in zip(
+                tensor_names,
+                (inputs[:0] if empty_eval else inputs, *weights),
+                strict=True,
+            )
+        }
+        output = fused_hstu_op(
+            **tensors,
+            seqlen_offsets=torch.zeros_like(offsets) if empty_eval else offsets,
+            max_seqlen=max(lengths),
+            scaling_seqlen=211,
+            num_heads=num_heads,
+            linear_dim_per_head=head_dim,
+            attention_dim_per_head=head_dim,
+            ln_eps=1e-6,
+            dropout_ratio=0.0,
+            training=not empty_eval,
+            attn_backend=KernelBackend.CUTLASS,
+            alpha=head_dim**-0.5,
+            causal=True,
+            residual=False,
+            **kwargs,
+        )
+        if empty_eval:
+            return (output,)
+        gradients = torch.autograd.grad(output, tuple(tensors.values()), dout)
+        return (output.detach(), *gradients)
+
+    attention_calls = []
+
+    def capture_attention(name, q_index):
+        operator = getattr(torch.ops.fbgemm, name)
+
+        def call(*args, **kwargs):
+            attention_calls.append((name, args[q_index].dtype, kwargs["quant_mode"]))
+            return operator(*args, **kwargs)
+
+        monkeypatch.setattr(torch.ops.fbgemm, name, call)
+
+    capture_attention("hstu_varlen_fwd_90", q_index=0)
+    capture_attention("hstu_varlen_bwd_90", q_index=2)
+    bf16_gemms = 0
+    mm = torch.mm
+
+    def capture_mm(a, b):
+        nonlocal bf16_gemms
+        assert a.is_cuda and b.is_cuda
+        assert a.dtype == b.dtype == dtype
+        bf16_gemms += 1
+        return mm(a, b)
+
+    monkeypatch.setattr(torch, "mm", capture_mm)
+    gemm_layouts = []
+    if linear_fp8:
+        te = pytest.importorskip("transformer_engine.pytorch")
+        te_gemm = pytest.importorskip("transformer_engine.pytorch.cpp_extensions")
+        general_gemm = te_gemm.general_gemm
+
+        def capture_gemm(a, b, *args, **kwargs):
+            assert isinstance(a, te.Float8Tensor)
+            assert isinstance(b, te.Float8Tensor)
+            assert kwargs["out_dtype"] == dtype
+            gemm_layouts.append(kwargs["layout"])
+            return general_gemm(a, b, *args, **kwargs)
+
+        monkeypatch.setattr(te_gemm, "general_gemm", capture_gemm)
+    bf16 = run()
+    assert not gemm_layouts
+    assert bf16_gemms == 4
+    bf16_gemms = 0
+    fp8 = run(
+        linear_fp8=linear_fp8,
+        attention_quant_mode=attention_quant_mode,
+        linear_fp8_backward=linear_fp8_backward,
+    )
+
+    attention_dtype = torch.float8_e4m3fn if attention_quant_mode == 5 else dtype
+    assert attention_calls == [
+        ("hstu_varlen_fwd_90", dtype, -1),
+        ("hstu_varlen_bwd_90", dtype, -1),
+        ("hstu_varlen_fwd_90", attention_dtype, attention_quant_mode),
+        ("hstu_varlen_bwd_90", attention_dtype, attention_quant_mode),
+    ]
+    fp8_backward = linear_fp8 and linear_fp8_backward
+    expected_layouts = ["NN", "NN"] if linear_fp8 else []
+    if fp8_backward:
+        expected_layouts.extend(["TN", "NT", "TN", "NT"])
+    assert gemm_layouts == expected_layouts
+    assert bf16_gemms == (0 if fp8_backward else 4)
+    labels = ("output", *(f"{name} gradient" for name in tensor_names))
+    for name, actual, expected in zip(labels, fp8, bf16, strict=True):
+        assert actual.dtype == expected.dtype == dtype, name
+        assert torch.isfinite(actual).all(), name
+        relative_error = (actual.float() - expected.float()).norm() / (
+            expected.float().norm()
+        )
+        tolerance = 0.12 if name == "output" else 0.18
+        assert relative_error < tolerance, f"{name} relative L2 error {relative_error}"
+
+    if linear_fp8 and attention_quant_mode == 5:
+        attention_calls.clear()
+        gemm_layouts.clear()
+        with torch.no_grad():
+            (empty,) = run(empty_eval=True, linear_fp8=True, attention_quant_mode=5)
+        assert empty.shape == (0, hidden_size)
+        assert empty.dtype == dtype
+        assert attention_calls == [("hstu_varlen_fwd_90", dtype, -1)]
+        assert not gemm_layouts

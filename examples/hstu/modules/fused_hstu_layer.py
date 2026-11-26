@@ -160,5 +160,8 @@ class FusedHSTULayer(MegatronModule):
             wgrad_event=self._wgrad_event,
             recompute_input_layernorm=self._recompute_input_layernorm,
             recompute_input_silu=self._recompute_input_silu,
+            attention_quant_mode=self.config.attention_quant_mode,
+            linear_fp8=self.config.linear_fp8,
+            linear_fp8_backward=self.config.linear_fp8_backward,
         )
         return jd.copy_others_but_set_values(values=output)

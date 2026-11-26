@@ -55,6 +55,7 @@ from utils import (  # from hstu.utils
     BenchmarkDatasetArgs,
     DatasetArgs,
     EmbeddingArgs,
+    MixedPrecisionArgs,
     NetworkArgs,
     OptimizerArgs,
     RankingArgs,
@@ -110,7 +111,7 @@ def main():
     print_rank_0(
         f"distributed env initialization done. Free cuda memory: {free_memory / (1024 ** 2):.2f} MB"
     )
-    hstu_config = create_hstu_config(network_args, tp_args)
+    hstu_config = create_hstu_config(network_args, tp_args, MixedPrecisionArgs())
     task_config = create_ranking_config(dataset_args, network_args, embedding_args)
     # We need to create the dataloader before model initialization in case the dataset is random.
     # In our scenario, the dataset across tp rank should be different. We need to fork the state

@@ -53,6 +53,7 @@ from utils import (  # from hstu.utils
     BenchmarkDatasetArgs,
     DatasetArgs,
     EmbeddingArgs,
+    MixedPrecisionArgs,
     NetworkArgs,
     OptimizerArgs,
     RetrievalArgs,
@@ -104,7 +105,7 @@ def main():
     )
     init.set_random_seed(trainer_args.seed)
 
-    hstu_config = create_hstu_config(network_args, tp_args)
+    hstu_config = create_hstu_config(network_args, tp_args, MixedPrecisionArgs())
     task_config = create_retrieval_config(dataset_args, network_args, embedding_args)
     # We need to create the dataloader before model initialization in case the dataset is random.
     # In our scenario, the dataset across tp rank should be different. We need to fork the state

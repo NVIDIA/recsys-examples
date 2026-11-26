@@ -83,6 +83,33 @@ mkdir -p ./tmp_data && python3 ./hstu_data_preprocessor.py --dataset_name <"ml-1
 ```
 
 ### Start training
+
+For fused HSTU training on Hopper with tensor parallel size 1, use the Gin
+bindings below to enable Transformer Engine FP8 projections and per-tensor
+FBGEMM FP8 attention independently.
+
+```gin
+NetworkArgs.dtype_str = "bfloat16"
+NetworkArgs.kernel_backend = "cutlass"
+MixedPrecisionArgs.mixed_precision_dtype = "fp8"
+MixedPrecisionArgs.hstu_attn_quantization_mode = "per-tensor"
+```
+
+FP8 projection forward uses E4M3 activations and weights. The FP8 backward
+path uses E5M2 output gradients. For FP8 projection forward with BF16
+projection backward and attention, use these bindings with the same
+BF16/CUTLASS network settings.
+
+```gin
+MixedPrecisionArgs.mixed_precision_dtype = "fp8"
+MixedPrecisionArgs.linear_fp8_backward = False
+MixedPrecisionArgs.hstu_attn_quantization_mode = "bf16"
+```
+
+FP8 projections require Transformer Engine with `Float8CurrentScalingQuantizer`
+(tested with 2.17). Projection padding is local to the GEMMs. The HSTU
+checkpoint format is compatible across these precision settings.
+
 The entrypoint for training are `pretrain_gr_retrieval.py` or `pretrain_gr_ranking.py`. We use gin-config to specify the model structure, training arguments, hyper-params etc.
 
 Command to run retrieval task with `MovieLens 20m` dataset:
