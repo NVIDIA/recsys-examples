@@ -38,6 +38,7 @@ import argparse
 import os
 import sys
 from typing import Dict, List, Optional, Tuple
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -96,13 +97,20 @@ def _feature(table: str) -> str:
     return f"f_{table}"
 
 
+def _layout(args, table):
+    # Different physical layouts create separate kernels in the same DMP.
+    if args.mixed_tables and table == TABLES[1]:
+        return 2 * EMBEDDING_DIM, torch.float16, "lru"
+    return EMBEDDING_DIM, DTYPES[args.embedding_dtype], args.score_strategy
+
+
 def _build(args) -> DMPCollection:
     ebc = torchrec.EmbeddingBagCollection(
         device=torch.device("meta"),
         tables=[
             torchrec.EmbeddingBagConfig(
                 name=table,
-                embedding_dim=EMBEDDING_DIM,
+                embedding_dim=_layout(args, table)[0],
                 num_embeddings=NUM_EMBEDDINGS,
                 feature_names=[_feature(table)],
                 pooling=torchrec.PoolingType.SUM,
@@ -119,9 +127,9 @@ def _build(args) -> DMPCollection:
             dynamicemb_options=DynamicEmbTableOptions(
                 global_hbm_for_values=1024**3,
                 init_capacity=GROW_CAPACITY if args.grow else None,
-                embedding_dtype=DTYPES[args.embedding_dtype],
+                embedding_dtype=_layout(args, table)[1],
                 index_type=torch.uint64 if args.uint64_keys else torch.int64,
-                score_strategy=SCORES[args.score_strategy],
+                score_strategy=SCORES[_layout(args, table)[2]],
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=(
                         DynamicEmbInitializerMode.NORMAL
@@ -182,7 +190,9 @@ def _replica_keys(args, replica: int) -> List[int]:
     return [10 + 2 * replica + i for i in range(KEYS_PER_REPLICA)]
 
 
-def _train(args, model: DMPCollection, keys: Optional[List[int]] = None) -> None:
+def _train(
+    args, model: DMPCollection, keys: Optional[List[int]] = None, active_tables=TABLES
+) -> None:
     # Every rank of a replica feeds the replica's keys; the fused optimizer
     # steps inside backward. One step under --grow: the table counts a batch's
     # keys toward its load before it knows how many are new.
@@ -192,8 +202,14 @@ def _train(args, model: DMPCollection, keys: Optional[List[int]] = None) -> None
     device = torch.device("cuda", torch.cuda.current_device())
     kjt = torchrec.KeyedJaggedTensor(
         keys=[_feature(table) for table in TABLES],
-        values=torch.tensor(keys * len(TABLES), dtype=torch.int64, device=device),
-        lengths=torch.ones(len(keys) * len(TABLES), dtype=torch.int64, device=device),
+        values=torch.tensor(
+            keys * len(active_tables), dtype=torch.int64, device=device
+        ),
+        lengths=torch.tensor(
+            [int(t in active_tables) for t in TABLES for _ in keys],
+            dtype=torch.int64,
+            device=device,
+        ),
     )
     for _ in range(steps):
         model(kjt).values().square().sum().backward()
@@ -210,7 +226,7 @@ def _rows(model: DMPCollection) -> Dict[str, Rows]:
                 torch.device("cuda"), 1024, table_id
             ):
                 opt_rows = (
-                    kernel.optimizer.states_for_checkpoint(opt, EMBEDDING_DIM)
+                    kernel.optimizer.states_for_checkpoint(opt, embeddings.size(1))
                     .float()
                     .tolist()
                     if opt is not None
@@ -242,21 +258,28 @@ def _at_table_precision(values: torch.Tensor, dtype: torch.dtype) -> torch.Tenso
 
 def _check_rows(args, model, before, after, stats, touched=None) -> None:
     replica_count = len(before)
-    dtype = DTYPES[args.embedding_dtype]
-    fresh_emb = _at_table_precision(torch.tensor([INIT_VALUE]), dtype).item()
-    kernel = get_dynamic_emb_module(model)[0]
-    opt_width = len(next(iter(before[0][TABLES[0]].values()))[1])
-    fresh_opt = [kernel.optimizer.get_initial_optimizer_state()] * opt_width
-    tolerance = {"fp32": 1e-6, "fp16": 1e-3, "fp8": 1 / 32}[args.embedding_dtype]
-
+    assert set(stats) == set(TABLES)
     for name in TABLES:
+        dim, dtype, score_strategy = _layout(args, name)
+        kernel = next(k for k in get_dynamic_emb_module(model) if name in k.table_names)
+        fresh_emb = _at_table_precision(torch.tensor([INIT_VALUE]), dtype).item()
+        fresh_opt = [
+            kernel.optimizer.get_initial_optimizer_state()
+        ] * kernel.optimizer.get_ckpt_state_dim(dim)
+        tolerance = {
+            torch.float32: 1e-6,
+            torch.float16: 1e-3,
+            torch.float8_e4m3fn: 1 / 32,
+        }[dtype]
         union = sorted(set().union(*(replica[name] for replica in before)))
         assert union, f"{name}: this shard holds no key; nothing was compared"
         mine = before[dist.get_rank(_replica_group(model))][name]
-        merged = set(union) if touched is None else set(union) & touched
+        merged = set(union) if touched is None else set(union) & touched[name]
         assert stats[name].union_keys == len(merged), (name, stats[name], merged)
         assert stats[name].local_keys == len(merged.intersection(mine)), (
-            name, stats[name], mine
+            name,
+            stats[name],
+            mine,
         )
         for replica in after:
             assert sorted(replica[name]) == union, (name, sorted(replica[name]))
@@ -267,7 +290,7 @@ def _check_rows(args, model, before, after, stats, touched=None) -> None:
                 continue
             held = [replica[name][key] for replica in before if key in replica[name]]
             if not args.random_initializer:
-                fresh_row = ([fresh_emb] * EMBEDDING_DIM, fresh_opt, 0)
+                fresh_row = ([fresh_emb] * dim, fresh_opt, 0)
                 held += [fresh_row] * (replica_count - len(held))
             emb = torch.tensor([row[0] for row in held]).mean(0)
             opt = torch.tensor([row[1] for row in held]).mean(0)
@@ -281,7 +304,7 @@ def _check_rows(args, model, before, after, stats, touched=None) -> None:
                 atol=tolerance,
             )
             torch.testing.assert_close(torch.tensor(got_opt), opt, rtol=1e-6, atol=1e-9)
-            if args.score_strategy == "lru_lfu":
+            if score_strategy == "lru_lfu":
                 assert got_frequency == frequency, (name, key, got_frequency, held)
             for replica in after[1:]:
                 assert replica[name][key] == after[0][name][key], (name, key)
@@ -289,7 +312,13 @@ def _check_rows(args, model, before, after, stats, touched=None) -> None:
 
 def check_sync(args) -> None:
     model = _build(args)
-    _train(args, model)
+    rank = dist.get_rank(_replica_group(model))
+    # The second table receives keys only on one replica in the mixed case.
+    _train(
+        args,
+        model,
+        active_tables=TABLES[:1] if args.mixed_tables and rank == 0 else TABLES,
+    )
     sync = DynamicEmbReplicaSync(model)
     before = _gather_replicas(model, _rows(model))
     states = [kernel.tables.tables[0] for kernel in get_dynamic_emb_module(model)]
@@ -304,7 +333,6 @@ def check_sync(args) -> None:
         # All replicas touch the entire union twice to populate and reuse
         # the dense route. Then just a subset changes, with a new private
         # key on each replica, so a stale route would lose updates.
-        rank = dist.get_rank(_replica_group(model))
         replicas = dist.get_world_size(_replica_group(model))
         shared = sorted(set().union(*(_replica_keys(args, r) for r in range(replicas))))
         for keys in (shared, shared, [10 + rank, 1000 + rank]):
@@ -313,7 +341,33 @@ def check_sync(args) -> None:
             before = _gather_replicas(model, _rows(model))
             stats = {table.table_name: table for table in sync.sync()}
             after = _gather_replicas(model, _rows(model))
-            _check_rows(args, model, before, after, stats, touched)
+            _check_rows(
+                args, model, before, after, stats, dict.fromkeys(TABLES, touched)
+            )
+
+    if args.mixed_tables:
+        # Only one table gets touched after a nonempty sync. Check the other
+        # table retains its exact rows, frequency counts and optimizer state.
+        keys = [10000 + rank]
+        _train(args, model, keys, active_tables=TABLES[:1])
+        touched = set().union(*_gather_replicas(model, keys))
+        before = _gather_replicas(model, _rows(model))
+        # No expansion this time. Both kernels, including the untouched
+        # table, must reach the C++ operator in one call.
+        with patch.object(
+            torch.ops.dyn_emb,
+            "replica_sync_batch_",
+            wraps=torch.ops.dyn_emb.replica_sync_batch_,
+        ) as dispatch:
+            result = sync.sync()
+        dispatch.assert_called_once()
+        assert len(dispatch.call_args.args[0]) == len(TABLES)
+        assert len(result) == len(TABLES)
+        stats = {item.table_name: item for item in result}
+        after = _gather_replicas(model, _rows(model))
+        _check_rows(
+            args, model, before, after, stats, {TABLES[0]: touched, TABLES[1]: set()}
+        )
 
     again = sync.sync()
     assert all(table.union_keys == 0 for table in again), again
@@ -369,6 +423,11 @@ def main(argv) -> None:
         action="store_true",
         help="sharding groups of strided ranks (use_inter_host_allreduce=False) "
         "rather than contiguous ones",
+    )
+    parser.add_argument(
+        "--mixed-tables",
+        action="store_true",
+        help="Exercise different dimensions, dtypes, scores and touched sets across tables",
     )
     parser.add_argument("--embedding-dtype", choices=sorted(DTYPES), default="fp32")
     parser.add_argument("--score-strategy", choices=sorted(SCORES), default="lru_lfu")

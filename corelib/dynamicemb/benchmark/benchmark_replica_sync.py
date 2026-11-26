@@ -9,6 +9,7 @@ import math
 import socket
 import statistics
 import time
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -20,7 +21,12 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     get_table_value_bytes,
 )
-from dynamicemb.key_value_table import get_find_score_arg, load_from_flat_single_table
+from dynamicemb.dump_load import get_dynamic_emb_module
+from dynamicemb.key_value_table import (
+    DynamicEmbStorage,
+    get_find_score_arg,
+    load_from_flat_single_table,
+)
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
@@ -33,32 +39,38 @@ from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import DataType
 
 
-def build_model(rows, dim, dtype, shard_count, local_world_size, device):
-    table = torchrec.EmbeddingBagConfig(
-        name="t",
-        feature_names=["f"],
-        embedding_dim=dim,
-        num_embeddings=2 * rows * shard_count,
-        data_type=DataType.FP32 if dtype == torch.float32 else DataType.FP16,
-    )
-    module = torchrec.EmbeddingBagCollection(
-        tables=[table], device=torch.device("meta")
-    )
+def build_model(rows, dim, dtype, shard_count, local_world_size, device, num_tables):
+    tables = [
+        torchrec.EmbeddingBagConfig(
+            name=f"t{i}",
+            feature_names=[f"f{i}"],
+            embedding_dim=dim,
+            num_embeddings=2 * rows * shard_count,
+            data_type=DataType.FP32 if dtype == torch.float32 else DataType.FP16,
+        )
+        for i in range(num_tables)
+    ]
+    module = torchrec.EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
     optimizer = EmbOptimType.EXACT_SGD
     sharder = DynamicEmbeddingBagCollectionSharder(
         fused_params={"optimizer": optimizer}
     )
-    constraints = DynamicEmbParameterConstraints(
-        sharding_types=[ShardingType.ROW_WISE.value],
-        use_dynamicemb=True,
-        enforce_hbm=True,
-        dynamicemb_options=DynamicEmbTableOptions(
-            global_hbm_for_values=get_table_value_bytes(table, optimizer, shard_count),
-            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
-            embedding_dtype=dtype,
-            dist_type="roundrobin",
-        ),
-    )
+    constraints = {
+        table.name: DynamicEmbParameterConstraints(
+            sharding_types=[ShardingType.ROW_WISE.value],
+            use_dynamicemb=True,
+            enforce_hbm=True,
+            dynamicemb_options=DynamicEmbTableOptions(
+                global_hbm_for_values=get_table_value_bytes(
+                    table, optimizer, shard_count
+                ),
+                score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+                embedding_dtype=dtype,
+                dist_type="roundrobin",
+            ),
+        )
+        for table in tables
+    }
     planner = DynamicEmbeddingShardingPlanner(
         topology=Topology(
             world_size=shard_count,
@@ -66,7 +78,7 @@ def build_model(rows, dim, dtype, shard_count, local_world_size, device):
             compute_device="cuda",
             hbm_cap=torch.cuda.get_device_properties(device).total_memory,
         ),
-        constraints={table.name: constraints},
+        constraints=constraints,
         batch_size=1,
         debug=False,
     )
@@ -98,6 +110,79 @@ def timed(device, operation, *args, **kwargs):
     return result, seconds.item()
 
 
+@dataclass
+class TableFixture:
+    storage: DynamicEmbStorage
+    table_id: int
+    keys: torch.Tensor
+    ids: torch.Tensor
+    insert_keys: torch.Tensor
+    insert_values: torch.Tensor
+    expected: torch.Tensor
+
+    def write(self):
+        self.insert_values.neg_()
+        self.expected.neg_()
+        self.storage.insert(self.insert_keys, self.ids, self.insert_values)
+
+    def check(self):
+        state = self.storage.tables[0]
+        for start in range(0, self.keys.numel(), 8192):
+            batch = slice(start, start + 8192)
+            keys = self.keys[batch]
+            score_arg = get_find_score_arg(
+                state, keys.numel(), keys.device, const_lookup=True
+            )
+            _, found, rows = state.key_index_map.lookup(
+                keys, self.ids[batch], score_arg
+            )
+            if not found.all().item():
+                raise RuntimeError(f"Missing rows in table {self.table_id}")
+            actual = load_from_flat_single_table(state, rows, self.table_id)
+            torch.testing.assert_close(actual, self.expected[batch], rtol=0, atol=0)
+
+
+def fixtures(model, args, dtype, shard, shard_count, replica, device):
+    # Every table has the same keys but distinct row values. Reversing insertion
+    # order on one replica also tests the correspondence of physical slots.
+    result = {}
+    generator = torch.Generator(device=device)
+    for kernel in get_dynamic_emb_module(model):
+        storage = kernel.tables
+        state = storage.tables[0]
+        keys = (
+            torch.arange(args.rows, dtype=state.key_index_map.key_type, device=device)
+            * shard_count
+            + shard
+        )
+        for table_id, name in enumerate(kernel.table_names):
+            seed = 2 * (shard * args.tables + int(name[1:]))
+            local, peer = [
+                torch.rand(
+                    (args.rows, args.dim),
+                    generator=generator.manual_seed(seed + r),
+                    dtype=dtype,
+                    device=device,
+                )
+                for r in (replica, 1 - replica)
+            ]
+            expected = ((local.float() + peer.float()) * 0.5).to(dtype)
+            del peer
+            result[name] = TableFixture(
+                storage,
+                table_id,
+                keys,
+                torch.full_like(keys, table_id, dtype=torch.int64),
+                keys.flip(0) if replica else keys,
+                local.flip(0) if replica else local,
+                expected,
+            )
+            del local
+    if len(result) != args.tables:
+        raise RuntimeError(f"Expected {args.tables} tables, found {list(result)}")
+    return result
+
+
 def run(args):
     rank, world, local_rank, local_world = init_distributed()
     if world < 2 or world % 2:
@@ -105,7 +190,9 @@ def run(args):
     device = torch.device("cuda", local_rank)
     shard_count = world // 2
     dtype = {"fp16": torch.float16, "fp32": torch.float32}[args.dtype]
-    model = build_model(args.rows, args.dim, dtype, shard_count, local_world, device)
+    model = build_model(
+        args.rows, args.dim, dtype, shard_count, local_world, device, args.tables
+    )
     sync = (
         DynamicEmbReplicaSync(model, max_staging_bytes=args.staging_mib * 1024**2)
         if args.staging_mib is not None
@@ -130,24 +217,9 @@ def run(args):
 
     # Only embedding values are useful wire payload in this SGD/TIMESTAMP case.
     # Both ranks hold all touched keys and send one row for each to their peer.
-    shape = (args.rows, args.dim)
-    generator = torch.Generator(device=device)
-    local = torch.rand(
-        shape,
-        generator=generator.manual_seed(2 * shard + replica),
-        dtype=dtype,
-        device=device,
-    )
-    peer = torch.rand(
-        shape,
-        generator=generator.manual_seed(2 * shard + 1 - replica),
-        dtype=dtype,
-        device=device,
-    )
-    expected = ((local.float() + peer.float()) * 0.5).to(dtype)
-    del peer
+    local = torch.rand(args.tables * args.rows, args.dim, dtype=dtype, device=device)
     payload_bytes = local.numel() * local.element_size()
-    output = torch.empty(2 * args.rows, args.dim, dtype=dtype, device=device)
+    output = torch.empty(2 * local.size(0), args.dim, dtype=dtype, device=device)
     baseline = []
     for step in range(args.warmup + args.iterations):
         _, elapsed = timed(
@@ -155,48 +227,23 @@ def run(args):
         )
         if step >= args.warmup:
             baseline.append(elapsed)
-    del output
+    del output, local
 
-    (kernel,) = sync.kernels
-    storage = kernel.tables
-    state = storage.tables[0]
-    keys = (
-        torch.arange(args.rows, dtype=state.key_index_map.key_type, device=device)
-        * shard_count
-        + shard
-    )
-    ids = torch.zeros_like(keys, dtype=torch.int64)
-    # Reverse insertion order on one replica. A sync must join the two by key.
-    insert_keys = keys.flip(0) if replica else keys
-    insert_values = local.flip(0) if replica else local
-    del local
+    tables = fixtures(model, args, dtype, shard, shard_count, replica, device)
     samples = []
     for step in range(args.warmup + args.iterations):
-        insert_values.neg_()
-        expected.neg_()
-        # Write real divergent values and fresh timestamp scores before every call.
-        storage.insert(insert_keys, ids, insert_values)
+        for table in tables.values():
+            table.write()
         stats, elapsed = timed(device, sync.sync)
         if step >= args.warmup:
             samples.append(elapsed)
-        if len(stats) != 1 or (stats[0].union_keys, stats[0].local_keys) != (
-            args.rows,
-            args.rows,
+        counts = {stat.table_name: (stat.union_keys, stat.local_keys) for stat in stats}
+        if len(stats) != len(tables) or counts != dict.fromkeys(
+            tables, (args.rows, args.rows)
         ):
             raise RuntimeError(f"rank {rank}: incomplete sync at step {step}: {stats}")
-        # Read back every merged row. The CONST lookup preserves its timestamp.
-        for start in range(0, args.rows, 8192):
-            batch = slice(start, start + 8192)
-            score_arg = get_find_score_arg(
-                state, keys[batch].numel(), device, const_lookup=True
-            )
-            _, found, rows = state.key_index_map.lookup(
-                keys[batch], ids[batch], score_arg
-            )
-            if not found.all().item():
-                raise RuntimeError(f"rank {rank}: missing rows at step {step}")
-            actual = load_from_flat_single_table(state, rows, 0)
-            torch.testing.assert_close(actual, expected[batch], rtol=0, atol=0)
+        for table in tables.values():
+            table.check()
 
     elapsed_s = statistics.mean(samples)
     effective = payload_bytes / elapsed_s / 1e9
@@ -211,6 +258,7 @@ def run(args):
                     "device": torch.cuda.get_device_name(device),
                     "dtype": args.dtype,
                     "rows_per_shard": args.rows,
+                    "tables": args.tables,
                     "staging_mib_override": args.staging_mib,
                     "embedding_dim": args.dim,
                     "useful_bytes_per_gpu_one_direction": payload_bytes,
@@ -239,6 +287,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--staging-mib", type=int, help="Maximum payload staging budget per GPU in MiB"
     )
+    parser.add_argument(
+        "--tables",
+        type=int,
+        default=1,
+        help="Number of tables in each measured sync call",
+    )
     parser.add_argument("--dim", type=int, default=256)
     parser.add_argument("--dtype", choices=["fp16", "fp32"], default="fp32")
     parser.add_argument("--iterations", type=int, default=10)
@@ -251,8 +305,8 @@ if __name__ == "__main__":
         help="Physical one-direction GB/s per GPU (decimal gigabytes/s)",
     )
     args = parser.parse_args()
-    if min(args.rows, args.dim, args.iterations, args.warmup) <= 0:
-        parser.error("rows, dim, iterations, and warmup must be positive")
+    if min(args.rows, args.tables, args.dim, args.iterations, args.warmup) <= 0:
+        parser.error("rows, tables, dim, iterations, and warmup must be positive")
     if args.staging_mib is not None and args.staging_mib <= 0:
         parser.error("staging-mib must be positive")
     if not math.isfinite(args.peak_gbps) or args.peak_gbps <= 0:

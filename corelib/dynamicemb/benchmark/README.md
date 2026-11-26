@@ -1011,15 +1011,17 @@ Record the GPU and NIC topology (`nvidia-smi topo -m`, `nvidia-smi nvlink -s`,
 and peer ranks. For these single-node NVLink and two-node IB configurations,
 the benchmark checks that NVLink pairs share a host and IB pairs span hosts.
 
-The default workload uses 131072 touched keys per shard, 256 FP32 values
-per key, SGD and timestamp scores. Both replicas hold every measured key.
+The default workload uses one table with 131072 touched keys per shard,
+256 FP32 values per key, SGD and timestamp scores. Set `--tables N` to
+synchronize N tables in each timed call. Each table receives the same keys
+and independently generated rows. Both replicas hold every measured key.
 They write different values and fresh timestamps before each call. The
 timer surrounds the complete `DynamicEmbReplicaSync.sync()`, including key
 discovery, communication, merge and writeback. Setup, rank alignment and
 the independent readback of every averaged row fall outside this interval.
 The benchmark checks touched and held counts on every call.
 
-Effective bandwidth is `rows × dim × element_size / mean(max_rank_seconds)`.
+Effective bandwidth is `tables × rows × dim × element_size / mean(max_rank_seconds)`.
 The numerator counts each embedding sent to the peer once. Padding, local
 traffic, control bytes and receive-side duplicates are excluded. The JSON
 also reports the bandwidth of a payload-only NCCL all-gather on the same
@@ -1028,7 +1030,48 @@ bandwidth greater than 80% of the specified physical peak. A miss prints the
 measurement and exits nonzero. Results apply to the reported shape, dtype,
 key overlap and topology.
 
-### Measured H100 InfiniBand run
+### Native multi-table sync on H100
+
+On two H100 SXM nodes, one native operator synchronized all tables per call.
+The NVLink runs used one node with NV18 connections and a 450 GB/s
+one-direction peak per GPU. Eight GPUs on that node form two replicas of four
+shards. The IB runs used two replicas of eight shards, with a dedicated
+400 Gb/s NDR port per GPU (50 GB/s). All runs below used FP32 and ten timed
+calls. Payload is the total over tables per GPU per direction.
+
+| Fabric | GPUs | Tables | Rows/table/shard | Dim | Payload | Staging MiB | Effective GB/s | Utilization |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| NVLink | 2 | 2 | 393216 | 2048 | 6 GiB | 6500 | 362.98 | 80.66% |
+| NVLink | 2 | 2 | 393216 | 2048 | 6 GiB | 12600 | 364.66 | 81.04% |
+| NVLink | 2 | 2 | 786432 | 2048 | 12 GiB | 12600 | 91.88 | 20.42% |
+| NVLink | 8 | 1 | 786432 | 2048 | 6 GiB | 6500 | 368.90 | 81.98% |
+| NVLink | 8 | 2 | 393216 | 2048 | 6 GiB | 6500 | 363.46 | 80.77% |
+| NVLink | 8 | 4 | 262144 | 2048 | 8 GiB | 8500 | 359.87 | 79.97% |
+| NVLink | 8 | 2 | 131072 | 256 | 256 MiB | 6500 | 195.52 | 43.45% |
+| IB | 16 | 1 | 2097152 | 256 | 2 GiB | 1536 | 40.53 | 81.05% |
+| IB | 16 | 2 | 2097152 | 256 | 4 GiB | 1536 | 40.61 | 81.22% |
+
+With two GPUs, two tables, 6 GiB payload and 6500 MiB staging, the earlier
+per-table implementation at `abd303fc` measured 357.10 GB/s (79.36%) on a
+different H100 SXM node. At 12 GiB the direct-copy workspace requires
+12 GiB plus progress words. The configured 12600 MiB budget covers it, but a
+diagnostic run with unused allocator blocks released had only 11.14 GiB free
+before warmup. That run measured 94.06 GB/s using the bounded path.
+
+Reproduce the two-table runs with
+
+```bash
+torchrun --standalone --nproc-per-node=8 benchmark/benchmark_replica_sync.py \
+    --fabric nvlink --peak-gbps 450 --tables 2 --rows 393216 --dim 2048 \
+    --staging-mib 6500 --warmup 4 --iterations 10
+srun -N2 --ntasks-per-node=8 env LOCAL_WORLD_SIZE=8 \
+    NCCL_CROSS_NIC=0 NCCL_NET_PLUGIN=none NCCL_MIN_NCHANNELS=8 \
+    NCCL_MAX_NCHANNELS=8 NCCL_BUFFSIZE=8388608 \
+    python benchmark/benchmark_replica_sync.py --fabric ib --peak-gbps 50 \
+    --tables 2 --rows 2097152 --dim 256 --staging-mib 1536
+```
+
+### Earlier per-table H100 InfiniBand run
 
 Two DGX H100 nodes with eight GPUs and eight 400 Gb/s NDR ports per node
 achieved **40.38 GB/s per GPU (80.76%)** on the full sync. The payload-only
@@ -1050,7 +1093,7 @@ workload. A second two-node run on the integrated build achieved 40.48 GB/s
 (80.97%) with the same settings. Smaller payloads spend a larger fraction of wall time validating
 keys, dispatching collectives and finishing writeback.
 
-### Measured H100 and H200 NVLink runs
+### Earlier per-table H100 and H200 NVLink runs
 
 Each run used two SXM GPUs on a single host with 18 active NVLinks per GPU
 and a 450 GB/s one-direction rating. The table reports full replica sync and

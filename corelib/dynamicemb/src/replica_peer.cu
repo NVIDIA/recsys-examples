@@ -10,10 +10,10 @@
 #include <cuda.h>
 #include <torch/library.h>
 
+#include "replica_peer.h"
 #include "table_operation/types.cuh"
 
-namespace dyn_emb {
-namespace {
+namespace dyn_emb::replica {
 // A warp handles adjacent 16-byte words of one embedding. The row mapping is
 // local to the table; the mailbox always uses the common union-key order.
 template <typename T, bool Merge>
@@ -197,11 +197,12 @@ void stream_check(CUresult status) {
               "CUDA stream memory operation failed: ", msg ? msg : "unknown");
 }
 
-void peer_copy_merge(const at::Tensor &table, const at::Tensor &inbox,
-                     const at::Tensor &peer, const at::Tensor &rows,
-                     const at::Tensor &peer_rows, const at::Tensor &slots,
-                     const at::Tensor &buckets, at::IntArrayRef ends,
-                     std::tuple<int64_t, int64_t, bool> layout) {
+void peer_copy_merge_async(const at::Tensor &table, const at::Tensor &inbox,
+                           const at::Tensor &peer, const at::Tensor &rows,
+                           const at::Tensor &peer_rows, const at::Tensor &slots,
+                           const at::Tensor &buckets, at::IntArrayRef ends,
+                           std::tuple<int64_t, int64_t, bool> layout,
+                           c10::cuda::CUDAStream compute) {
   const auto [capacity, rows_per_copy, reverse] = layout;
   check_transfer(table, inbox, rows, slots, buckets, peer_rows, capacity);
   TORCH_CHECK(!ends.empty() && ends.back() == rows.numel() &&
@@ -222,7 +223,6 @@ void peer_copy_merge(const at::Tensor &table, const at::Tensor &inbox,
   const int64_t nbytes = rows.numel() * width;
   c10::cuda::CUDAGuard guard(table.device());
   auto copy = at::cuda::getCurrentCUDAStream();
-  auto compute = at::cuda::getStreamFromPool();
   // Do not observe a previous invocation's counters (or stale payload at a
   // new flag offset) before this invocation's zero and start barrier finish.
   at::cuda::CUDAEvent initialized;
@@ -258,25 +258,13 @@ void peer_copy_merge(const at::Tensor &table, const at::Tensor &inbox,
     }
     begin = end;
   }
-  at::cuda::CUDAEvent completed;
-  completed.record(compute);
-  completed.block(copy);
 }
 
 TORCH_LIBRARY_FRAGMENT(dyn_emb, m) {
   m.def("replica_peer_capabilities(Tensor(a!) probe, int peer_device) -> "
         "(bool, bool)");
-  m.def("replica_copy_merge_(Tensor(a!) table, Tensor(b!) inbox, Tensor(c!) "
-        "peer, Tensor rows, Tensor peer_rows, Tensor slots, Tensor(d!) "
-        "buckets, int[] ends, (int, int, bool) layout) -> ()");
-  m.def("replica_peer_transfer_(Tensor(a!) table, Tensor(b!) mailbox, Tensor "
-        "rows, Tensor slots, Tensor(c!) buckets, Tensor? peer_rows, (int, "
-        "bool) config) -> ()");
 }
 TORCH_LIBRARY_IMPL(dyn_emb, CUDA, m) {
   m.impl("replica_peer_capabilities", TORCH_FN(peer_capabilities));
-  m.impl("replica_copy_merge_", TORCH_FN(peer_copy_merge));
-  m.impl("replica_peer_transfer_", TORCH_FN(peer_transfer));
 }
-} // namespace
-} // namespace dyn_emb
+} // namespace dyn_emb::replica

@@ -8,10 +8,10 @@
 #include <c10/util/Float8_e4m3fn.h>
 #include <torch/library.h>
 
-#include "table_operation/types.cuh"
+#include "replica_sync_rows.h"
+#include "table_operation/table.cuh"
 
-namespace dyn_emb {
-namespace {
+namespace dyn_emb::replica {
 
 // The dispatcher represents a plain layout as a tuple of integers. It is
 // unpacked once on the host; both kernels take the same POD by value.
@@ -148,47 +148,57 @@ __global__ void pack_kernel(const uint8_t *table, uint8_t *buckets,
   }
 }
 
-at::Tensor pack(const at::Tensor &table, const at::Tensor &buckets,
-                const at::Tensor &rows, const at::Tensor &slots, int64_t padded,
-                LayoutTuple layout) {
-  c10::cuda::CUDAGuard guard(table.device());
-  RowLayout l = get_layout(table, buckets, layout);
-  check_indices(rows, table);
-  check_indices(slots, table);
+int64_t wire_width(const Table &t) {
+  auto l = get_layout(t.values, t.buckets, t.layout);
+  return l.packed_bytes + (l.scores - 1) * 8;
+}
+
+void pack_into(const Table &t, const at::Tensor &rows, const at::Tensor &slots,
+               int64_t padded, const at::Tensor &out) {
+  RowLayout l = get_layout(t.values, t.buckets, t.layout);
+  check_indices(rows, t.values);
+  check_indices(slots, t.values);
   TORCH_CHECK(rows.numel() == slots.numel() && rows.numel() <= padded);
-  TORCH_CHECK(padded <= INT64_MAX / (l.packed_bytes + (l.scores - 1) * 8));
-  auto out = at::empty({padded * (l.packed_bytes + (l.scores - 1) * 8)},
-                       buckets.options());
+  TORCH_CHECK(padded <= INT64_MAX / wire_width(t));
+  TORCH_CHECK(out.device() == t.values.device() &&
+              out.scalar_type() == at::kByte && out.is_contiguous() &&
+              out.numel() == padded * wire_width(t));
   if (padded) {
     int payload =
-        l.embedding * table.element_size() + l.opt_columns * l.opt_bytes;
+        l.embedding * t.values.element_size() + l.opt_columns * l.opt_bytes;
     pack_kernel<<<(padded + 7) / 8, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
-        static_cast<const uint8_t *>(table.const_data_ptr()),
-        buckets.data_ptr<uint8_t>(), rows.data_ptr<int64_t>(),
+        static_cast<const uint8_t *>(t.values.const_data_ptr()),
+        t.buckets.data_ptr<uint8_t>(), rows.data_ptr<int64_t>(),
         slots.data_ptr<int64_t>(), out.data_ptr<uint8_t>(), rows.numel(),
         padded, l, payload);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
-  return out;
 }
 
 // Raw words retain the exact fp8 encoding and the packed fp32 Adagrad state.
 // Averaging the decoded fp8 codes in the table's scaled units cancels the
 // common power-of-two scale, including when the initial row contributes.
 template <class Scalar>
-__global__ void merge_kernel(uint8_t *table, uint8_t *buckets,
-                             const int64_t *rows, const int64_t *slots,
-                             const uint8_t *packets, const int32_t *offsets,
-                             const uint8_t *fresh, int64_t count,
-                             int64_t padded, int replicas, RowLayout l,
-                             int64_t timestamp, bool constant) {
+__global__ void
+merge_kernel(uint8_t *table, uint8_t *buckets, const int64_t *rows,
+             const int64_t *slots, const uint8_t *packets,
+             const int32_t *offsets, const uint8_t *fresh, int64_t count,
+             int64_t padded, int replicas, RowLayout l, int64_t rank_bytes,
+             bool constant, uint8_t *pending, uint64_t *pending_scores,
+             int64_t pending_count) {
   int lane = threadIdx.x % 32;
   int64_t i = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
-  if (i >= count || rows[i] < 0 || slots[i] < 0)
+  if (i >= count)
     return;
-  CUDA_KERNEL_ASSERT(rows[i] < l.table_rows && slots[i] < l.slot_count);
-  auto *dst = table + rows[i] * l.runtime_bytes;
-  int64_t rank_bytes = padded * (l.packed_bytes + (l.scores - 1) * 8);
+  // Negative rows are offsets in the compact insertion list. Placement may
+  // grow the owning VMM buffer and rehash multiple tables in the storage.
+  bool missing = slots[i] < 0;
+  int64_t index = missing ? ~rows[i] : rows[i];
+  CUDA_KERNEL_ASSERT(index >= 0);
+  CUDA_KERNEL_ASSERT(missing
+                         ? index < pending_count
+                         : (index < l.table_rows && slots[i] < l.slot_count));
+  auto *dst = (missing ? pending : table) + index * l.runtime_bytes;
   int payload = l.embedding * sizeof(Scalar) + l.opt_columns * l.opt_bytes;
   for (int j = lane; j < l.embedding + l.opt_columns; j += 32) {
     bool wide = j >= l.embedding && l.opt_bytes != sizeof(Scalar);
@@ -231,10 +241,10 @@ __global__ void merge_kernel(uint8_t *table, uint8_t *buckets,
   for (int j = payload + lane; j < l.runtime_bytes; j += 32)
     dst[j] = fresh[j];
   if (lane == 0) {
-    uint64_t *scores = score_block(buckets, l, slots[i]);
-    uint64_t now = timestamp;
-    if (!now)
-      asm volatile("mov.u64 %0,%%globaltimer;" : "=l"(now));
+    uint64_t *scores = missing ? pending_scores + index * l.scores
+                               : score_block(buckets, l, slots[i]);
+    uint64_t now;
+    asm volatile("mov.u64 %0,%%globaltimer;" : "=l"(now));
     scores[0] = now;
     if (l.scores == 2) {
       // Sum quotients and remainders independently to avoid overflow even
@@ -257,17 +267,19 @@ __global__ void merge_kernel(uint8_t *table, uint8_t *buckets,
   }
 }
 
-void merge(const at::Tensor &table, const at::Tensor &buckets,
-           const at::Tensor &rows, const at::Tensor &slots,
-           const at::Tensor &packets, const std::optional<at::Tensor> &offsets,
-           const at::Tensor &fresh, bool constant, int64_t timestamp,
-           LayoutTuple layout) {
+void merge_into(const Table &t, const at::Tensor &rows, const at::Tensor &slots,
+                const at::Tensor &packets,
+                const std::optional<at::Tensor> &offsets,
+                const at::Tensor &missing_values,
+                const at::Tensor &missing_scores) {
+  const auto &table = t.values, &buckets = t.buckets, &fresh = t.fresh;
+  auto layout = t.layout;
   c10::cuda::CUDAGuard guard(table.device());
   RowLayout l = get_layout(table, buckets, layout);
   check_indices(rows, table);
   check_indices(slots, table);
-  TORCH_CHECK(rows.numel() == slots.numel() && packets.is_contiguous() &&
-              packets.scalar_type() == at::kByte &&
+  TORCH_CHECK(rows.numel() == slots.numel() && packets.dim() == 2 &&
+              packets.stride(1) == 1 && packets.scalar_type() == at::kByte &&
               packets.device() == table.device() && packets.dim() == 2 &&
               packets.size(0) > 0 && packets.size(0) <= INT_MAX);
   TORCH_CHECK(fresh.device() == table.device() && fresh.is_contiguous() &&
@@ -296,7 +308,10 @@ void merge(const at::Tensor &table, const at::Tensor &buckets,
             buckets.data_ptr<uint8_t>(), rows.data_ptr<int64_t>(),
             slots.data_ptr<int64_t>(), packets.data_ptr<uint8_t>(), idx,
             static_cast<const uint8_t *>(fresh.const_data_ptr()), rows.numel(),
-            padded, packets.size(0), l, timestamp, constant);
+            padded, packets.size(0), l, packets.stride(0), t.constant,
+            static_cast<uint8_t *>(missing_values.data_ptr()),
+            reinterpret_cast<uint64_t *>(missing_scores.data_ptr<int64_t>()),
+            missing_values.size(0));
   };
   switch (table.scalar_type()) {
   case at::kFloat:
@@ -317,21 +332,67 @@ void merge(const at::Tensor &table, const at::Tensor &buckets,
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-TORCH_LIBRARY_FRAGMENT(dyn_emb, m) {
-  m.def("replica_validate_(Tensor buckets, Tensor table_rows, Tensor keys, "
-        "Tensor rows, Tensor slots, int bucket_capacity, int scores, int "
-        "threshold, Tensor(a!) valid) -> ()");
-  m.def("replica_pack(Tensor table, Tensor buckets, Tensor rows, Tensor slots, "
-        "int padded, (int, int, int, int, int) layout) -> Tensor");
-  m.def("replica_merge_(Tensor(a!) table, Tensor(b!) buckets, Tensor rows, "
-        "Tensor slots, Tensor packets, Tensor? offsets, Tensor fresh, bool "
-        "constant, int timestamp, (int, int, int, int, int) layout) -> ()");
-}
-TORCH_LIBRARY_IMPL(dyn_emb, CUDA, m) {
-  m.impl("replica_validate_", TORCH_FN(validate));
-  m.impl("replica_pack", TORCH_FN(pack));
-  m.impl("replica_merge_", TORCH_FN(merge));
+// Compact touched keys directly into the rank's single batch send buffer.
+__global__ void export_kernel(uint8_t *storage, int64_t capacity, int scores,
+                              int64_t size, uint64_t threshold, int64_t *out,
+                              int64_t limit, unsigned long long *count) {
+  int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t key = -1;
+  bool matched = false;
+  if (i < size) {
+    Bucket b(storage + (i / capacity) * Bucket::memory_usage(capacity, scores),
+             capacity, scores);
+    auto slot = i % capacity;
+    key = *b.keys(slot);
+    matched = Bucket::is_valid(key) && *b.scores(slot) >= threshold;
+  }
+  unsigned mask = __ballot_sync(~0u, matched);
+  unsigned lane = threadIdx.x % 32;
+  unsigned long long base = 0;
+  if (!lane && mask)
+    base = ::atomicAdd(count, __popc(mask));
+  base = __shfl_sync(~0u, base, 0);
+  if (matched) {
+    auto pos = base + __popc(mask & ((1u << lane) - 1));
+    CUDA_KERNEL_ASSERT(pos < limit);
+    out[pos] = key;
+  }
 }
 
-} // namespace
-} // namespace dyn_emb
+at::Tensor count_touched(const Table &t, int64_t threshold) {
+  auto [emb, opt, bytes, cap, scores] = t.layout;
+  return table_count_matched(t.buckets, at::kLong, cap, threshold, 0,
+                             t.row_map.numel(), scores, 0);
+}
+
+void export_keys(const Table &t, int64_t threshold, const at::Tensor &output) {
+  if (!output.numel())
+    return;
+  auto count = at::zeros({1}, t.row_map.options());
+  auto [emb, opt, bytes, cap, scores] = t.layout;
+  export_kernel<<<(t.row_map.numel() + 255) / 256, 256, 0,
+                  at::cuda::getCurrentCUDAStream()>>>(
+      t.buckets.data_ptr<uint8_t>(), cap, scores, t.row_map.numel(), threshold,
+      output.data_ptr<int64_t>(), output.numel(),
+      reinterpret_cast<unsigned long long *>(count.data_ptr<int64_t>()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+Route lookup(const Table &t, const at::Tensor &keys) {
+  auto [emb, opt, bytes, cap, scores] = t.layout;
+  if (!keys.numel())
+    return {keys, keys, keys};
+  auto ids = at::zeros_like(keys);
+  auto offsets = at::tensor({int64_t(0), t.sizes.numel()}, keys.options());
+  std::optional<at::Tensor> global;
+  if (t.global_capacity)
+    global = at::full({1}, t.global_capacity, keys.options());
+  auto [unused, held, slots] = table_lookup(
+      t.buckets, offsets, cap, keys, ids, std::nullopt, ScorePolicyType::Const,
+      std::nullopt, 0, std::nullopt, scores, global);
+  auto rows =
+      at::where(held, t.row_map.index_select(0, slots.clamp_min(0)), -1);
+  return {keys, rows, slots};
+}
+
+} // namespace dyn_emb::replica

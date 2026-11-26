@@ -359,6 +359,8 @@ class DynamicEmbTableState:
     # was read from, so whoever walks the slots across calls -- an erase by score,
     # in chunks -- compares this to know when to start over.
     key_map_generation: int = 0
+    # Tensor views need a new row extent when only a value buffer grows.
+    value_buffer_generation: int = 0
     # Name of the score column incremental_dump thresholds on. Equals
     # score_policy.name (for LruLfu this is the leading, timestamp, word).
     incremental_score_name: Optional[str] = None
@@ -1014,6 +1016,7 @@ def _grow_values_only(state: DynamicEmbTableState, need_rows: List[int]) -> None
             state.tables[i].extend((target - rows, state.table_value_dims_cpu[i]))
             grown = True
     if grown:
+        state.value_buffer_generation += 1
         state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, state.device))
         state.key_index_map.set_row_limits([t.shape[0] for t in state.tables])
 

@@ -23,28 +23,22 @@ replicas are merged by key here instead. See docs/two_d_sparse_parallel_design.m
 """
 
 from dataclasses import dataclass
-from typing import List, NamedTuple, Sequence
+from typing import List, Sequence
 
 import torch
 import torch.distributed as dist
 from dynamicemb.dump_load import get_dynamic_emb_module
-from dynamicemb.dynamicemb_config import (
-    score_strategy_has_timestamp_column,
-)
-from dynamicemb.key_value_table import (
-    DynamicEmbStorage,
-    get_find_score_arg,
-)
-from dynamicemb.replica_peer import ReplicaPeer
+from dynamicemb.dynamicemb_config import score_strategy_has_timestamp_column
+from dynamicemb.key_value_table import DynamicEmbStorage
+from dynamicemb.replica_peer import peer_state
 from dynamicemb.types import DynamicEmbInitializerMode
 from dynamicemb.utils import encode_table_values
-from dynamicemb_extensions import device_timestamp
+from dynamicemb_extensions import device_timestamp, table_scatter_score_blocks
 from torch import nn
 from torchrec.distributed.model_parallel import DMPCollection
 
 # Bounds the simultaneous packed send and receive buffers, including pipeline overlap.
 SYNC_CHUNK_BYTES = 256 * 1024**2
-TOUCHED_KEY_SCAN_BATCH = 1 << 22
 
 
 @dataclass
@@ -93,52 +87,43 @@ def replica_sync_errors(
     return errors
 
 
-def gather_unique_keys(keys: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
-    """The sorted union of ``keys`` over ``group``, the same tensor on every rank."""
-    group_size = dist.get_world_size(group)
-    local_count = torch.tensor([keys.numel()], dtype=torch.int64, device=keys.device)
-    counts = torch.empty(group_size, dtype=torch.int64, device=keys.device)
-    dist.all_gather_into_tensor(counts, local_count, group=group)
-    per_rank = counts.tolist()
-    max_count = max(per_rank)
-    if max_count == 0:
-        return keys[:0]
-    padded = torch.zeros(max_count, dtype=keys.dtype, device=keys.device)
-    padded[: keys.numel()] = keys
-    gathered = torch.empty(group_size * max_count, dtype=keys.dtype, device=keys.device)
-    dist.all_gather_into_tensor(gathered, padded, group=group)
-    parts = [
-        gathered[rank * max_count : rank * max_count + count]
-        for rank, count in enumerate(per_rank)
-    ]
-    # Sorted, so that every replica merges the rows in the same order.
-    return torch.unique(torch.cat(parts))
-
-
-class _RowLayout(NamedTuple):
-    embedding: int
-    opt_columns: int
-    opt_bytes: int
-    bucket_capacity: int
-    scores: int
-
-
-def _buckets(state, table_id):
+def _install_missing(storage, keys, values, scores):
+    """Grow the local storage once and install the rows computed by the batch op."""
+    state = storage.tables[0]
+    counts = [k.numel() for k in keys]
+    total = sum(counts)
+    if not total:
+        return
+    storage.expand_if_need(torch.tensor(counts, dtype=torch.int64, device="cpu"))
     key_map = state.key_index_map
-    start, end = key_map.table_bucket_offsets_cpu_[table_id : table_id + 2].tolist()
-    width = key_map.bucket_capacity_ * sum(key_map.fields_byte_)
-    return key_map.table_storage_[start * width : end * width]
-
-
-def _exchange(packet, group):
-    replicas = dist.get_world_size(group)
-    received = torch.empty(
-        replicas, packet.numel(), device=packet.device, dtype=packet.dtype
+    ids = torch.cat([torch.full_like(k, t) for t, k in enumerate(keys) if k.numel()])
+    flat_keys = torch.cat(keys).to(key_map.key_type)
+    padded = torch.empty(
+        total, state.value_dim, device=state.device, dtype=state.emb_dtype
     )
-    work = dist.all_gather_into_tensor(
-        received.view(-1), packet, group=group, async_op=True
+    # Fused storage takes the optimizer columns at the maximum embedding width.
+    offset = 0
+    for emb_dim, rows in zip(state.table_emb_dims_cpu, values):
+        if rows.size(0):
+            target = padded.narrow(0, offset, rows.size(0))
+            target[:, :emb_dim].copy_(rows[:, :emb_dim])
+            opt_width = rows.size(1) - emb_dim
+            target[:, state.emb_dim : state.emb_dim + opt_width].copy_(
+                rows[:, emb_dim:]
+            )
+            offset += rows.size(0)
+    storage.insert(flat_keys, ids, padded)
+    slots = key_map.slots_of(flat_keys, ids)
+    absolute = slots + key_map.table_bucket_offsets_[ids] * key_map.bucket_capacity_
+    table_scatter_score_blocks(
+        key_map.table_storage_,
+        key_map.bucket_capacity_,
+        key_map.num_scores_,
+        0,
+        absolute.masked_fill_(slots < 0, -1),
+        torch.cat(scores),
+        key_map.key_type,
     )
-    return work, received
 
 
 class DynamicEmbReplicaSync:
@@ -180,11 +165,6 @@ class DynamicEmbReplicaSync:
         self.max_staging_bytes = budget.item()
         if self.max_staging_bytes <= 0:
             raise ValueError("max_staging_bytes must be positive on every replica")
-        self._peer = (
-            ReplicaPeer(self.replica_group, self.max_staging_bytes)
-            if self.replica_count == 2
-            else None
-        )
         self.kernels = get_dynamic_emb_module(model)
         shard_ranks = dist.get_process_group_ranks(mesh.get_group("shard"))
         if errors := replica_sync_errors(self.kernels, shard_ranks):
@@ -194,7 +174,64 @@ class DynamicEmbReplicaSync:
             )
         # Until mark_synced, a sync merges every key the tables hold.
         self.threshold = 0
-        self._dense_routes = {}
+        self._routes = []
+        self._peer = peer_state(self.replica_group, torch.cuda.current_device())
+        self._generations = None
+        self._names = []
+        self._fresh = []
+        self._layouts = []
+        for kernel in self.kernels:
+            state = kernel.tables.tables[0]
+            key_map = state.key_index_map
+            for i, name in enumerate(kernel.table_names):
+                emb = state.table_emb_dims_cpu[i]
+                initializer = state.options_list[i].initializer_args
+                constant = initializer.mode == DynamicEmbInitializerMode.CONSTANT
+                fresh = torch.empty(
+                    (1, state.table_value_dims_cpu[i]),
+                    dtype=state.emb_dtype,
+                    device=state.device,
+                )
+                if constant:
+                    initial = torch.tensor([initializer.value], device=state.device)
+                    fresh[:, :emb] = encode_table_values(initial, state.emb_dtype)
+                state.optimizer.reset_optimizer_states(fresh[:, emb:], emb_dims=emb)
+                self._names.append(name)
+                self._fresh.append(fresh)
+                self._layouts.append(
+                    (
+                        emb,
+                        state.optimizer.get_ckpt_state_dim(emb),
+                        state.optimizer.get_state_dtype(state.emb_dtype).itemsize,
+                        key_map.bucket_capacity_,
+                        key_map.num_scores_,
+                        constant,
+                        key_map.global_capacities_[i],
+                    )
+                )
+
+    def _refresh_views(self):
+        """Refresh table slices when a rehash or value-buffer extension changes them."""
+        states = [kernel.tables.tables[0] for kernel in self.kernels]
+        generations = [
+            (s.key_map_generation, s.value_buffer_generation) for s in states
+        ]
+        if generations == self._generations:
+            return
+        self._values, self._buckets, self._rows, self._sizes = [], [], [], []
+        for state in states:
+            key_map = state.key_index_map
+            offsets = key_map.table_bucket_offsets_cpu_.tolist()
+            cap = key_map.bucket_capacity_
+            width = cap * sum(key_map.fields_byte_)
+            for table, start, end in zip(state.tables, offsets, offsets[1:]):
+                self._values.append(table.tensor())
+                self._buckets.append(
+                    key_map.table_storage_[start * width : end * width]
+                )
+                self._rows.append(key_map.rows_[start * cap : end * cap])
+                self._sizes.append(key_map.bucket_sizes[start:end])
+        self._generations = generations
 
     def mark_synced(self) -> None:
         """Take now as when the replicas last agreed; a sync covers keys touched since.
@@ -207,246 +244,44 @@ class DynamicEmbReplicaSync:
 
     def sync(self) -> List[TableSyncStats]:
         """Merge every row touched on any replica since the last sync into all replicas."""
+        if not self._names:
+            self.mark_synced()
+            return []
+        self._refresh_views()
+        (
+            counts,
+            self._routes,
+            keys,
+            values,
+            scores,
+            self._peer,
+        ) = torch.ops.dyn_emb.replica_sync_batch_(
+            self._values,
+            self._buckets,
+            self._rows,
+            self._sizes,
+            self._fresh,
+            self._layouts,
+            self._routes,
+            self._peer,
+            self.replica_group.group_name,
+            self.threshold,
+            self.max_staging_bytes,
+        )
         stats = [
-            self.sync_table(kernel, table_id, name)
-            for kernel in self.kernels
-            for table_id, name in enumerate(kernel.table_names)
+            TableSyncStats(name, union, local)
+            for name, (union, local) in zip(self._names, counts.tolist())
         ]
+        if any(entry.local_keys < entry.union_keys for entry in stats):
+            offset = 0
+            for kernel in self.kernels:
+                end = offset + len(kernel.table_names)
+                _install_missing(
+                    kernel.tables,
+                    keys[offset:end],
+                    values[offset:end],
+                    scores[offset:end],
+                )
+                offset = end
         self.mark_synced()
         return stats
-
-    def _route(self, kernel, table_id, chunk_rows):
-        state = kernel.tables.tables[0]
-        key_map = state.key_index_map
-        token = (kernel, table_id)
-        previous = self._dense_routes.get(token)
-        if previous is not None:
-            keys, rows, slots = previous
-            start, end = key_map.table_bucket_offsets_cpu_[
-                table_id : table_id + 2
-            ].tolist()
-            capacity = key_map.bucket_capacity_
-            valid = (key_map.bucket_sizes[start:end].sum() == keys.numel()).int()
-            torch.ops.dyn_emb.replica_validate_(
-                _buckets(state, table_id),
-                key_map.rows_[start * capacity : end * capacity],
-                keys,
-                rows,
-                slots,
-                capacity,
-                key_map.num_scores_,
-                self.threshold,
-                valid,
-            )
-            dist.all_reduce(valid, op=dist.ReduceOp.MIN, group=self.replica_group)
-            if valid.item():
-                counts = [
-                    [min(chunk_rows, keys.numel() - i)] * self.replica_count
-                    for i in range(0, keys.numel(), chunk_rows)
-                ]
-                return keys, None, rows, slots, counts
-            del self._dense_routes[token]
-            if self._peer is not None:
-                self._peer.routes.pop(token, None)
-
-        # Consume the same threshold scan as incremental_dump directly on the
-        # device. Checkpoint-oriented incremental_dump stages its output on CPU.
-        parts = [
-            keys
-            for keys, _, _ in key_map._batched_export_keys_scores(
-                [state.incremental_score_name],
-                state.device,
-                table_id,
-                [self.threshold],
-                TOUCHED_KEY_SCAN_BATCH,
-            )
-        ]
-        touched = (
-            torch.cat(parts).to(torch.int64)
-            if parts
-            else torch.empty(0, dtype=torch.int64, device=state.device)
-        )
-        keys = gather_unique_keys(touched, self.replica_group)
-        if keys.numel() == 0:
-            return keys, None, None, None, []
-        table_ids = torch.full_like(keys, table_id)
-        lookup = get_find_score_arg(
-            state, keys.numel(), state.device, const_lookup=True
-        )
-        _, held, rows, slots = key_map.lookup(
-            keys.to(key_map.key_type), table_ids, lookup, return_slots=True
-        )
-
-        # Exchange all chunk counts in one collective and one device-to-host
-        # transfer. A fully held chunk needs neither masks nor compaction.
-        count = torch.stack([mask.sum() for mask in held.split(chunk_rows)])
-        work, counts_gpu = _exchange(count, self.replica_group)
-        work.wait()
-        counts = counts_gpu.T.tolist()
-        if all(
-            min(per_rank) == min(chunk_rows, keys.numel() - i * chunk_rows)
-            for i, per_rank in enumerate(counts)
-        ):
-            self._dense_routes[token] = keys, rows, slots
-        return keys, held, rows, slots, counts
-
-    def sync_table(self, kernel: nn.Module, table_id: int, name: str) -> TableSyncStats:
-        """Merge one table's touched rows over the replica group and write them back."""
-        storage = kernel.tables
-        state = storage.tables[0]
-        key_map = state.key_index_map
-        layout = _RowLayout(
-            state.table_emb_dims_cpu[table_id],
-            state.optimizer.get_ckpt_state_dim(state.table_emb_dims_cpu[table_id]),
-            state.optimizer.get_state_dtype(state.emb_dtype).itemsize,
-            key_map.bucket_capacity_,
-            key_map.num_scores_,
-        )
-        initializer = state.options_list[table_id].initializer_args
-        constant = initializer.mode == DynamicEmbInitializerMode.CONSTANT
-        fresh = torch.empty(
-            1,
-            state.table_value_dims_cpu[table_id],
-            dtype=state.emb_dtype,
-            device=state.device,
-        )
-        if constant:
-            initial = torch.tensor([initializer.value], device=state.device)
-            fresh[:, : layout.embedding] = encode_table_values(initial, state.emb_dtype)
-        state.optimizer.reset_optimizer_states(
-            fresh[:, layout.embedding :], emb_dims=layout.embedding
-        )
-
-        payload = (
-            layout.embedding * fresh.element_size()
-            + layout.opt_columns * layout.opt_bytes
-        )
-        wire_bytes = ((payload + 15) // 16) * 16 + (layout.scores - 1) * 8
-        chunk_rows = max(
-            1, self.max_staging_bytes // (2 * (self.replica_count + 1) * wire_bytes)
-        )
-        keys, held, rows, slots, counts = self._route(kernel, table_id, chunk_rows)
-        if not counts:
-            return TableSyncStats(name, 0, 0)
-        replica = dist.get_rank(self.replica_group)
-        local_keys = sum(c[replica] for c in counts)
-        if (
-            self._peer is not None
-            and layout.scores == 1
-            and (not layout.opt_columns or layout.opt_bytes == fresh.element_size())
-            and payload == fresh.numel() * fresh.element_size()
-            and state.emb_dtype in (torch.float32, torch.float16, torch.bfloat16)
-            and payload % 16 == 0
-            and payload * keys.numel() >= 8 << 20
-            and all(sum(c[r] for c in counts) == keys.numel() for r in range(2))
-            and self._peer.sync(
-                (kernel, table_id),
-                state.tables[table_id].tensor(),
-                _buckets(state, table_id),
-                rows,
-                slots,
-                layout.bucket_capacity,
-            )
-        ):
-            return TableSyncStats(name, keys.numel(), local_keys)
-        if self._peer is not None:
-            self._peer.release_workspace()
-        lookup = get_find_score_arg(
-            state, keys.numel(), state.device, const_lookup=True
-        )
-        # Mutable score time comes from %globaltimer in the writeback kernel.
-        now = 0
-        pending = None
-
-        def finish(pending):
-            work, received, indices, destinations, positions = pending
-            work.wait()
-            torch.ops.dyn_emb.replica_merge_(
-                state.tables[table_id].tensor(),
-                _buckets(state, table_id),
-                destinations,
-                positions,
-                received,
-                indices,
-                fresh,
-                constant,
-                now,
-                layout,
-            )
-
-        refresh_lookup = False
-        for chunk, counts_per_rank in enumerate(counts):
-            begin = chunk * chunk_rows
-            stop = min(begin + chunk_rows, keys.numel())
-            selected = slice(begin, stop)
-            chunk_keys = keys[selected].to(key_map.key_type)
-            chunk_ids = None
-            chunk_rows_local, chunk_slots = rows[selected], slots[selected]
-            mask = held[selected] if held is not None else None
-            if refresh_lookup or min(counts_per_rank) != stop - begin:
-                chunk_ids = torch.full_like(keys[selected], table_id)
-            if refresh_lookup:
-                # Insertion in an earlier chunk may have grown a table or
-                # evicted an as-yet unprocessed key. Refresh both coordinates
-                # and held counts before packing, on every rank.
-                _, mask, chunk_rows_local, chunk_slots = state.key_index_map.lookup(
-                    chunk_keys, chunk_ids, lookup, return_slots=True
-                )
-                work, updated = _exchange(mask.sum().reshape(1), self.replica_group)
-                work.wait()
-                counts_per_rank = updated.flatten().tolist()
-            dense = min(counts_per_rank) == stop - begin
-            indices = None
-            if dense:
-                source_rows, source_slots = chunk_rows_local, chunk_slots
-            else:
-                if pending:
-                    finish(pending)
-                    pending = None
-                source_rows, source_slots = chunk_rows_local[mask], chunk_slots[mask]
-                work, masks = _exchange(mask.to(torch.uint8), self.replica_group)
-                work.wait()
-                indices = masks.cumsum(dim=1, dtype=torch.int32) - 1
-                indices.masked_fill_(masks == 0, -1)
-            packet = torch.ops.dyn_emb.replica_pack(
-                state.tables[table_id].tensor(),
-                _buckets(state, table_id),
-                source_rows,
-                source_slots,
-                max(counts_per_rank),
-                layout,
-            )
-            work, received = _exchange(packet, self.replica_group)
-            # Enqueue the next chunk's all-gather before waiting on the last
-            # one, allowing NCCL to run while the last chunk is averaged.
-            if pending:
-                finish(pending)
-            if not dense and counts_per_rank[replica] < stop - begin:
-                missing = (~mask) & masks.any(dim=0)
-                # Index as signed bits; PyTorch lacks uint64 boolean indexing.
-                missing_keys = keys[selected][missing].to(key_map.key_type)
-                if missing_keys.numel():
-                    per_table = torch.zeros(len(state.options_list), dtype=torch.int64)
-                    per_table[table_id] = missing_keys.numel()
-                    storage.expand_if_need(per_table)
-                    storage.insert(
-                        missing_keys,
-                        chunk_ids[missing],
-                        torch.zeros(
-                            missing_keys.numel(),
-                            state.value_dim,
-                            device=state.device,
-                            dtype=state.emb_dtype,
-                        ),
-                    )
-                    _, _, chunk_rows_local, chunk_slots = state.key_index_map.lookup(
-                        chunk_keys, chunk_ids, lookup, return_slots=True
-                    )
-            pending = work, received, indices, chunk_rows_local, chunk_slots
-            if not dense:
-                refresh_lookup = True
-                finish(pending)
-                pending = None
-        if pending:
-            finish(pending)
-        return TableSyncStats(name, keys.numel(), local_keys)
