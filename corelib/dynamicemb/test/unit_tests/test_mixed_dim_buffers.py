@@ -72,7 +72,9 @@ ALIGNED = ((4, 8), (12, 24))
 UNALIGNED = ((3, 5), (9, 15))
 
 
-@pytest.mark.parametrize("emb_dims,value_dims", [ALIGNED, UNALIGNED], ids=["vec4", "scalar"])
+@pytest.mark.parametrize(
+    "emb_dims,value_dims", [ALIGNED, UNALIGNED], ids=["vec4", "scalar"]
+)
 def test_store_then_load_round_trips_every_table_in_its_own_width(emb_dims, value_dims):
     # A padded row is [embedding, zero-padded to max_emb_dim][optimizer state], so the
     # widest row needs max_emb_dim + the largest optimizer width (e.g. 8 + 16 = 24).
@@ -104,7 +106,9 @@ def test_store_then_load_round_trips_every_table_in_its_own_width(emb_dims, valu
         torch.testing.assert_close(emb[i, :e], vals[i, :e])
 
 
-@pytest.mark.parametrize("emb_dims,value_dims", [ALIGNED, UNALIGNED], ids=["vec4", "scalar"])
+@pytest.mark.parametrize(
+    "emb_dims,value_dims", [ALIGNED, UNALIGNED], ids=["vec4", "scalar"]
+)
 def test_a_padded_store_writes_only_the_columns_a_table_uses(emb_dims, value_dims):
     # Fill every buffer with a sentinel, store padded rows (as wide as the widest table)
     # and check that nothing but the stored rows of the stored tables changed: a table
@@ -131,12 +135,12 @@ def test_loading_and_storing_whole_rows_of_one_table():
     b = make()
     rows = idx([3, 4])
     vals = torch.randn(2, 8, device="cuda")  # table 1 is 8 wide
-    b.store(rows, 1, vals)
-    torch.testing.assert_close(b.load(rows, 1), vals)
+    b.store(1, rows, vals)
+    torch.testing.assert_close(b.load(1, rows), vals)
     torch.testing.assert_close(b.tensor(1)[rows], vals)
     # nothing to do, nothing to fail
-    assert tuple(b.load(rows[:0], 0).shape) == (0, 12)
-    b.store(rows[:0], 0, torch.empty(0, 12, device="cuda"))
+    assert tuple(b.load(0, rows[:0]).shape) == (0, 12)
+    b.store(0, rows[:0], torch.empty(0, 12, device="cuda"))
     assert tuple(b.load_to_padded(rows[:0], rows[:0], CopyMode.VALUE).shape) == (0, 12)
 
 
@@ -154,22 +158,22 @@ def test_an_extendable_buffer_grows_and_keeps_its_rows(kind):
     assert b.kind == kind and b.on_device == (kind == "device")
     rows = idx([0, 1])
     vals = torch.randn(2, 8, device="cuda")
-    b.store(rows, 1, vals)
+    b.store(1, rows, vals)
     other_rows = idx([2, 3])  # table 0 must come through a growth of table 1 intact
     other = torch.randn(2, 12, device="cuda")
-    b.store(other_rows, 0, other)
+    b.store(0, other_rows, other)
 
     assert not b.grow_to(1, 10)  # it has 48 already
     assert b.grow_to(1, 100)
     assert b.num_rows(1) >= 100
     # the pointers the kernels use follow the buffers
     assert b.ptrs.tolist() == [b.tensor(t).data_ptr() for t in range(2)]
-    torch.testing.assert_close(b.load(rows, 1), vals)
-    torch.testing.assert_close(b.load(other_rows, 0), other)
+    torch.testing.assert_close(b.load(1, rows), vals)
+    torch.testing.assert_close(b.load(0, other_rows), other)
     assert b.num_rows(0) == 32
     # and the grown part is addressable
-    b.store(idx([99]), 1, torch.ones(1, 8, device="cuda"))
-    torch.testing.assert_close(b.load(idx([99]), 1), torch.ones(1, 8, device="cuda"))
+    b.store(1, idx([99]), torch.ones(1, 8, device="cuda"))
+    torch.testing.assert_close(b.load(1, idx([99])), torch.ones(1, 8, device="cuda"))
 
 
 def test_a_fixed_pool_does_not_grow():
@@ -184,9 +188,11 @@ def test_indices_on_the_host_are_accepted():
     b = make()
     rows = torch.tensor([1, 2], dtype=torch.int32)  # a key map's, on the host
     vals = torch.randn(2, 8, device="cuda")
-    b.store(rows, 1, vals)
-    torch.testing.assert_close(b.load(rows, 1), vals)
-    got = b.load_to_padded(rows, torch.tensor([1, 1], device="cuda"), CopyMode.EMBEDDING)
+    b.store(1, rows, vals)
+    torch.testing.assert_close(b.load(1, rows), vals)
+    got = b.load_to_padded(
+        rows, torch.tensor([1, 1], device="cuda"), CopyMode.EMBEDDING
+    )
     torch.testing.assert_close(got[:, :8], vals)
 
 
@@ -194,21 +200,34 @@ def test_an_fp8_buffer_stores_encoded_values():
     from dynamicemb.utils import FP8_STORAGE_DTYPE, decode_table_values
 
     b = MixedDimBuffers(
-        (4,), (4,), (8,), FP8_STORAGE_DTYPE, torch.device("cuda", torch.cuda.current_device()), "fixed"
+        (4,),
+        (4,),
+        (8,),
+        FP8_STORAGE_DTYPE,
+        torch.device("cuda", torch.cuda.current_device()),
+        "fixed",
     )
     rows = idx([0, 3])
-    vals = torch.tensor([[0.5, -0.25, 0.125, 1.0]] * 2, dtype=torch.float16, device="cuda")
-    b.store(rows, 0, vals)
+    vals = torch.tensor(
+        [[0.5, -0.25, 0.125, 1.0]] * 2, dtype=torch.float16, device="cuda"
+    )
+    b.store(0, rows, vals)
     # the buffer holds codes of value * scale, not the plain cast
-    torch.testing.assert_close(decode_table_values(b.load(rows, 0), torch.float16), vals)
+    torch.testing.assert_close(
+        decode_table_values(b.load(0, rows), torch.float16), vals
+    )
     b.store_from_padded(rows, idx([0, 0]), vals)
-    torch.testing.assert_close(decode_table_values(b.load(rows, 0), torch.float16), vals)
+    torch.testing.assert_close(
+        decode_table_values(b.load(0, rows), torch.float16), vals
+    )
 
 
 def test_gather_emb_by_entry_gathers_and_skips_negative_rows():
     b = make(emb_dims=(4, 8), value_dims=(12, 24))
     vals = torch.randn(3, b.max_value_dim, device="cuda")
-    b.store_from_padded(idx([0, 1, 2]), idx([0, 1, 1]), vals)  # table 0 row 0; table 1 rows 1, 2
+    b.store_from_padded(
+        idx([0, 1, 2]), idx([0, 1, 1]), vals
+    )  # table 0 row 0; table 1 rows 1, 2
 
     # entries: 0 -> (row 0, table 0), 1 -> (row -1, missing), 2 -> (row 2, table 1)
     rows, table_ids = idx([0, -1, 2]), idx([0, 1, 1])

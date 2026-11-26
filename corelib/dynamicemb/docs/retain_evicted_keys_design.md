@@ -297,7 +297,7 @@ if state.evicted_item_mode == EvictedItemMode.RETAIN_KEY:
 else:
     indices = state.key_index_map.insert(...)   # as before
 ...
-store_to_flat(state, flat_indices, table_ids, unique_values)   # unchanged
+state.buffers.store_from_padded(flat_indices, table_ids, unique_values)   # unchanged
 ```
 `_append_evicted` clones the first `num_evicted` entries and appends (key, tid)
 to the two chunk lists (pure append, no compaction).

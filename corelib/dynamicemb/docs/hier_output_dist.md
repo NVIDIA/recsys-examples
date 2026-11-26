@@ -3485,8 +3485,8 @@ Paths from `corelib/dynamicemb`.
   op. The table options are in `dynamicemb/dynamicemb_config.py`.
 * **DynamicEmb's lookup**, where it takes a row map (section 11.2):
   `dynamicemb/batched_dynamicemb_function.py` (`OutputAlloc`, the forward
-  and its backward's `grad_rows`), `dynamicemb/key_value_table.py`
-  (`load_from_flat_by`), `src/dynamic_emb_op.cu`
+  and its backward's `grad_rows`), `dynamicemb/state/mixed_dim_buffers.py`
+  (`gather_emb_by_entry`), `src/dynamic_emb_op.cu`
   (`load_from_flat_table_kernel` and its vector form, `gather_embedding`,
   `reduce_grads`) and `src/lookup_forward.cu` (`scatter_fused`).
 * **C++** (`src/hier_output_dist/`, namespace `dyn_emb::hier_output_dist`):

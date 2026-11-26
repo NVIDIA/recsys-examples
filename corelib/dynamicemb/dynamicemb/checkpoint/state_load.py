@@ -31,7 +31,6 @@ from dynamicemb.checkpoint.files import load_from_json, resolve_checkpoint_value
 from dynamicemb.dynamicemb_config import DynamicEmbTableOptions
 from dynamicemb.key_ownership import OwnershipRule
 from dynamicemb.score.args import ScoreArg
-from dynamicemb.state.value_rows import store_to_flat_single_table
 from dynamicemb.types import (
     EMBEDDING_TYPE,
     KEY_TYPE,
@@ -427,7 +426,7 @@ def _load_key_values(
             state.key_index_map.slots_of(keys, tid_tensor),
             scores.to(SCORE_TYPE).contiguous(),
         )
-        store_to_flat_single_table(state, indices, table_id, values)
+        state.buffers.store(table_id, indices, values)
         return
 
     policy = ScorePolicy.ASSIGN
@@ -454,4 +453,4 @@ def _load_key_values(
     )
 
     indices = state.key_index_map.insert(keys, tid_tensor, score_arg_insert)
-    store_to_flat_single_table(state, indices, table_id, values)
+    state.buffers.store(table_id, indices, values)

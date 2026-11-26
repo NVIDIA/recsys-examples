@@ -15,7 +15,7 @@
 
 """Regression tests for the contiguous *padded buffer* optimizer kernels.
 
-The padded buffer (produced by ``load_from_flat`` with ``CopyMode.VALUE``) lays
+The padded buffer (produced by ``buffers.load_to_padded`` with ``CopyMode.VALUE``) lays
 each row out as::
 
     [ emb (edim) | pad ... | m (edim) | v (edim) | pad ... ]

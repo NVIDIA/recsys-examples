@@ -24,7 +24,6 @@ from dynamicemb.dynamicemb_config import ReplayContent
 from dynamicemb.score.checkpoint_columns import _fresh_score_block, _replay_score_block
 from dynamicemb.state.value_rows import (
     _row_differs_from_slot,
-    store_to_flat_single_table,
 )
 from dynamicemb.types import ReplayStats
 from dynamicemb.utils import encode_table_values
@@ -45,7 +44,7 @@ def _replay_write_values(
     """Write a replayed row's value columns, per :class:`ReplayContent`.
 
     A value row is an embedding followed by the optimizer state, and the two are
-    written together or not at all -- ``store_to_flat_single_table`` copies from
+    written together or not at all -- ``buffers.store`` copies from
     the row base, so there is no way to write the tail without the head. The
     embedding is therefore always written, and the only choice is what the tail
     gets:
@@ -65,7 +64,7 @@ def _replay_write_values(
     want_opt = ReplayContent.OPTIMIZER_STATE in content and optstate_dim > 0
 
     if optstate_dim == 0:
-        store_to_flat_single_table(state, rows, table_id, embeddings)
+        state.buffers.store(table_id, rows, embeddings)
         return
 
     if want_opt:
@@ -90,14 +89,12 @@ def _replay_write_values(
             state.buffers.dtype,
             embeddings.device,
         )
-        store_to_flat_single_table(
-            state, rows, table_id, torch.cat([embeddings, opt], dim=-1)
-        )
+        state.buffers.store(table_id, rows, torch.cat([embeddings, opt], dim=-1))
         return
 
     keep = keep_optimizer
     if bool(keep.any()):
-        store_to_flat_single_table(state, rows[keep], table_id, embeddings[keep])
+        state.buffers.store(table_id, rows[keep], embeddings[keep])
     fresh = torch.logical_not(keep)
     if bool(fresh.any()):
         fresh_emb = embeddings[fresh]
@@ -107,10 +104,9 @@ def _replay_write_values(
             device=fresh_emb.device,
         )
         state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
-        store_to_flat_single_table(
-            state,
-            rows[fresh],
+        state.buffers.store(
             table_id,
+            rows[fresh],
             torch.cat([fresh_emb, opt_states], dim=-1),
         )
 

@@ -22,7 +22,6 @@ from dynamicemb.dynamicemb_config import EvictedItemMode
 from dynamicemb.score.args import get_find_score_arg, get_insert_score_arg
 from dynamicemb.state.evicted_items import _append_evicted
 from dynamicemb.state.table_state import DynamicEmbTableState
-from dynamicemb.state.value_rows import store_to_flat
 from dynamicemb_extensions import flagged_compact
 
 
@@ -140,7 +139,7 @@ def _insert_key_values(
         _append_evicted(state, evicted_keys, evicted_table_ids, num_evicted)
     else:
         indices = state.key_index_map.insert(unique_keys, table_ids, score_arg)
-    store_to_flat(state, indices, table_ids, unique_values)
+    state.buffers.store_from_padded(indices, table_ids, unique_values)
 
 
 def _insert_and_evict_keys(

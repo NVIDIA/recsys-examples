@@ -136,7 +136,7 @@ class FixedDeviceBuffer(ExtendableBuffer):
     """A device buffer that never grows: the cache's row pool.
 
     It has the buffer interface so it can sit where a table's value buffer does
-    (``get_table_ptrs``, the memory report, the kernels that address rows through
+    (``MixedDimBuffers``, the memory report, the kernels that address rows through
     it), but a cache's capacity is fixed at construction, so there is nothing to
     extend: it is a plain tensor, not an extendable (VMM) mapping.
     """

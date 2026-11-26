@@ -227,7 +227,7 @@ class MixedDimBuffers:
             self.all_dims_vec4,
         )
 
-    def load(self, rows: torch.Tensor, table: int) -> torch.Tensor:
+    def load(self, table: int, rows: torch.Tensor) -> torch.Tensor:
         """The whole value rows of one table at exactly its width, no padding: ``[n, value_dim]``."""
         rows = self._on_device_rows(rows)
         out = torch.empty(
@@ -249,7 +249,7 @@ class MixedDimBuffers:
             )
         return out
 
-    def store(self, rows: torch.Tensor, table: int, values: torch.Tensor) -> None:
+    def store(self, table: int, rows: torch.Tensor, values: torch.Tensor) -> None:
         """Write the whole value rows of one table at exactly its width, ``[n, value_dim]``."""
         if rows.numel() == 0:
             return

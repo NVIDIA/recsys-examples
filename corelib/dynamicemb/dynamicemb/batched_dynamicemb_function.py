@@ -34,10 +34,7 @@ from dynamicemb.key_value_table import (
     eval_lookup,
     get_find_score_arg,
     get_insert_score_arg,
-    load_from_flat,
-    load_from_flat_by,
     score_source,
-    store_to_flat,
 )
 from dynamicemb.lookup.embedding_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
@@ -388,7 +385,7 @@ def _load_storage_values(
     """
     st = storage._state
     rows = slots
-    return load_from_flat(st, rows, miss_tids, copy_mode=CopyMode.VALUE)
+    return st.buffers.load_to_padded(rows, miss_tids, copy_mode=CopyMode.VALUE)
 
 
 def _lookup_next_tier(
@@ -470,15 +467,15 @@ def _insert_into_storage(
         _,
     ) = _insert_and_evict_keys(st, keys, table_ids, scores)
     if num_evicted > 0:
-        evicted_values = load_from_flat(
-            st, evicted_slots, evicted_table_ids, copy_mode=CopyMode.VALUE
+        evicted_values = st.buffers.load_to_padded(
+            evicted_slots, evicted_table_ids, copy_mode=CopyMode.VALUE
         )
         # A key the storage refused (e.g. its bucket is full and the score does
         # not beat any stored one) comes back as an "evicted" row with a negative
-        # slot: load_from_flat left its value unwritten, so take the key's own
+        # slot: load_to_padded left its value unwritten, so take the key's own
         # input value instead, as HybridStorage.insert does.
         select_insert_failed_values(evicted_slots, values, evicted_values)
-    store_to_flat(st, slots, table_ids, values)
+    st.buffers.store_from_padded(slots, table_ids, values)
     if num_evicted > 0:
         next_tier.insert(evicted_keys, evicted_table_ids, evicted_values)
 
@@ -686,12 +683,11 @@ def _prefetch_inclusive_cache_path(
 
         # 8. What it evicted: read before the slots are overwritten, then write back
         with torch.cuda.nvtx.range("op:load_from_flat"):
-            evicted_values = load_from_flat(
-                state, evicted_slots, evicted_tids, copy_mode=CopyMode.VALUE
+            evicted_values = state.buffers.load_to_padded(
+                evicted_slots, evicted_tids, copy_mode=CopyMode.VALUE
             )
         with torch.cuda.nvtx.range("op:store_to_flat"):
-            store_to_flat(
-                state,
+            state.buffers.store_from_padded(
                 cache_slots,
                 cache_tids,
                 _select(values, into_cache, num_cache == values.size(0)),
@@ -868,7 +864,7 @@ def _prefetch_hbm_direct_path(
             # counter is indexed by slot, the value buffer by row.
             new_rows = new_indices
             with torch.cuda.nvtx.range("op:store_to_flat"):
-                store_to_flat(state, new_rows, admitted_tids, init_values)
+                state.buffers.store_from_padded(new_rows, admitted_tids, init_values)
 
             # Keys the insert could not place (-1) are skipped by the kernel.
             storage.increment_counter(new_slots, admitted_tids)
@@ -1383,9 +1379,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 )
                 if not direct:
                     with torch.cuda.nvtx.range("op:load_from_flat"):
-                        unique_embs = load_from_flat(
-                            state,
-                            # Value buffer: address by row (the slot, for a
+                        unique_embs = state.buffers.load_to_padded(  # Value buffer: address by row (the slot, for a
                             # cache).
                             prefetch_state.value_row_indices,
                             prefetch_state.unique_table_ids,
@@ -1472,8 +1466,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     output_embs, out_rows = alloc
                 if direct:
                     with torch.cuda.nvtx.range("op:load_from_flat"):
-                        load_from_flat_by(
-                            state,
+                        state.buffers.gather_emb_by_entry(
                             prefetch_state.value_row_indices,
                             prefetch_state.unique_table_ids,
                             prefetch_state.reverse_indices,

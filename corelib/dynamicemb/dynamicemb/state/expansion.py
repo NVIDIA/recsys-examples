@@ -32,10 +32,6 @@ from dynamicemb.state.table_state import (
     collect_table_sizes_for_state,
     collect_table_sizes_to_device,
 )
-from dynamicemb.state.value_rows import (
-    load_from_flat_single_table,
-    store_to_flat_single_table,
-)
 
 
 def _expand_tables_impl(
@@ -188,7 +184,7 @@ def _expand_tables_impl(
 
             if not new_key_index_map.use_rows_:
                 # Value row == hash slot: the value has to follow its key.
-                values_batch = load_from_flat_single_table(state, src_slots, table_id)
+                values_batch = state.buffers.load(table_id, src_slots)
                 dst_values_list.append((dst_slots, table_id, values_batch))
 
         if new_key_index_map.use_rows_:
@@ -196,7 +192,7 @@ def _expand_tables_impl(
             new_key_index_map.carry_rows_from(old_key_index_map, table_id)
 
         for dst_indices, table_id, values_batch in dst_values_list:
-            store_to_flat_single_table(state, dst_indices, table_id, values_batch)
+            state.buffers.store(table_id, dst_indices, values_batch)
 
     state.key_index_map = new_key_index_map
     state.key_map_generation += 1

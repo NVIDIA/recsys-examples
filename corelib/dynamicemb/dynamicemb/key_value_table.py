@@ -118,11 +118,6 @@ from dynamicemb.state.value_rows import (  # noqa: F401 (re-exported)
     _encode_slot_index,
     _row_differs_from_slot,
     _split_value_row,
-    load_from_flat,
-    load_from_flat_by,
-    load_from_flat_single_table,
-    store_to_flat,
-    store_to_flat_single_table,
 )
 from dynamicemb.types import SCORE_TYPE, Cache, CopyMode, ReplayStats, Storage
 from dynamicemb.utils import (  # noqa: F401 (re-exported)
@@ -548,7 +543,9 @@ class DynamicEmbStorage(Storage):
             indices,
         ) = result
         flat_rows = indices
-        values = load_from_flat(self._state, flat_rows, table_ids, copy_mode=copy_mode)
+        values = self._state.buffers.load_to_padded(
+            flat_rows, table_ids, copy_mode=copy_mode
+        )
 
         return (
             h_num_missing,
@@ -757,7 +754,7 @@ class DynamicEmbStorage(Storage):
             )
             scores_batch = named_scores[s.incremental_score_name]
             flat_rows = indices
-            values = load_from_flat_single_table(s, flat_rows, table_id)
+            values = s.buffers.load(table_id, flat_rows)
             value, opt = _split_value_row(s, table_id, values)
             key = keys.to(s.device) if keys.device.type != "cuda" else keys
             slot = _encode_slot_index(s, slots, flat_rows)
@@ -1098,7 +1095,7 @@ class HybridStorage(Storage):
         return self._hbm.buffers.max_value_dim
 
     def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
-        # find() builds the value buffer from the HBM tier (load_from_flat(self._hbm)),
+        # find() builds the value buffer from the HBM tier (``self._hbm.buffers.load_to_padded``),
         # and max_*_dim above also report the HBM tier, so its dims are authoritative.
         return (
             self._hbm.buffers.emb_dims if on_device else self._hbm.buffers.emb_dims_host
@@ -1191,7 +1188,9 @@ class HybridStorage(Storage):
         ) = result_hbm
 
         flat_hbm = indices_hbm
-        values = load_from_flat(self._hbm, flat_hbm, table_ids, copy_mode=copy_mode)
+        values = self._hbm.buffers.load_to_padded(
+            flat_hbm, table_ids, copy_mode=copy_mode
+        )
 
         if h_num_missing_hbm == 0:
             return (
@@ -1223,8 +1222,8 @@ class HybridStorage(Storage):
         ) = result_host
 
         flat_host = indices_host
-        host_vals = load_from_flat(
-            self._host, flat_host, missing_table_ids_hbm, copy_mode=copy_mode
+        host_vals = self._host.buffers.load_to_padded(
+            flat_host, missing_table_ids_hbm, copy_mode=copy_mode
         )
 
         host_found_mask = founds_host
@@ -1290,7 +1289,7 @@ class HybridStorage(Storage):
 
         * ``preserve_existing=True`` (e.g. autograd backward refresh): **no insert**.
           Performs the same two-tier lookup as :meth:`find`, and only
-          ``store_to_flat`` updates rows that already exist in HBM or host. Keys
+          ``buffers.store_from_padded`` updates rows that already exist in HBM or host. Keys
           absent from both tiers are ignored.
         """
         if preserve_existing:
@@ -1308,8 +1307,7 @@ class HybridStorage(Storage):
             ) = _find_keys(self._hbm, unique_keys, table_ids)
             if founds_hbm.any():
                 flat_hbm = indices_hbm
-                store_to_flat(
-                    self._hbm,
+                self._hbm.buffers.store_from_padded(
                     flat_hbm[founds_hbm],
                     table_ids[founds_hbm],
                     unique_values[founds_hbm],
@@ -1333,8 +1331,7 @@ class HybridStorage(Storage):
                 if founds_host.any():
                     orig_rows = missing_indices_hbm[founds_host]
                     flat_host = indices_host
-                    store_to_flat(
-                        self._host,
+                    self._host.buffers.store_from_padded(
                         flat_host[founds_host],
                         missing_table_ids_hbm[founds_host],
                         unique_values[orig_rows],
@@ -1356,11 +1353,11 @@ class HybridStorage(Storage):
             preserve_existing=False,
         )
 
-        evicted_values = load_from_flat(
-            self._hbm, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
+        evicted_values = self._hbm.buffers.load_to_padded(
+            evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
         )
         select_insert_failed_values(evicted_indices, unique_values, evicted_values)
-        store_to_flat(self._hbm, indices, table_ids, unique_values)
+        self._hbm.buffers.store_from_padded(indices, table_ids, unique_values)
 
         if num_evicted != 0:
             _insert_key_values(
@@ -1426,7 +1423,7 @@ class HybridStorage(Storage):
             )
             scores_batch = named_scores[s.incremental_score_name]
             flat_rows = indices
-            values = load_from_flat_single_table(s, flat_rows, table_id)
+            values = s.buffers.load(table_id, flat_rows)
             value, opt = _split_value_row(s, table_id, values)
             key = keys.to(s.device) if keys.device.type != "cuda" else keys
             slot = _encode_slot_index(s, indices, flat_rows, tier=tier)
@@ -1783,14 +1780,13 @@ class HybridStorage(Storage):
                 evicted_scores,
             ) = _insert_and_evict_keys(self._hbm, keys, tids, file_scores)
 
-            evicted_values = load_from_flat(
-                self._hbm,
+            evicted_values = self._hbm.buffers.load_to_padded(
                 evicted_indices,
                 evicted_table_ids,
                 copy_mode=CopyMode.VALUE,
             )
             select_insert_failed_values(evicted_indices, values, evicted_values)
-            store_to_flat_single_table(self._hbm, ins_indices, table_id, values)
+            self._hbm.buffers.store(table_id, ins_indices, values)
 
             if num_evicted != 0:
                 _insert_key_values(
@@ -1941,7 +1937,9 @@ def flush_cache(
             table_id=t,
         ):
             tid = torch.full((keys.numel(),), t, dtype=torch.int64, device=keys.device)
-            values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE)
+            values = state.buffers.load_to_padded(
+                indices, tid, copy_mode=CopyMode.VALUE
+            )
             if cache_owns_scores:
                 storage.insert(keys, tid, values, named_scores[state.score_policy.name])
             else:
@@ -1989,8 +1987,8 @@ def _eval_lookup_cached(
 ) -> torch.Tensor:
     _, founds, cache_indices = cache.lookup(keys, table_ids)
 
-    embs = load_from_flat(
-        cache._state, cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
+    embs = cache._state.buffers.load_to_padded(
+        cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
     )
 
     missing_mask = ~founds

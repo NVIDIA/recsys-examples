@@ -30,7 +30,6 @@ from dynamicemb.checkpoint.files import (
     save_to_json,
 )
 from dynamicemb.score.strategy import score_dump_permutation
-from dynamicemb.state.value_rows import load_from_flat_single_table
 from dynamicemb.types import SCORE_TYPE
 from dynamicemb.utils import checkpoint_dtype, decode_table_values
 from dynamicemb_extensions import EvictStrategy
@@ -72,7 +71,7 @@ def export_keys_values_iter(
     ):
         scores = named_scores[state.score_policy.name]
         flat_rows = indices
-        values = load_from_flat_single_table(state, flat_rows, table_id)
+        values = state.buffers.load(table_id, flat_rows)
         embeddings = decode_table_values(
             values[:, :emb_dim_t], checkpoint_dtype(state.buffers.dtype)
         ).contiguous()
