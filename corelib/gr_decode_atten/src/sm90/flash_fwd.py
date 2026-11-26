@@ -1642,7 +1642,7 @@ class FlashAttentionForwardSm90:
         self,
         acc_O: cute.Tensor,
         softmax: Softmax,
-        thr_mma: cute.core.ThrMma,
+        thr_mma: cute.ThrMma,
         tidx: Int32,
         sQ: cute.Tensor,  # swizzled SMEM Q (swizzle on pointer, affine layout)
         mK_beam: cute.Tensor,

@@ -10,7 +10,7 @@
 cmake_minimum_required(VERSION 3.18)
 project(nve_init_hook LANGUAGES CXX CUDA)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(CUDAToolkit REQUIRED)
@@ -27,7 +27,7 @@ find_library(NVE_COMMON_LIB nve-common
 
 add_library(nve_init_hook SHARED nve_init_hook.cu)
 set_target_properties(nve_init_hook PROPERTIES
-  CUDA_STANDARD 17
+  CUDA_STANDARD 20
   CUDA_STANDARD_REQUIRED ON
   POSITION_INDEPENDENT_CODE ON
   CUDA_ARCHITECTURES "90"
