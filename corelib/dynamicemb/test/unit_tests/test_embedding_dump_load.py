@@ -28,6 +28,7 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     FrequencyAdmissionStrategy,
+    get_global_table_capacity,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dump_load import (
@@ -37,13 +38,14 @@ from dynamicemb.dump_load import (
     get_dynamic_emb_module,
 )
 from dynamicemb.dynamicemb_config import (
+    DEFAULT_BUCKET_CAPACITY,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     ScoreStrategy,
     get_table_value_bytes,
 )
 from dynamicemb.embedding_admission import KVCounter
-from dynamicemb.key_ownership import murmur3_fmix64
+from dynamicemb.key_ownership import hashed_shard_capacity, murmur3_fmix64
 from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage
 from dynamicemb.planner import get_planner
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
@@ -99,13 +101,15 @@ def get_optimizer_kwargs(optimizer_type: str) -> Dict[str, Any]:
         raise ValueError("unknown optimizer type")
 
 
-def get_score_strategy(score_strategy_str: str) -> DynamicEmbScoreStrategy:
+def get_score_strategy(score_strategy_str: str) -> ScoreStrategy:
     if score_strategy_str == "timestamp":
         return DynamicEmbScoreStrategy.TIMESTAMP
     elif score_strategy_str == "step":
         return DynamicEmbScoreStrategy.STEP
     elif score_strategy_str == "lfu":
         return DynamicEmbScoreStrategy.LFU
+    elif score_strategy_str == "lru_lfu":
+        return (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)
     else:
         raise ValueError(f"Invalid score strategy: {score_strategy_str}")
 
@@ -121,7 +125,7 @@ def assert_batched_dynamicemb_storage_class(
     - Must be :class:`DynamicEmbStorage` or :class:`HybridStorage`.
     - With ``--caching``: expect ``DynamicEmbStorage`` (backing store under cache).
     - No cache and ``global_hbm_budget_scale < 1``: expect ``HybridStorage``
-      (StorageMode DEFAULT / two-tier).
+      (the generic prefetch path / two-tier).
     - No cache and full budget: expect single-tier ``DynamicEmbStorage``.
     """
     for _, _, sharded_module in find_sharded_modules(model, ""):
@@ -382,7 +386,7 @@ def apply_dmp(
             eb_config,
             emb_opt_type,
             world_size,
-            MAX_BUCKET_CAPACITY,
+            table_bucket_capacity(dist_type),
         )
         if caching:
             global_hbm = int(value_bytes * cache_capacity_ratio)
@@ -397,7 +401,9 @@ def apply_dmp(
                 mode=DynamicEmbInitializerMode.CONSTANT,
                 value=TABLE_INITIALIZER_VALUE,
             ),
-            bucket_capacity=MAX_BUCKET_CAPACITY,  # keep same to the bucket capacity from get_table_value_bytes
+            bucket_capacity=table_bucket_capacity(
+                dist_type
+            ),  # keep same to the bucket capacity from get_table_value_bytes
             caching=caching,
             admit_strategy=admit_strategy,
             **table_output_dist.get(eb_config.name, {}),
@@ -436,6 +442,18 @@ def apply_dmp(
     ]
     hier_switch.track(dmp, *(fields for _, fields in collection_output_dist))
     return dmp
+
+
+def table_bucket_capacity(dist_type: str) -> int:
+    """The bucket capacity these tests give a table: one bucket per shard
+    (``MAX_BUCKET_CAPACITY``), except under ``hash_bucket``, which exists for the
+    global bucket layout of a table of ordinary buckets. With one bucket per shard
+    its global capacity is ``world_size * shard rows`` and changes with the
+    fan-out, so a checkpoint would never be reloaded under the layout it was
+    written with."""
+    if dist_type == "hash_bucket":
+        return DEFAULT_BUCKET_CAPACITY
+    return MAX_BUCKET_CAPACITY
 
 
 def create_model(
@@ -556,7 +574,13 @@ def check_counter_table_checkpoint(x, y):
                 ), f"counter frequency mismatch for table_id={table_id}"
 
 
-def owns_key(key: int, rank: int, world_size: int, dist_type: str) -> bool:
+def owns_key(
+    key: int,
+    rank: int,
+    world_size: int,
+    dist_type: str,
+    num_embeddings: Optional[int] = None,
+) -> bool:
     """Whether *rank* is the one holding *key*, under the rule the model uses.
 
     The question `dynamicemb.key_ownership` answers for tensors, asked one
@@ -569,11 +593,34 @@ def owns_key(key: int, rank: int, world_size: int, dist_type: str) -> bool:
 
     A key from an int32 KJT arrives as a Python int with its sign, so it is read
     as the int64 key a table stores.
+
+    hash_bucket routes by the table's global bucket layout, so it needs the
+    table's size: its whole-table capacity and the rows one shard holds follow from
+    ``num_embeddings`` and the bucket capacity the tests give it
+    (``table_bucket_capacity``), as the planner derives them.
     """
     if world_size <= 1:
         return True
     if dist_type == "hash_roundrobin":
         return int(murmur3_fmix64(key)) % world_size == rank
+    if dist_type == "hash_bucket":
+        if num_embeddings is None:
+            raise ValueError("owns_key: hash_bucket needs the table's num_embeddings")
+        bucket_capacity = table_bucket_capacity(dist_type)
+        global_capacity = get_global_table_capacity(
+            EmbeddingConfig(
+                name="owns_key",
+                embedding_dim=1,
+                num_embeddings=num_embeddings,
+                feature_names=["owns_key"],
+            ),
+            bucket_capacity,
+        )
+        shard_capacity = hashed_shard_capacity(
+            global_capacity, bucket_capacity, world_size
+        )
+        h = int(murmur3_fmix64(key)) & ((1 << 63) - 1)
+        return (h % global_capacity) // shard_capacity == rank
     return (int(key) & 0xFFFFFFFFFFFFFFFF) % world_size == rank
 
 
@@ -597,6 +644,14 @@ def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
                 # rather than restating the mapping here.
                 expected_code = int(dist_type_codes([expected_dist_type])[0])
                 assert set(codes.tolist()) == {expected_code}
+                # hash_bucket carries its parameters next to the codes:
+                # every feature a positive whole-table and shard capacity.
+                global_caps = input_dist._global_capacity_tensor.tolist()
+                shard_caps = input_dist._shard_capacity_tensor.tolist()
+                assert len(global_caps) == len(shard_caps) == codes.numel()
+                if expected_dist_type == "hash_bucket":
+                    assert all(c > 0 for c in global_caps), global_caps
+                    assert all(c > 0 for c in shard_caps), shard_caps
                 seen_input_dist = True
 
     assert seen_sharding, "Did not find any DynamicEmb sharding carrying dist_type."
@@ -622,7 +677,7 @@ def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
 )
 @click.option(
     "--dist-type",
-    type=click.Choice(["continuous", "roundrobin", "hash_roundrobin"]),
+    type=click.Choice(["continuous", "roundrobin", "hash_roundrobin", "hash_bucket"]),
     default="roundrobin",
     show_default=True,
 )
@@ -795,7 +850,13 @@ def test_model_load_dump(
                     keys = kjt[feature_name].values().tolist()
                     for key in keys:
                         if (
-                            owns_key(key, rank, world_size, dist_type)
+                            owns_key(
+                                key,
+                                rank,
+                                world_size,
+                                dist_type,
+                                num_embeddings[embedding_idx],
+                            )
                             and key not in visited_keys
                         ):
                             assert (
@@ -812,7 +873,13 @@ def test_model_load_dump(
                     keys = kjt[feature_name].values().tolist()
                     for key in keys:
                         if (
-                            owns_key(key, rank, world_size, dist_type)
+                            owns_key(
+                                key,
+                                rank,
+                                world_size,
+                                dist_type,
+                                num_embeddings[embedding_idx],
+                            )
                             and key not in visited_keys
                         ):
                             assert (

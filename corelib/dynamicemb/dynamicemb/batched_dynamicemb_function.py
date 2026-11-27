@@ -17,9 +17,8 @@ import sys
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from threading import RLock
-from typing import Callable, ContextManager, Optional, Tuple
+from typing import Callable, ContextManager, Optional, Tuple, Union
 
 import torch
 from dynamicemb.async_erase import defer_table_cleanup, table_section
@@ -37,14 +36,16 @@ from dynamicemb.key_value_table import (
     _select,
     _write_back_evicted,
     eval_lookup,
+    get_find_score_arg,
     get_insert_score_arg,
     load_from_flat,
     load_from_flat_by,
     score_source,
     store_to_flat,
 )
-from dynamicemb.lookup_layout import EmbeddingLayout
+from dynamicemb.lookup.embedding_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb.state.storage_layout import CachePolicy, StorageLayout
 from dynamicemb.types import CopyMode, MultiTableAdmitter
 from dynamicemb.utils import decode_table_values, gradient_dtype
 from dynamicemb_extensions import (
@@ -197,12 +198,6 @@ def largest_score_per_unique_key(
     )
 
 
-class StorageMode(Enum):
-    DEFAULT = auto()
-    CACHE = auto()
-    HBM_DIRECT = auto()
-
-
 class _PinnedRowLease:
     """One pin reservation, returned on final backward or abandoned ownership.
 
@@ -210,9 +205,8 @@ class _PinnedRowLease:
     event orders cancellation on a different stream after the last queued use.
     """
 
-    def __init__(self, cache, storage, batch):
-        self.cache, self.storage = cache, storage
-        self.storage_mode = batch.storage_mode
+    def __init__(self, batch):
+        self.owner = batch.slot_owner
         self.unique_keys, self.unique_table_ids = (
             batch.unique_keys,
             batch.unique_table_ids,
@@ -242,9 +236,7 @@ class _PinnedRowLease:
         with self._lock:
             if self.released:
                 return
-            owner = (
-                self.cache if self.storage_mode == StorageMode.CACHE else self.storage
-            )
+            owner = self.owner
             # Fixed hash slots cannot move while pinned. As in the existing
             # backward contract, the atomic decrement follows this stream's
             # final use; async erase sees the pin until that decrement. Rehash
@@ -270,13 +262,7 @@ class _PinnedRowLease:
                     ):
                         tensor.record_stream(stream)
                 refresh_slots_after_rehash(owner._state, self)
-                release_slot_pins(
-                    self.cache,
-                    self.storage,
-                    self.storage_mode,
-                    self.slot_indices,
-                    self.unique_table_ids,
-                )
+                release_slot_pins(owner, self.slot_indices, self.unique_table_ids)
                 self.released = True
 
     def __del__(self):
@@ -302,7 +288,10 @@ class PrefetchState:
     lfu_accumulated_frequency: torch.Tensor
     table_num: int
     emb_dtype: torch.dtype
-    storage_mode: StorageMode
+    storage_layout: StorageLayout
+    # The table whose hash slots ``slot_indices`` are: the cache when HBM caches, else
+    # the storage. Its counter pins them and its state is what they address.
+    slot_owner: Union[Cache, Storage]
     slot_indices: Optional[torch.Tensor]
     # Value-buffer row per key -- what forward and backward both address values
     # with. It differs from ``slot_indices`` for a table that stores a row per
@@ -319,6 +308,7 @@ class PrefetchState:
     # The key_map_generation (rehash count) of the table state the slots were found in: a later
     # prefetch may expand it before this batch's backward runs.
     key_map_generation: int = 0
+    table_gate: Optional[Callable[[], ContextManager]] = None
 
     def record_stream(self, stream: torch.cuda.Stream) -> None:
         """Marks the per-batch tensors used on ``stream``: a prefetch pipeline
@@ -383,16 +373,6 @@ def refresh_slots_after_rehash(state: DynamicEmbTableState, batch) -> None:
     batch.key_map_generation = state.key_map_generation
 
 
-def _is_hbm_storage(storage: Storage) -> bool:
-    """True if values live in GPU device memory (HBM). Use buffer type, not
-    tensor.is_cuda: host memory registered to CUDA address space can report is_cuda True.
-    """
-    return (
-        isinstance(storage, DynamicEmbStorage)
-        and storage._state.tables[0].is_device_buffer()
-    )
-
-
 def _apply_admission(
     missing_keys: torch.Tensor,
     missing_indices: torch.Tensor,
@@ -404,6 +384,7 @@ def _apply_admission(
     max_emb_dim: int,
     freq_for_admission: Optional[torch.Tensor],
     admitter: Optional[MultiTableAdmitter],
+    scores_are_frequencies: bool = False,
 ) -> Tuple[
     torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -431,6 +412,14 @@ def _apply_admission(
             )
 
         admit_mask = admitter.admit(missing_keys, missing_table_ids, freq_for_admission)
+        if (
+            scores_are_frequencies
+            and freq_for_admission is not None
+            and missing_scores is not None
+        ):
+            # An LFU score is a frequency, and the admitter hands back each key's
+            # running total in the frequencies it was given.
+            missing_scores = freq_for_admission
         non_admitted_initializer = admitter.non_admitted_initializer
 
         non_admitted_mask = ~admit_mask
@@ -591,7 +580,7 @@ def _insert_into_storage(
         next_tier.insert(evicted_keys, evicted_table_ids, evicted_values)
 
 
-def _prefetch_cache_path(
+def _prefetch_inclusive_cache_path(
     cache: DynamicEmbCache,
     storage: DynamicEmbStorage,
     unique_keys: torch.Tensor,
@@ -606,7 +595,7 @@ def _prefetch_cache_path(
     external_storage: Optional[Storage] = None,
     key_scores: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Cache prefetch with counter protection and overflow buffer.
+    """Cache prefetch with counter protection and overflow buffer (CachePolicy.INCLUSIVE).
 
     ``storage`` is the tier that owns every key's score; the cache above it
     ranks by timestamp only, and holds the freshest value of a key until it is
@@ -626,7 +615,7 @@ def _prefetch_cache_path(
 
     Returns (slot_indices, non_admitted_positions).
     """
-    with torch.cuda.nvtx.range("_prefetch_cache_path"):
+    with torch.cuda.nvtx.range("_prefetch_inclusive_cache_path"):
         device = unique_keys.device
         state = cache._state
 
@@ -648,7 +637,9 @@ def _prefetch_cache_path(
         # ``score_input`` is what the storage's score is made from, chosen once
         # here and carried with the keys from now on; ``accumulated_frequency``
         # is only for admission below.
-        score_input = score_source(storage._state, accumulated_frequency, key_scores)
+        score_input = score_source(
+            storage._state.evict_strategy, accumulated_frequency, key_scores
+        )
         with torch.cuda.nvtx.range("op:storage_find"):
             (_, _, _, _, _, st_founds, _, st_slots) = _find_keys(
                 storage._state,
@@ -703,6 +694,14 @@ def _prefetch_cache_path(
                 ) = flagged_compact(is_new, [miss_keys, miss_tids, miss_freq, miss_pos])
             if num_new > 0:
                 admit_mask = admitter.admit(new_keys, new_tids, new_freq)
+                if (
+                    miss_score_input is not None
+                    and new_freq is not None
+                    and storage._state.evict_strategy == EvictStrategy.KLfu
+                ):
+                    # An LFU score is a frequency: the admitter hands back each
+                    # key's running total in the frequencies it was given.
+                    miss_score_input[new_rows] = new_freq
                 admitted[new_rows] = admit_mask
                 with torch.cuda.nvtx.range("op:flagged_compact"):
                     num_refused, _, (refused_pos,) = flagged_compact(
@@ -856,7 +855,9 @@ def _prefetch_hbm_direct_path(
                 state,
                 unique_keys,
                 unique_table_ids,
-                score_input=score_source(state, accumulated_frequency, key_scores),
+                score_input=score_source(
+                    state.evict_strategy, accumulated_frequency, key_scores
+                ),
                 return_slots=True,
             )
 
@@ -886,6 +887,14 @@ def _prefetch_hbm_direct_path(
             admit_mask = admitter.admit(
                 missing_keys, missing_table_ids, freq_for_admission
             )
+            if (
+                freq_for_admission is not None
+                and missing_scores is not None
+                and state.evict_strategy == EvictStrategy.KLfu
+            ):
+                # An LFU score is a frequency: the admitter hands back each key's
+                # running total in the frequencies it was given.
+                missing_scores = freq_for_admission
 
             admitted_keys = missing_keys[admit_mask]
             admitted_tids = missing_table_ids[admit_mask]
@@ -977,6 +986,7 @@ def dynamicemb_prefetch(
     offsets: torch.Tensor,
     cache: Optional[Cache],
     storage: Storage,
+    storage_layout: StorageLayout,
     feature_offsets: torch.Tensor,
     initializer: MultiTableInitializer,
     forward_stream: Optional[torch.cuda.Stream] = None,
@@ -989,6 +999,10 @@ def dynamicemb_prefetch(
 ) -> PrefetchState:
     """Unified prefetch for all storage types (cache, HBM-direct, generic).
 
+    ``storage_layout`` says where the values are (see :class:`StorageLayout`); its
+    ``cache_policy`` says what a cache sits on: under NINE, ``storage`` is the
+    external store itself and ``external_storage`` is unused.
+
     Returns a PrefetchState containing unique embeddings + optimizer states
     and the metadata needed by forward/backward.
 
@@ -1000,7 +1014,9 @@ def dynamicemb_prefetch(
     ``table_gate`` is what an erase running beside the training takes too (see
     ``async_erase.TableAccessGate``). Prefetch holds it while it reads or changes the
     tables -- from the expansion through the find and the counter increment -- so
-    that a key it found is pinned before an erase can look at it.
+    that a key it found is pinned before an erase can look at it. The generic
+    (DEFAULT) path finds and inserts its keys in forward and writes them back in
+    backward instead, so the gate goes with the returned state and those take it too.
     """
     with torch.cuda.nvtx.range("dynamicemb_prefetch"):
         table_num = feature_offsets.numel() - 1
@@ -1008,7 +1024,6 @@ def dynamicemb_prefetch(
         emb_dtype = storage.embedding_dtype()
         max_emb_dim = storage.max_embedding_dim()
         max_val_dim = storage.max_value_dim()
-        caching = cache is not None
 
         evict_strat = EvictStrategy(evict_strategy.value) if evict_strategy else None
         # todo: double check
@@ -1049,41 +1064,59 @@ def dynamicemb_prefetch(
         non_admitted_positions = None
         value_row_indices = None
         key_map_generation = 0
-        if caching:
-            storage_mode = StorageMode.CACHE
-        elif _is_hbm_storage(storage):
-            storage_mode = StorageMode.HBM_DIRECT
-        else:
-            storage_mode = StorageMode.DEFAULT
 
         with table_section(table_gate):
             if hasattr(storage, "expand_if_need"):
                 storage.expand_if_need(unique_size_per_table)
 
-            if storage_mode == StorageMode.CACHE:
-                (
-                    slot_indices,
-                    non_admitted_positions,
-                ) = _prefetch_cache_path(
-                    cache,
-                    storage,
-                    unique_keys,
-                    unique_table_ids,
-                    max_emb_dim,
-                    max_val_dim,
-                    emb_dtype,
-                    initializer,
-                    evict_strat,
-                    lfu_accumulated_frequency,
-                    admitter,
-                    external_storage,
-                    key_scores=unique_scores,
-                )
+            if storage_layout.caching:
+                if storage_layout.cache_policy == CachePolicy.NINE:
+                    # Imported here: the path module imports helpers from this one.
+                    from dynamicemb.lookup.nine_cache_path import (
+                        prefetch_nine_cache_path,
+                    )
+
+                    (
+                        slot_indices,
+                        non_admitted_positions,
+                    ) = prefetch_nine_cache_path(
+                        cache,
+                        storage,
+                        unique_keys,
+                        unique_table_ids,
+                        max_emb_dim,
+                        max_val_dim,
+                        emb_dtype,
+                        initializer,
+                        evict_strat,
+                        lfu_accumulated_frequency,
+                        admitter,
+                        key_scores=unique_scores,
+                    )
+                else:
+                    (
+                        slot_indices,
+                        non_admitted_positions,
+                    ) = _prefetch_inclusive_cache_path(
+                        cache,
+                        storage,
+                        unique_keys,
+                        unique_table_ids,
+                        max_emb_dim,
+                        max_val_dim,
+                        emb_dtype,
+                        initializer,
+                        evict_strat,
+                        lfu_accumulated_frequency,
+                        admitter,
+                        external_storage,
+                        key_scores=unique_scores,
+                    )
                 # The cache addresses its own value buffer by cache slot: a cache is
                 # never NO_EVICTION (it enables overflow, which NO_EVICTION rejects
                 # at construction), so the two index spaces coincide here.
                 value_row_indices = slot_indices
-            elif storage_mode == StorageMode.HBM_DIRECT:
+            elif storage_layout.hbm_direct:
                 (
                     slot_indices,
                     non_admitted_positions,
@@ -1110,7 +1143,8 @@ def dynamicemb_prefetch(
             table_num=table_num,
             emb_dtype=emb_dtype,
             slot_indices=slot_indices,
-            storage_mode=storage_mode,
+            storage_layout=storage_layout,
+            slot_owner=cache if storage_layout.caching else storage,
             non_admitted_positions=non_admitted_positions,
             unique_scores=unique_scores,
             value_row_indices=value_row_indices,
@@ -1118,7 +1152,7 @@ def dynamicemb_prefetch(
             table_gate=table_gate,
         )
         if result.slot_indices is not None:
-            result.pin_lease = _PinnedRowLease(cache, storage, result)
+            result.pin_lease = _PinnedRowLease(result)
         return result
 
 
@@ -1277,11 +1311,10 @@ def _generic_forward_path(
             ) = storage.find(
                 unique_keys,
                 unique_table_ids,
-                copy_mode=CopyMode.VALUE,
-                lfu_accumulated_frequency=accumulated_frequency,
-                # Only when there are some: an external store written against
-                # the interface before per-key scores has no such parameter.
-                **({} if key_scores is None else {"key_scores": key_scores}),
+                CopyMode.VALUE,
+                # The one input the table's score is made from, positionally: an
+                # external store keeps its own name for the parameter.
+                score_source(evict_strategy, accumulated_frequency, key_scores),
             )
 
         key_persisted = founds.clone()
@@ -1320,6 +1353,7 @@ def _generic_forward_path(
             max_emb_dim,
             freq_for_admission,
             admitter,
+            scores_are_frequencies=evict_strategy == EvictStrategy.KLfu,
         )
 
         if indices_to_init.numel() > 0:
@@ -1356,20 +1390,49 @@ def _generic_forward_path(
 
 
 def release_slot_pins(
-    cache: Optional[Cache],
-    storage: Storage,
-    storage_mode: StorageMode,
+    slot_owner: Union[Cache, Storage],
     slot_indices: torch.Tensor,
     unique_table_ids: torch.Tensor,
 ) -> None:
     """Undo the ref-counter pins that prefetch took on ``slot_indices``.
 
-    The counter sits beside the hash table of whichever of ``cache`` / ``storage``
-    served the batch, and is indexed by hash slot (not by value row). Called by
+    The counter sits beside the hash table of ``slot_owner`` (the cache or the
+    storage that served the batch), and is indexed by hash slot (not by value row). Called by
     backward, or by a forward that has no backward (no autograd graph).
     """
-    counter_owner = cache if storage_mode == StorageMode.CACHE else storage
-    counter_owner.decrement_counter(slot_indices, unique_table_ids)
+    slot_owner.decrement_counter(slot_indices, unique_table_ids)
+
+
+def write_back_generic(
+    storage: Storage,
+    keys: torch.Tensor,
+    table_ids: torch.Tensor,
+    values: torch.Tensor,
+) -> None:
+    """Backward's write-back on the generic path: the updated rows of the keys forward
+    found or inserted, scores left as they are.
+
+    A ``DynamicEmbStorage`` pins no slot here, so between forward and backward an erase
+    may have taken a key: its update is dropped rather than inserted again, since a
+    ``CONST`` insert would give it a score of 0 and evict a live key to make room.
+    Other storages keep their own ``insert(preserve_existing=True)``.
+
+    No host sync: a missing key's row is set to -1, which the store skips."""
+    if not isinstance(storage, DynamicEmbStorage):
+        storage.insert(keys, table_ids, values, preserve_existing=True)
+        return
+    if keys.numel() == 0:
+        return
+    state = storage._state
+    km = state.key_index_map
+    if keys.dtype != km.key_type:
+        keys = keys.to(km.key_type)
+    score_arg = get_find_score_arg(state, keys.numel(), keys.device, const_lookup=True)
+    if getattr(km, "enable_overflow_", False):
+        _, founds, rows = km.lookup_with_overflow(keys, table_ids, score_arg)
+    else:
+        _, founds, rows = km.lookup(keys, table_ids, score_arg)
+    store_to_flat(state, torch.where(founds, rows, -1), table_ids, values)
 
 
 class DynamicEmbeddingFunction(torch.autograd.Function):
@@ -1412,11 +1475,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             # rows to write and read back in between.
             direct = False
             if use_counter:
-                state = (
-                    cache._state
-                    if prefetch_state.storage_mode == StorageMode.CACHE
-                    else storage._state
-                )
+                state = prefetch_state.slot_owner._state
                 direct = (
                     not is_pooling
                     and prefetch_state.non_admitted_positions is None
@@ -1451,24 +1510,25 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 unique_values = None
                 persisted_unique_indices = None
             else:
-                assert prefetch_state.storage_mode == StorageMode.DEFAULT
+                assert not prefetch_state.storage_layout.caching
                 evict_strat = (
                     EvictStrategy(evict_strategy.value) if evict_strategy else None
                 )
-                unique_values, persisted_unique_indices = _generic_forward_path(
-                    storage,
-                    optimizer,
-                    prefetch_state.unique_keys,
-                    prefetch_state.unique_table_ids,
-                    max_emb_dim,
-                    max_val_dim,
-                    emb_dtype,
-                    initializer,
-                    evict_strat,
-                    prefetch_state.lfu_accumulated_frequency,
-                    admitter,
-                    key_scores=prefetch_state.unique_scores,
-                )
+                with table_section(prefetch_state.table_gate):
+                    unique_values, persisted_unique_indices = _generic_forward_path(
+                        storage,
+                        optimizer,
+                        prefetch_state.unique_keys,
+                        prefetch_state.unique_table_ids,
+                        max_emb_dim,
+                        max_val_dim,
+                        emb_dtype,
+                        initializer,
+                        evict_strat,
+                        prefetch_state.lfu_accumulated_frequency,
+                        admitter,
+                        key_scores=prefetch_state.unique_scores,
+                    )
                 # find() was asked for CopyMode.VALUE, so a row here is
                 # embedding ++ optimizer state; keep only the embedding.
                 unique_embs = unique_values[:, :max_emb_dim]
@@ -1534,14 +1594,12 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             # The backward reads key i's gradient from the row its output took.
             ctx.out_rows = out_rows
             ctx.unique_table_ids = prefetch_state.unique_table_ids
-            ctx.cache = cache
             ctx.storage = storage
-            ctx.slot_indices = prefetch_state.slot_indices
             # Same split as the forward: the fused optimizer writes into the
             # value buffer (rows), the ref counter is indexed by hash slot.
             ctx.update_value_rows = prefetch_state.value_row_indices
-            ctx.key_map_generation = prefetch_state.key_map_generation
-            ctx.storage_mode = prefetch_state.storage_mode
+            ctx.slot_owner = prefetch_state.slot_owner
+            ctx.table_gate = prefetch_state.table_gate
             ctx.optimizer = optimizer
             ctx.layout = layout
             ctx.offsets = offsets
@@ -1567,7 +1625,6 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 raise RuntimeError(
                     "This embedding graph was already consumed; use retain_graph=True for another backward"
                 )
-            cache = ctx.cache
             storage = ctx.storage
             optimizer = ctx.optimizer
             grads = grads.contiguous()
@@ -1608,30 +1665,26 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
 
             with torch.cuda.nvtx.range("DynamicEmbeddingFunction.update"):
                 if ctx.use_counter:
-                    state = (
-                        cache._state
-                        if ctx.storage_mode == StorageMode.CACHE
-                        else storage._state
-                    )
-                    # A later batch's prefetch may have rehashed the table
-                    # since this one's prefetch (prefetch pipelines, several
-                    # forwards before their backwards).
-                    refresh_slots_after_rehash(state, ctx)
-                    with torch.cuda.nvtx.range("op:optimizer_update_fused"):
-                        optimizer.fused_update_for_flat_table(
-                            unique_grads.to(
-                                gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
-                            ),
-                            # Writes into the value buffer -> rows.
-                            ctx.update_value_rows,
-                            state.table_ptrs_dev,
-                            unique_table_ids,
-                            state.table_value_dims,
-                            state.table_emb_dims,
-                            state.max_emb_dim,
-                            state.all_dims_vec4,
-                            state.emb_dtype,
-                        )
+                    state = ctx.slot_owner._state
+                    try:
+                        with torch.cuda.nvtx.range("op:optimizer_update_fused"):
+                            optimizer.fused_update_for_flat_table(
+                                unique_grads.to(
+                                    gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
+                                ),
+                                # Writes into the value buffer -> rows.
+                                ctx.update_value_rows,
+                                state.table_ptrs_dev,
+                                unique_table_ids,
+                                state.table_value_dims,
+                                state.table_emb_dims,
+                                state.max_emb_dim,
+                                state.all_dims_vec4,
+                                state.emb_dtype,
+                            )
+                    except BaseException:
+                        ctx.prefetch_state.pin_lease.record_use()
+                        raise
 
                 if not ctx.use_counter and ctx.unique_values is not None:
                     # Per-table embedding dims (on the CUDA device) let the
@@ -1662,17 +1715,10 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         keys_c = ctx.unique_keys[pui]
                         tids_c = unique_table_ids[pui]
                         vals_c = ctx.unique_values[pui]
-                        # preserve_existing=True → CONST score policy on insert:
-                        # refresh embedding/optimizer buffers only; do not overwrite
-                        # table scores (LFU / timestamp / etc.). For HybridStorage,
-                        # the HBM tier uses this on backward; existing scores stay.
-                        with torch.cuda.nvtx.range("op:storage_insert"):
-                            storage.insert(
-                                keys_c,
-                                tids_c,
-                                vals_c,
-                                preserve_existing=True,
-                            )
+                        with torch.cuda.nvtx.range("op:storage_insert"), table_section(
+                            ctx.table_gate
+                        ):
+                            write_back_generic(storage, keys_c, tids_c, vals_c)
 
             if torch._C._autograd._get_current_graph_task_keep_graph():
                 if ctx.prefetch_state.pin_lease is not None:

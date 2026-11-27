@@ -23,7 +23,7 @@ import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, DynamicEmbTableOptions
 from dynamicemb.planner import DynamicEmbParameterSharding
-from dynamicemb.scored_kjt import get_scores
+from dynamicemb.score.kjt import get_scores
 from dynamicemb.utils import checkpoint_dtype
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import PoolingMode
 from torch import nn

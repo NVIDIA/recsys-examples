@@ -344,7 +344,7 @@ def test_hybrid_storage_export_scores_and_embeddings(
 
     **Per-step loop (per rank)**
         1. ``torch.unique`` + ``bincount`` -> per-key counts for this step.
-        2. ``find(uniq, table_ids=0, CopyMode.VALUE, lfu_accumulated_frequency=counts)``
+        2. ``find(uniq, table_ids=0, CopyMode.VALUE, score_input=counts)``
            for LFU; TIMESTAMP passes ``lfu_arg=None``.
         3. **LFU only**: ``export_keys_values`` and assert every exported key's score equals
            ``old_cum[key] + count_this_step[key]`` for keys present in export (keys not yet
