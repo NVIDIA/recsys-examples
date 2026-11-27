@@ -9,8 +9,8 @@ inserted by the same call). Such a key comes back among the evicted ones with a
 negative slot, and has no row for the forward to read. The insert kernel flags a
 refused key (a variant of the kernel asked to) in pinned host memory, which the
 read of the number of evicted keys the prefetch makes anyway waits for, and the
-prefetch raises before it writes anything back: the refused key's evicted row was
-never loaded, and written back it would have overwritten the key's storage row.
+prefetch raises after recovering accepted rows and real victims, if any. A refused
+key has no value row and must not be written back to storage.
 
 The cache here is one bucket (1024 slots, its buckets always hold 1024) plus an
 overflow area of 3 buckets: one prefetch of more new keys than those 4096 slots
@@ -109,7 +109,7 @@ def test_refused_keys_stop_the_prefetch_and_keep_the_storage():
     assert torch.count_nonzero(counter).item() == 0
 
     # Every key went into the storage (it has room for all of them) with its
-    # initial value, and kept it: the prefetch raised before it wrote back.
+    # initial value, and kept it: the empty cache had no real victims.
     table_ids = torch.zeros_like(keys)
     found = model._storage.find(keys, table_ids, copy_mode=CopyMode.EMBEDDING)
     founds, values = found[5], found[7]
