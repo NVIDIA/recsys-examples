@@ -24,7 +24,7 @@ whichever way the keys were reordered or cut.
 import pytest
 import torch
 from dynamicemb import ScoredKeyedJaggedTensor
-from dynamicemb.scored_kjt import get_scores
+from dynamicemb.score.kjt import get_scores
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 DEVICE = "cuda"

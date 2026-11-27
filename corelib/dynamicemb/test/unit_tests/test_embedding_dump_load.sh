@@ -64,6 +64,57 @@ for num_gpus in ${HASH_RR_NUM_GPUS[@]}; do
   done
 done
 
+# hash_bucket: dumped and reloaded at the same world size, then across world
+# sizes. The rule sends a key to the rank holding its global hash bucket, so a
+# checkpoint written by one fan-out is loaded by another with every rank
+# reading every file and keeping its own share. The tables have ordinary buckets
+# (table_bucket_capacity in test_embedding_dump_load.py), so the layout is the
+# fan-out-invariant one and the second pass reloads it without the
+# re-partition warning. These runs fill the tables far below a bucket, so they
+# check where every key lands; that a bucket filled to 97 % still loses nothing
+# on a fold is test_global_bucket_layout.py's.
+for num_gpus in 1 2; do
+  for mode in "dump" "load"; do
+    echo "hash_bucket: num_gpus: $num_gpus, mode: $mode"
+    torchrun \
+      --nnodes 1 \
+      --nproc_per_node $num_gpus \
+      ./test/unit_tests/test_embedding_dump_load.py \
+      --optimizer-type sgd \
+      --score-strategy step \
+      --dist-type hash_bucket \
+      --mode "${mode}" \
+      --optim False \
+      --counter False \
+      --save-path "debug_weight_hash_bucket_${num_gpus}" \
+      --num-embedding-collections 1 \
+      --num-embeddings 1000000 \
+      --multi-hot-sizes 10 \
+      --embedding-dim 16 || exit 1
+  done
+done
+for pair in "2 1" "1 2"; do
+  set -- $pair
+  dump_gpus=$1
+  load_gpus=$2
+  echo "hash_bucket: dumped by $dump_gpus, loaded by $load_gpus"
+  torchrun \
+    --nnodes 1 \
+    --nproc_per_node $load_gpus \
+    ./test/unit_tests/test_embedding_dump_load.py \
+    --optimizer-type sgd \
+    --score-strategy step \
+    --dist-type hash_bucket \
+    --mode "load" \
+    --optim False \
+    --counter False \
+    --save-path "debug_weight_hash_bucket_${dump_gpus}" \
+    --num-embedding-collections 1 \
+    --num-embeddings 1000000 \
+    --multi-hot-sizes 10 \
+    --embedding-dim 16 || exit 1
+done
+
 # Tables named "<scope>/<name>" dump into, and load from, a subdirectory of
 # the collection directory that nothing creates in advance.
 for mode in "dump" "load"; do

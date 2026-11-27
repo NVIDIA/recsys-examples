@@ -84,10 +84,12 @@ from dynamicemb import (
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dynamicemb_config import (
+    DEFAULT_BUCKET_CAPACITY,
     DIST_TYPE_CODES,
     OUTPUT_DIST_CAPACITY_NAMES,
     get_eviction_score_strategy,
 )
+from dynamicemb.key_ownership import hashed_shard_capacity
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
@@ -456,6 +458,13 @@ CASES = [
         rules=("hash_roundrobin", "hash_roundrobin", "roundrobin"),
     ),
     Case("fp32 pow-law hash_roundrobin", keys="pow-law", dist_type="hash_roundrobin"),
+    # hash_bucket: a key's owner is the shard that holds its global bucket, which the op
+    # computes from the capacities of the key's table (the planner's)
+    Case(
+        "fp32 pow-law, hash_bucket and roundrobin tables",
+        keys="pow-law",
+        rules=("hash_bucket", "hash_bucket", "roundrobin"),
+    ),
     # LFU on one table, admission on the others: the keys carry index dedup's
     # frequency counters, for both
     Case("fp32 pow-law, LFU and admission tables", keys="pow-law", mixed=True),
@@ -668,14 +677,27 @@ def sharded_ec(model: DistributedModelParallel) -> ShardedDynamicEmbeddingCollec
 
 
 def bucketized_owners(
-    keys: torch.Tensor, world_size: int, dist_type: str
+    keys: torch.Tensor,
+    world_size: int,
+    dist_type: str,
+    num_embeddings: int = 0,
 ) -> torch.Tensor:
     """The rank TorchRec's path in DynamicEmb sends each key to: DynamicEmb's
     bucketize run on the keys as given (one sample of one feature), which
     places an int32 key as the int64 key of its value. A key's owner is the
-    bucket its place in the bucketized keys falls in."""
+    bucket its place in the bucketized keys falls in. ``hash_bucket`` routes by
+    the capacities of its table, which the planner derives from its
+    ``num_embeddings`` and the default bucket capacity."""
     if keys.numel() == 0:
         return torch.empty(0, dtype=torch.int64, device=keys.device)
+    global_capacity = shard_capacity = 0
+    if dist_type == "hash_bucket":
+        global_capacity = (
+            -(-num_embeddings // DEFAULT_BUCKET_CAPACITY) * DEFAULT_BUCKET_CAPACITY
+        )
+        shard_capacity = hashed_shard_capacity(
+            global_capacity, DEFAULT_BUCKET_CAPACITY, world_size
+        )
     lengths, _, _, _, places = block_bucketize_sparse_features(
         torch.tensor([keys.numel()], dtype=torch.int64, device=keys.device),
         keys,
@@ -683,6 +705,12 @@ def bucketized_owners(
         sequence=True,
         dist_type_per_feature=torch.tensor(
             [DIST_TYPE_CODES[dist_type]], dtype=torch.int32, device=keys.device
+        ),
+        global_capacity_per_feature=torch.tensor(
+            [global_capacity], dtype=torch.int64, device=keys.device
+        ),
+        shard_capacity_per_feature=torch.tensor(
+            [shard_capacity], dtype=torch.int64, device=keys.device
         ),
         # the cyclic rules read no block size
         block_sizes=torch.ones(1, dtype=keys.dtype, device=keys.device),
@@ -704,7 +732,9 @@ def owner_rule(case: Case) -> Callable:
         for table, feats in enumerate(case.tables)
         for feature in feats
     }
-    return lambda keys, feature: bucketized_owners(keys, world_size, rule_of[feature])
+    return lambda keys, feature: bucketized_owners(
+        keys, world_size, rule_of[feature], case.num_embeddings
+    )
 
 
 def capacities_for(case: Case, calls: Sequence[KeyedJaggedTensor]) -> Dict:

@@ -595,12 +595,17 @@ class HierDist:
         dist_types: Sequence[int],
         weighted: bool,
         index_dedup: bool,
+        global_capacities: Sequence[int] = (),
+        shard_capacities: Sequence[int] = (),
     ) -> bool:
         """Whether this sharding takes the hierarchical dist, the same on
         every rank. The first call reads the node from NCCL (its LSA team on
         the sharding's ranks: :func:`node_size`), then builds the operator,
         collectively, with the bucketize's rule of each feature (DistType
-        codes) and whether the keys carry weights. ``index_dedup`` is the
+        codes), whether the keys carry weights and, for a ``hash_bucket``
+        feature, the rows of its whole table (``global_capacities``) and of one
+        shard of it (``shard_capacities``; per feature, empty when no feature
+        takes that rule). ``index_dedup`` is the
         sharder's ``use_index_dedup``: a call on the operator deduplicates the
         sharding's keys either way (without it, a sharding that takes the
         operator warns so here, once), but tables that clip gradients need it.
@@ -651,6 +656,8 @@ class HierDist:
         arguments = dict(
             self._arguments,
             dist_types=list(dist_types),
+            global_capacities=[int(c) for c in global_capacities],
+            shard_capacities=[int(c) for c in shard_capacities],
             weighted=weighted,
         )
         # The tables clip each row their lookup gets. TorchRec's dists without

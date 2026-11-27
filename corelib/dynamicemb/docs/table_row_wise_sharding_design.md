@@ -196,7 +196,7 @@ independently wherever ownership matters:
 |---|---|---|
 | `_block_bucketize_sparse_features_cuda_kernel1/2` | `idx % my_size`, `murmur(idx) % my_size`, or block | yes |
 | `batched_dynamicemb_tables.owned_key_mask` | same three, in numpy | yes |
-| `key_value_table._iter_batches_from_files` (checkpoint load) | `keys % world_size == rank` | **no** |
+| `checkpoint.files._iter_batches_from_files` (checkpoint load) | `keys % world_size == rank` | **no** |
 | `scored_hashtable.LinearBucketTable.load` (counter load) | `keys % world_size == rank` | **no** |
 | `construct_twin_module.init_twin_embedding_model` | `indices % self._world_size == self._rank` | **no** |
 
@@ -1351,8 +1351,8 @@ component is `per_rank_storage`, which reads each table's own.
 grouping key, so a group where one member asks for caching and another does not
 cannot form -- `any(option.caching ...)` in the runtime is `all` of them, and a
 "mixed caching group" is not a reachable state. And an external store is
-accounted for: it zeroes the host tier in the two layouts that have a backing
-tier to move, CACHING_PS and HOST_PS. `HybridStorage` ignores `external_storage`
+accounted for: it zeroes the host tier in the layouts that have a backing
+tier to move: an external store under a cache, or alone (`StorageTier.EXTERNAL`). `HybridStorage` ignores `external_storage`
 and warns, so its host tier is local and is counted, which is correct.
 
 Both are read only *after* the group is found not to fit, as the runtime reads

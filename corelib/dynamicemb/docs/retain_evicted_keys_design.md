@@ -53,10 +53,10 @@ must hook every "last-tier, truly-drops-the-victim" insert. A code walk found
 **two** such places (the second was missed initially and added after the
 module-level test caught it):
 
-- **(A) the `storage.insert` path** → `key_value_table._insert_key_values`. Used
+- **(A) the `storage.insert` path** → `state.key_index_ops._insert_key_values`. Used
   by: a direct `storage.insert` (`DynamicEmbStorage` / the host tier of
   `HybridStorage`), the caching-mode cache-eviction write-back to backing
-  (`_prefetch_cache_path`), and `_generic_forward_path`.
+  (`_prefetch_inclusive_cache_path`), and `_generic_forward_path`.
 - **(B) the forward HBM-direct path** →
   `batched_dynamicemb_function._prefetch_hbm_direct_path`. Used by **non-caching
   training forward** (single-tier HBM `DynamicEmbStorage`), which calls
@@ -276,7 +276,7 @@ def insert(self, keys, table_ids, score, insert_results=None, score_out=None,
 > collection: `collect_evicted=True` there raises a clear `RuntimeError` (no
 > silent fallback). [Decision 3]
 
-### 5.3 `dynamicemb/key_value_table.py` (core)
+### 5.3 `dynamicemb/key_value_table.py` and `dynamicemb/state/` (core)
 
 **(a) `DynamicEmbTableState` gains retain state** (initialized in
 `create_table_state` from `evicted_item_mode`, only for a last-tier state):
@@ -445,7 +445,10 @@ All retain tests live under `test/unit_tests/retain_evicted_keys/`.
 | `src/table_operation/table.cu` | bind `table_insert_collect_evicted` |
 | `dynamicemb/dynamicemb_config.py` | `evicted_item_mode` option |
 | `dynamicemb/scored_hashtable.py` | `LinearBucketTable.insert(collect_evicted=...)` |
-| `dynamicemb/key_value_table.py` | state retain chunks + `_insert_key_values` collection + `_append_evicted` / `_pop_state_evicted_keys` + storage `pop_evicted_keys` |
+| `dynamicemb/state/table_state.py` | state retain chunks |
+| `dynamicemb/state/key_index_ops.py` | `_insert_key_values` collection |
+| `dynamicemb/state/evicted_items.py` | `_append_evicted` / `_pop_state_evicted_keys` |
+| `dynamicemb/key_value_table.py` | storage `pop_evicted_keys` |
 | `dynamicemb/batched_dynamicemb_function.py` | **retain collection on the forward HBM-direct path (`_prefetch_hbm_direct_path`) — §3(B) gap fix** |
 | `dynamicemb/batched_dynamicemb_tables.py` | thread the config through + module-level `pop_evicted_keys` |
 | `dynamicemb/incremental_dump.py` | model-level `pop_evicted_keys` + variable-length all_gather |

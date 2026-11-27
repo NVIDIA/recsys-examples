@@ -100,10 +100,11 @@ __global__ void __launch_bounds__(kThreads)
 // ── the owner rules ──
 
 // The owner rules the op takes (DistType, src/utils.h), as DynamicEmb's
-// bucketize places a key (src/sparse_block_bucketize_features.cu): in the
-// arithmetic of the key's own type (int32_t or int64_t), as unsigned numbers.
-// Both keep the key. Config::validate and the bucketize's hook refuse every
-// other code.
+// bucketize places a key (src/sparse_block_bucketize_features.cu): roundrobin
+// and hash_roundrobin in the arithmetic of the key's own type (int32_t or
+// int64_t), as unsigned numbers; hash_bucket on the key widened to int64 with
+// its sign. All three keep the key. Config::validate and the bucketize's hook
+// refuse every other code.
 
 // kCyclic ("roundrobin"): key % world_size.
 template <typename Key>
@@ -121,13 +122,33 @@ __device__ __forceinline__ int64_t hashed_cyclic_owner(Key key, int64_t world_si
   return (int64_t)(hash % (Unsigned)world_size);
 }
 
+// kHashedBucket ("hash_bucket"): the shard that holds the key's global bucket,
+// (h % global_capacity) / shard_capacity, h = murmur3_fmix64(key) & INT64_MAX.
+// The key is read as the int64 key a table stores (an int32 key widens with its
+// sign), the same h as the table's (LinearBucket::hash), DynamicEmb's bucketize
+// (hashed_shard) and the host's (key_ownership.owning_shard): the four agree
+// key for key. global_capacity is the capacity of the whole table, a multiple of
+// its bucket capacity, and shard_capacity that of one shard, ceil(buckets /
+// world_size) buckets: both are the feature's, positive, and
+// ceil(global_capacity / shard_capacity) <= world_size (Config::validate), so the
+// owner is a rank.
+template <typename Key>
+__device__ __forceinline__ int64_t hashed_bucket_owner(Key key, int64_t global_capacity,
+                                                       int64_t shard_capacity) {
+  const uint64_t hash = murmur3_fmix64((uint64_t)(int64_t)key) & 0x7FFFFFFFFFFFFFFFull;
+  return (int64_t)(hash % (uint64_t)global_capacity / (uint64_t)shard_capacity);
+}
+
 // A key's owner by its feature's rule, read at run time (a sharding's tables
-// may mix the two). A warp's keys are consecutive, so they are of one feature
+// may mix the rules). A warp's keys are consecutive, so they are of one feature
 // and take one branch, except at the start of a feature.
 template <typename Key>
-__device__ __forceinline__ int64_t owner_of(Key key, int32_t dist_type, int64_t world_size) {
-  return dist_type == (int)DistType::kCyclic ? cyclic_owner(key, world_size)
-                                             : hashed_cyclic_owner(key, world_size);
+__device__ __forceinline__ int64_t owner_of(Key key, int32_t feature, const OwnerRulesView &rules,
+                                            int64_t world_size) {
+  const int32_t dist_type = rules.dist_types[feature];
+  if (dist_type == (int)DistType::kCyclic) return cyclic_owner(key, world_size);
+  if (dist_type == (int)DistType::kHashedCyclic) return hashed_cyclic_owner(key, world_size);
+  return hashed_bucket_owner(key, rules.global_capacities[feature], rules.shard_capacities[feature]);
 }
 
 // ── the counting sort by owner ──
@@ -204,7 +225,7 @@ template <typename Key, typename Offset>
 __device__ __forceinline__ void bucket_items(const Key *values, int64_t first, int64_t end,
                                              const FeatureStarts<Offset> &starts, int64_t origin,
                                              int32_t lo_feature, int32_t hi_feature,
-                                             int64_t num_features, const int32_t *dist_types,
+                                             int64_t num_features, const OwnerRulesView &rules,
                                              int64_t world_size, int lane,
                                              uint32_t (&bucket)[kSortItems],
                                              int32_t (&bucket_feature)[kSortItems]) {
@@ -231,7 +252,7 @@ __device__ __forceinline__ void bucket_items(const Key *values, int64_t first, i
       bucket[item] = kNoBucket;
       bucket_feature[item] = 0;
     } else if (feature[item] < num_features) {
-      const int64_t owner = owner_of(key[item], dist_types[feature[item]], world_size);
+      const int64_t owner = owner_of(key[item], feature[item], rules, world_size);
       bucket[item] = (uint32_t)owner;
       bucket_feature[item] = (int32_t)(owner * num_features + feature[item]);
     } else {
@@ -268,7 +289,7 @@ __device__ __forceinline__ int32_t warp_rank(uint16_t *counts, uint32_t bucket, 
 template <typename Key, typename Offset, typename InputOffset>
 __global__ void __launch_bounds__(kThreads, 2)
     owner_count_kernel(const Key *values, int64_t num_keys, FeatureStarts<Offset> starts,
-                       int64_t num_features, const int32_t *dist_types, int64_t world_size,
+                       int64_t num_features, OwnerRulesView rules, int64_t world_size,
                        int64_t chunk, int64_t ctas, int64_t buckets, int32_t *counts,
                        const InputOffset *input_offsets, int64_t batch,
                        int64_t *input_length_per_key) {
@@ -294,8 +315,8 @@ __global__ void __launch_bounds__(kThreads, 2)
   for (int64_t first = lo + warp * kWarpKeys; first < hi; first += kSubTile) {
     uint32_t bucket[kSortItems];
     int32_t bucket_feature[kSortItems];
-    bucket_items(values, first, hi, starts, origin, lo_feature, hi_feature, num_features,
-                 dist_types, world_size, lane, bucket, bucket_feature);
+    bucket_items(values, first, hi, starts, origin, lo_feature, hi_feature, num_features, rules,
+                 world_size, lane, bucket, bucket_feature);
 #pragma unroll
     for (int item = 0; item < kSortItems; ++item) {
       const unsigned peers = __match_any_sync(0xffffffffu, bucket[item]);
@@ -376,7 +397,7 @@ inline int64_t scatter_smem(int64_t buckets, int64_t owners) {
 template <typename Key, typename Offset>
 __global__ void __launch_bounds__(kThreads, 2)
     owner_scatter_kernel(const Key *values, int64_t num_keys, FeatureStarts<Offset> starts,
-                         int64_t num_features, const int32_t *dist_types, int64_t world_size,
+                         int64_t num_features, OwnerRulesView rules, int64_t world_size,
                          int64_t chunk, int64_t ctas, int64_t buckets, const int32_t *counts,
                          int64_t first_owner, int64_t owners, int32_t *inv,
                          int32_t *bucket_feature_of_row, int64_t *offset_per_bucket_feature,
@@ -474,7 +495,7 @@ __global__ void __launch_bounds__(kThreads, 2)
       uint32_t bucket[kSortItems];
       int32_t bucket_feature[kSortItems];
       bucket_items(values, tile + warp * kWarpKeys, hi, starts, origin, bounds[0], bounds[1],
-                   num_features, dist_types, world_size, lane, bucket, bucket_feature);
+                   num_features, rules, world_size, lane, bucket, bucket_feature);
 #pragma unroll
       for (int item = 0; item < kSortItems; ++item) {
         const int key = warp * kWarpKeys + 32 * item + lane;
@@ -654,13 +675,13 @@ void with_feature_starts(const PlanInput &input, const at::Tensor &value_offsets
 template <typename Key>
 __global__ void __launch_bounds__(kThreads)
     place_keys_kernel(const Key *values, int64_t num_keys, const int64_t *value_offsets,
-                      int64_t num_features, const int32_t *dist_types, int64_t world_size,
+                      int64_t num_features, OwnerRulesView rules, int64_t world_size,
                       int32_t *bucket_feature, int32_t *index) {
   for (int64_t key = first_item(); key < num_keys; key += item_stride()) {
     const int64_t feature = upper_bound(value_offsets, num_features + 1, key) - 1;
     bucket_feature[key] =
         feature < num_features
-            ? (int32_t)(owner_of(values[key], dist_types[feature], world_size) * num_features +
+            ? (int32_t)(owner_of(values[key], (int32_t)feature, rules, world_size) * num_features +
                         feature)
             : (int32_t)(world_size * num_features);
     index[key] = (int32_t)key;
@@ -883,10 +904,10 @@ at::Tensor feature_offsets_of(const PlanInput &input, int64_t num_features,
 // order, and the keys past the valid ones stay last, in order), then a
 // search of the sorted bucket features for where each bucket feature starts.
 // It writes all of offset_per_bucket_feature.
-BucketizedKeys bucketize_rows_sorted(const PlanInput &input, const at::Tensor &dist_types,
+BucketizedKeys bucketize_rows_sorted(const PlanInput &input, const OwnerRules &rules,
                                      int64_t world_size) {
   const at::Tensor &values = input.values;
-  const int64_t num_keys = values.numel(), num_features = dist_types.numel();
+  const int64_t num_keys = values.numel(), num_features = rules.num_features();
   const int64_t bucket_features = world_size * num_features;
   const auto long_options = values.options().dtype(at::kLong);
   const auto int_options = values.options().dtype(at::kInt);
@@ -899,9 +920,8 @@ BucketizedKeys bucketize_rows_sorted(const PlanInput &input, const at::Tensor &d
   if (num_keys > 0) {
     with_index(values, [&](const auto *keys) {
       place_keys_kernel<<<item_grid(num_keys), kThreads, 0, current_stream()>>>(
-          keys, num_keys, value_offsets.data_ptr<int64_t>(), num_features,
-          dist_types.data_ptr<int32_t>(), world_size, bucket_feature.data_ptr<int32_t>(),
-          index.data_ptr<int32_t>());
+          keys, num_keys, value_offsets.data_ptr<int64_t>(), num_features, rules.view(),
+          world_size, bucket_feature.data_ptr<int32_t>(), index.data_ptr<int32_t>());
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
@@ -919,11 +939,11 @@ BucketizedKeys bucketize_rows_sorted(const PlanInput &input, const at::Tensor &d
 // The counting sort on its grid: owner_count_kernel, then
 // owner_scatter_kernel, which owner_scatter_fits found can take its shared
 // memory.
-BucketizedKeys bucketize_rows_counted(const PlanInput &input, const at::Tensor &dist_types,
+BucketizedKeys bucketize_rows_counted(const PlanInput &input, const OwnerRules &rules,
                                       int64_t world_size, int64_t first_owner, int64_t owners,
                                       const CountingGrid &grid) {
   const at::Tensor &values = input.values;
-  const int64_t num_keys = values.numel(), num_features = dist_types.numel();
+  const int64_t num_keys = values.numel(), num_features = rules.num_features();
   const auto long_options = values.options().dtype(at::kLong);
   const auto int_options = values.options().dtype(at::kInt);
   const cudaStream_t stream = current_stream();
@@ -948,16 +968,16 @@ BucketizedKeys bucketize_rows_counted(const PlanInput &input, const at::Tensor &
     using Offset = std::decay_t<decltype(*starts.offsets)>;
     with_index(input.input_offsets, [&](const auto *input_offsets) {
       owner_count_kernel<<<count_ctas, kThreads, 4 * grid.buckets, stream>>>(
-          keys, num_keys, starts, num_features, dist_types.data_ptr<int32_t>(), world_size,
-          grid.chunk, grid.ctas, grid.buckets, counts.data_ptr<int32_t>(), input_offsets,
+          keys, num_keys, starts, num_features, rules.view(), world_size, grid.chunk, grid.ctas,
+          grid.buckets, counts.data_ptr<int32_t>(), input_offsets,
           input.batch_size,
           value_offsets.defined() ? nullptr : bucketized.input_length_per_key.data_ptr<int64_t>());
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     owner_scatter_kernel<Key, Offset>
         <<<grid.ctas, kThreads, scatter_smem(grid.buckets, owners), stream>>>(
-            keys, num_keys, starts, num_features, dist_types.data_ptr<int32_t>(), world_size,
-            grid.chunk, grid.ctas, grid.buckets, counts.data_ptr<int32_t>(), first_owner, owners,
+            keys, num_keys, starts, num_features, rules.view(), world_size, grid.chunk, grid.ctas,
+            grid.buckets, counts.data_ptr<int32_t>(), first_owner, owners,
             bucketized.inv.data_ptr<int32_t>(),
             bucketized.bucket_feature_of_row.data_ptr<int32_t>(),
             bucketized.offset_per_bucket_feature.data_ptr<int64_t>(),
@@ -984,16 +1004,23 @@ bool owner_scatter_fits(const PlanInput &input, const CountingGrid &grid, int64_
 
 }  // namespace
 
-void check_bucketize_input(const PlanInput &input, const at::Tensor &dist_types,
-                           int64_t world_size) {
+void check_bucketize_input(const PlanInput &input, const OwnerRules &rules, int64_t world_size) {
   const at::Tensor &values = input.values;
   const int64_t num_keys = values.numel(), batch = input.batch_size,
-                num_features = dist_types.numel();
+                num_features = rules.num_features();
   TORCH_CHECK(num_features >= 1 && world_size >= 1,
               "hier_output_dist: a rule per feature, and some owners");
-  TORCH_CHECK(on_gpu_of(dist_types, values) && dist_types.scalar_type() == at::kInt,
+  TORCH_CHECK(on_gpu_of(rules.dist_types, values) && rules.dist_types.scalar_type() == at::kInt,
               "hier_output_dist: the rules' dist types (int32) must be contiguous on the GPU of "
               "the keys");
+  TORCH_CHECK(on_gpu_of(rules.global_capacities, values) &&
+                  on_gpu_of(rules.shard_capacities, values) &&
+                  rules.global_capacities.scalar_type() == at::kLong &&
+                  rules.shard_capacities.scalar_type() == at::kLong &&
+                  rules.global_capacities.numel() == num_features &&
+                  rules.shard_capacities.numel() == num_features,
+              "hier_output_dist: the rules' capacities (int64, one of each per feature) must be "
+              "contiguous on the GPU of the keys");
   TORCH_CHECK(
       values.is_cuda() && values.is_contiguous() && is_index_dtype(values) && num_keys < INT32_MAX,
       "hier_output_dist: keys must be contiguous int32 or int64 on the GPU, fewer than 2^31");
@@ -1024,18 +1051,18 @@ void check_fanout_input(const at::Tensor &reverse_indices) {
               "than 2^31");
 }
 
-BucketizedKeys bucketize_rows(const PlanInput &input, const at::Tensor &dist_types,
+BucketizedKeys bucketize_rows(const PlanInput &input, const OwnerRules &rules,
                               int64_t world_size, int64_t first_owner, int64_t owners,
                               c10::optional<bool> sorted_path) {
   TORCH_CHECK(first_owner >= 0 && owners >= 1 && first_owner + owners <= world_size,
               "hier_output_dist: the owners of the bucketize's offsets per bucket feature must be "
               "some of its world_size owners");
   // The keys stay in the KJT either way: the push gathers them (bucketize_keys here).
-  if (sorted_path.value_or(false)) return bucketize_rows_sorted(input, dist_types, world_size);
+  if (sorted_path.value_or(false)) return bucketize_rows_sorted(input, rules, world_size);
   const CountingGrid grid = counting_grid(input.values.numel(), world_size);
   const bool few_owners = grid.buckets <= kMaxCountingBuckets;
   if (few_owners && owner_scatter_fits(input, grid, owners))
-    return bucketize_rows_counted(input, dist_types, world_size, first_owner, owners, grid);
+    return bucketize_rows_counted(input, rules, world_size, first_owner, owners, grid);
   // The counting sort cannot run here: sorted_path false raises with the reason.
   TORCH_CHECK(!sorted_path.has_value() || few_owners,
               "hier_output_dist: the bucketize's counting sort takes at most ",
@@ -1045,14 +1072,14 @@ BucketizedKeys bucketize_rows(const PlanInput &input, const at::Tensor &dist_typ
               world_size, " owners (offsets per bucket feature of ", owners,
               "), and with its static ones that is more than a CTA of this GPU takes (",
               at::cuda::getCurrentDeviceProperties()->sharedMemPerBlockOptin, " bytes)");
-  return bucketize_rows_sorted(input, dist_types, world_size);
+  return bucketize_rows_sorted(input, rules, world_size);
 }
 
-BucketizedKeys bucketize_keys(const PlanInput &input, const at::Tensor &dist_types,
+BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules,
                               int64_t world_size, int64_t first_owner, int64_t owners,
                               c10::optional<bool> sorted_path) {
   BucketizedKeys bucketized =
-      bucketize_rows(input, dist_types, world_size, first_owner, owners, sorted_path);
+      bucketize_rows(input, rules, world_size, first_owner, owners, sorted_path);
   const at::Tensor &values = input.values;
   const int64_t num_keys = values.numel();
   // the keys (and weights) gathered into bucketized order

@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 from dynamicemb import DynamicEmbPoolingMode
 from dynamicemb.dense_lookup import DenseLookup
-from dynamicemb.extendable_tensor import DeviceExtendableBuffer
+from dynamicemb.state.extendable_buffer import DeviceExtendableBuffer
 from dynamicemb.torchrec_lookup import TorchRecLookup
 
 

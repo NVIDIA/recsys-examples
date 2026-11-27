@@ -85,3 +85,25 @@ def test_output_allocator_preserves_values_and_gradient_rows(layout, mapped):
         evaluated if row_map is None else evaluated.index_select(0, row_map.long())
     )
     torch.testing.assert_close(in_order, expected, rtol=0, atol=0)
+
+
+def test_raw_eval_uses_native_lookup_without_the_resolved_adapter():
+    model, _ = make_model(DynamicEmbPoolingMode.NONE, "hbm")
+    keys, offsets = batch(0)
+    model(keys, offsets).sum().backward()
+    model.eval()
+    native = model._native_lookup
+    calls = []
+
+    def lookup(*args, **kwargs):
+        calls.append(True)
+        return native(*args, **kwargs)
+
+    model._native_lookup = lookup
+    with torch.no_grad():
+        raw = model(keys, offsets)
+        assert not calls
+        state = model.resolve_input(keys, offsets)
+        prepared = model(keys, offsets, prefetch_state=state)
+    assert calls == [True]
+    torch.testing.assert_close(raw, prepared)

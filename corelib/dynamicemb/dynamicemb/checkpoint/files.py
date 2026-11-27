@@ -14,16 +14,15 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 import numpy as np
 import torch
 import torch.distributed as dist
-from torch import Tensor
-
-from .key_ownership import owned_key_mask
-from .types import (
+from dynamicemb.key_ownership import OwnershipRule
+from dynamicemb.types import (
     EMBEDDING_TYPE,
     KEY_TYPE,
     OPT_STATE_TYPE,
     SCORE_TYPE,
     torch_dtype_to_np_dtype,
 )
+from torch import Tensor
 
 META_EMBEDDING_DTYPE = "embedding_dtype"
 META_EMBEDDING_DIM = "embedding_dim"
@@ -131,11 +130,19 @@ def get_loading_files(
     rank: int,
     world_size: int,
     sorted_file_names: Optional[Sequence[str]] = None,
+    read_all: bool = False,
 ) -> Tuple[List[str], List[str], List[str], List[str], int, int]:
     """Resolve one table's checkpoint files under *root_path*.
 
     Pass *sorted_file_names*, from list_checkpoint_files, when resolving many
     tables, so the directory is listed once rather than once per table.
+
+    When the checkpoint has as many shard files as the table has shards, each
+    rank gets only its own file -- which is right only if the files were
+    written under the rank's own key -> rank rule. *read_all* turns that
+    shortcut off and hands every rank every file, for a checkpoint whose rule
+    or bucket layout differs from the table's; the loader's ownership filter
+    then re-partitions the keys.
     """
     if not os.path.exists(root_path):
         raise RuntimeError(f"can't find path to load, path:", root_path)
@@ -180,7 +187,7 @@ def get_loading_files(
             f"The number of key files under path {root_path} for table {name} does not match the number of keys files of admission counter({num_key_files}/{num_counter_key_files})."
         )
 
-    if world_size == num_key_files:
+    if world_size == num_key_files and not read_all:
         return (
             [encode_checkpoint_file_path(root_path, name, rank, world_size, "keys")],
             [encode_checkpoint_file_path(root_path, name, rank, world_size, "values")],
@@ -342,6 +349,8 @@ def _iter_batches_from_files(
     opt_state_dtype: torch.dtype = OPT_STATE_TYPE,
     shard_index: Optional[int] = None,
     num_shards: Optional[int] = None,
+    global_capacity: Optional[int] = None,
+    bucket_capacity: Optional[int] = None,
 ) -> Iterator[Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]]:
     """Yield (keys, embeddings, scores, opt_states) batches from checkpoint files.
 
@@ -371,7 +380,10 @@ def _iter_batches_from_files(
     key in it already belongs to that rank, and the filter is a no-op -- but
     only if the rule is the right one. When the counts differ the files are
     re-split across ranks and the filter is what does the resharding.
-    Pass *score_file_path* / *opt_file_path* as ``None`` to skip those files.
+    *global_capacity* / *bucket_capacity* are the parameters of the
+    ``hash_bucket`` rule (``_LoadParams`` carries them from the table's
+    options). Pass *score_file_path* / *opt_file_path* as ``None`` to skip
+    those files.
     """
     fkey = open(emb_key_path, "rb")
     fembedding = open(embedding_file_path, "rb")
@@ -386,6 +398,7 @@ def _iter_batches_from_files(
     if num_shards is None or shard_index is None:
         num_shards = dist.get_world_size() if dist.is_initialized() else 1
         shard_index = dist.get_rank() if dist.is_initialized() else 0
+    rule = OwnershipRule(dist_type, num_shards, global_capacity, bucket_capacity)
 
     try:
         for start in range(0, num_keys, batch_size):
@@ -421,7 +434,7 @@ def _iter_batches_from_files(
                     opt_bytes, opt_state_dtype, device
                 ).view(-1, optstate_dim)
 
-            masks = owned_key_mask(keys, shard_index, num_shards, dist_type)
+            masks = rule.mask(keys, shard_index)
             if masks is not None:
                 keys = keys[masks]
                 embeddings = embeddings[masks]
@@ -438,3 +451,34 @@ def _iter_batches_from_files(
             fscore.close()
         if fopt:
             fopt.close()
+
+
+def save_to_json(data: Dict[str, Any], file_path: str) -> None:
+    try:
+        with open(file_path, "w") as json_file:
+            json.dump(data, json_file, indent=4)
+    except Exception as e:
+        raise RuntimeError(f"Error saving data to JSON file: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint value layout
+#
+# Key / embedding / score / optimizer-state files are bare row-major blobs with
+# no header, so the table's meta JSON is the only record of how to read them
+# back. Embeddings and optimizer states are dumped at the table's own precision
+# (``DynamicEmbTableState.emb_dtype``) rather than being upcast to fp32, which
+# makes ``embedding_dtype`` and ``embedding_dim`` load-bearing rather than
+# decorative. Checkpoints written before those keys existed are always fp32, and
+# their dim is recoverable from the file size -- see
+# :func:`resolve_checkpoint_value_layout`.
+# ---------------------------------------------------------------------------
+
+
+def _raw_bytes(tensor: torch.Tensor) -> bytes:
+    """Little-endian raw bytes of *tensor*, for any dtype it can hold.
+
+    Views as uint8 instead of going through ``numpy().tobytes()`` because numpy
+    has no bfloat16, and value files now carry the table's own precision.
+    """
+    return tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()

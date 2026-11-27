@@ -37,7 +37,7 @@ from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel
-from ..scored_kjt import without_scores
+from ..score.kjt import without_scores
 from .per_key_score import collect_per_key_score, require_scores
 from .rw_sharding import RwPooledDynamicEmbeddingSharding
 from .twrw_sharding import TwRwPooledDynamicEmbeddingSharding

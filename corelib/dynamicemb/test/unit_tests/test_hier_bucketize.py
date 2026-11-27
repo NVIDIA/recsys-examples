@@ -118,6 +118,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
+from dynamicemb.key_ownership import hashed_shard_capacity
 from dynamicemb_extensions import (
     block_bucketize_sparse_features,
     hier_output_dist_bucketize,
@@ -135,6 +136,24 @@ ROUNDROBIN, HASH_ROUNDROBIN = (
 )
 # the op refuses it (run_rule_refusals)
 CONTINUOUS = DIST_TYPE_CODES["continuous"]
+HASH_BUCKET = DIST_TYPE_CODES["hash_bucket"]
+# hash_bucket's table: every such table has TABLE_ROWS rows, of buckets of BUCKET_CAPACITY, so the
+# capacity of the whole table is GLOBAL_CAPACITY and that of one of its world_size shards follows
+# (hashed_shard_capacity: ceil(buckets / world_size) buckets, what the planner sizes a shard to)
+BUCKET_CAPACITY = 128
+TABLE_ROWS = 1_000_000
+GLOBAL_CAPACITY = -(-TABLE_ROWS // BUCKET_CAPACITY) * BUCKET_CAPACITY
+
+
+def capacities_of(dist_types, world_size: int) -> Tuple[List[int], List[int]]:
+    """hash_bucket's two parameters of each feature, the rows of its whole table and of one
+    of its shards over ``world_size`` ranks (0 for a feature of another rule)."""
+    shard = hashed_shard_capacity(GLOBAL_CAPACITY, BUCKET_CAPACITY, world_size)
+    return (
+        [GLOBAL_CAPACITY if code == HASH_BUCKET else 0 for code in dist_types],
+        [shard if code == HASH_BUCKET else 0 for code in dist_types],
+    )
+
 HEAVY = 64  # kHeavy: a row of more original rows is heavy
 
 
@@ -188,6 +207,14 @@ class Case:
 CASES = [
     Case("roundrobin", rules=(ROUNDROBIN, ROUNDROBIN, ROUNDROBIN)),
     Case("hash_roundrobin", rules=(HASH_ROUNDROBIN, HASH_ROUNDROBIN, HASH_ROUNDROBIN)),
+    Case("hash_bucket", rules=(HASH_BUCKET, HASH_BUCKET, HASH_BUCKET)),
+    Case("all three rules", rules=(ROUNDROBIN, HASH_ROUNDROBIN, HASH_BUCKET)),
+    Case(
+        "hash_bucket, negative int32 keys",
+        rules=(HASH_BUCKET, HASH_BUCKET, HASH_BUCKET),
+        key_range=(-(1 << 31), 1 << 31),
+        values=torch.int32,
+    ),
     Case(
         "roundrobin and hash_roundrobin",
         rules=(ROUNDROBIN, HASH_ROUNDROBIN, HASH_ROUNDROBIN),
@@ -343,12 +370,19 @@ def reference(
     per feature in the keys' dtype, are ones: the cyclic rules do not read
     them."""
     num_features, batch_size, valid = len(case.tables), case.batch_size, batch.valid
+    global_capacities, shard_capacities = capacities_of(dist_types, world_size)
     new_lengths, new_values, new_weights, _, perm = block_bucketize_sparse_features(
         batch.lengths,
         batch.values,
         bucketize_pos=False,
         sequence=True,
         dist_type_per_feature=torch.tensor(dist_types, dtype=torch.int32).cuda(),
+        global_capacity_per_feature=torch.tensor(
+            global_capacities, dtype=torch.int64
+        ).cuda(),
+        shard_capacity_per_feature=torch.tensor(
+            shard_capacities, dtype=torch.int64
+        ).cuda(),
         block_sizes=torch.ones(num_features, dtype=batch.values.dtype).cuda(),
         my_size=world_size,
         weights=batch.weights,
@@ -422,6 +456,11 @@ def bucketize(
         given.update(zip(("num_nodes", "local_size", "node"), node))
     if sorted_path is not None:
         given["sorted_path"] = sorted_path
+    if HASH_BUCKET in dist_types:
+        global_capacities, shard_capacities = capacities_of(dist_types, world_size)
+        given.update(
+            global_capacities=global_capacities, shard_capacities=shard_capacities
+        )
     return planner(
         hier_output_dist_bucketize,
         # The sharding gives the op int32 keys as int64 (hier_forward). The
@@ -592,10 +631,24 @@ def run_nodes(
 def run_rule_refusals() -> Dict[str, bool]:
     """The op's configuration check (``hier_output_dist_invalid``, which
     builds nothing and waits for nothing) refuses every dist_type but
-    roundrobin and hash_roundrobin, and a table whose features have
-    different rules; the bucketize's hook raises for those codes."""
+    roundrobin, hash_roundrobin and hash_bucket, a hash_bucket feature
+    without positive capacities that name only the sharding's ranks, and a
+    table whose features have different rules or capacities; the
+    bucketize's hook raises for those codes."""
 
-    def why(feature_tables: List[int], codes: List[int]) -> str:
+    def why(
+        feature_tables: List[int],
+        codes: List[int],
+        global_capacities: Optional[List[int]] = None,
+        shard_capacities: Optional[List[int]] = None,
+    ) -> str:
+        capacities = (
+            {}
+            if global_capacities is None
+            else dict(
+                global_capacities=global_capacities, shard_capacities=shard_capacities
+            )
+        )
         return planner(
             hier_output_dist_invalid,
             rank=0,
@@ -614,7 +667,13 @@ def run_rule_refusals() -> Dict[str, bool]:
             out_ctas=0,
             reduce_ctas=8,
             payload_kb=512,
+            **capacities,
         )
+
+    # the capacities the planner gives a hash_bucket table of a sharding of 8 ranks (the
+    # check's), and one made for 32 ranks, which names more ranks than there are
+    g, s8 = GLOBAL_CAPACITY, hashed_shard_capacity(GLOBAL_CAPACITY, BUCKET_CAPACITY, 8)
+    s32 = hashed_shard_capacity(GLOBAL_CAPACITY, BUCKET_CAPACITY, 32)
 
     def bucketize_error(rules: Tuple[int, ...]) -> str:
         case = Case("a refused rule", rules=rules)
@@ -633,6 +692,31 @@ def run_rule_refusals() -> Dict[str, bool]:
         "two rules in a table": "share a table"
         in why([0, 0, 1], [ROUNDROBIN, HASH_ROUNDROBIN, ROUNDROBIN]),
         "a rule per feature": "per feature" in why([0, 0, 1], [ROUNDROBIN, ROUNDROBIN]),
+        "hash_bucket": why(
+            [0, 0, 1], [ROUNDROBIN, ROUNDROBIN, HASH_BUCKET], [0, 0, g], [0, 0, s8]
+        )
+        == "",
+        # a plan made for fewer ranks than the sharding has is not the op's to refuse: the
+        # distributor does (routing_param_lists)
+        "hash_bucket with a plan of one rank": why(
+            [0, 1, 2], [HASH_BUCKET] * 3, [g] * 3, [g] * 3
+        )
+        == "",
+        "hash_bucket without capacities": "positive global and shard capacity"
+        in why([0, 0, 1], [ROUNDROBIN, ROUNDROBIN, HASH_BUCKET]),
+        "hash_bucket with a zero capacity": "positive global and shard capacity"
+        in why([0, 0, 1], [ROUNDROBIN, ROUNDROBIN, HASH_BUCKET], [0, 0, g], [0, 0, 0]),
+        "hash_bucket over more ranks than there are": "ranks, but the sharding has 8"
+        in why([0, 0, 1], [ROUNDROBIN, ROUNDROBIN, HASH_BUCKET], [0, 0, g], [0, 0, s32]),
+        "two capacities in a table": "hash_bucket capacities"
+        in why(
+            [0, 0, 1],
+            [HASH_BUCKET, HASH_BUCKET, ROUNDROBIN],
+            [g, g, 0],
+            [s8, s8 + BUCKET_CAPACITY, 0],
+        ),
+        "a capacity per feature": "per feature"
+        in why([0, 0, 1], [HASH_BUCKET] * 3, [g, g], [s8, s8, s8]),
         "bucketize": f"got {CONTINUOUS}"
         in bucketize_error((ROUNDROBIN, HASH_ROUNDROBIN, CONTINUOUS))
         and bucketize_error((ROUNDROBIN, HASH_ROUNDROBIN, ROUNDROBIN)) == "",

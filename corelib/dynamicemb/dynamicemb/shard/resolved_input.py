@@ -15,7 +15,7 @@ import torch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..batched_dynamicemb_function import PrefetchState
-from ..scored_kjt import _shallow_copy_as
+from ..score.kjt import _shallow_copy_as
 
 
 class ResolvedEmbeddingInput(KeyedJaggedTensor):
@@ -105,7 +105,7 @@ class ResolvedEmbeddingInput(KeyedJaggedTensor):
             _jt_dict=None,
         )
         if state is not None and state.unique_scores is not None:
-            from ..scored_kjt import ScoredKeyedJaggedTensor
+            from ..score.kjt import ScoredKeyedJaggedTensor
 
             features = ScoredKeyedJaggedTensor.from_kjt(
                 features, state.unique_scores[state.reverse_indices]

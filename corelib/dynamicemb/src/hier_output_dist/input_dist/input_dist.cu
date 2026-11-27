@@ -83,7 +83,14 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
   const auto options = at::TensorOptions().device(at::kCUDA, device);
   // the bucketize's rules, and the fan-out's words, on one node too (before its return below):
   // copies the host waits for, so a call on any stream finds them
-  dist_types_ = at::tensor(config.dist_types, at::kInt).to(options);
+  rules_.dist_types = at::tensor(config.dist_types, at::kInt).to(options);
+  // hash_bucket's capacities; zeros, which no other rule reads, where the config has none
+  std::vector<int64_t> global_capacities = config.global_capacities,
+                       shard_capacities = config.shard_capacities;
+  global_capacities.resize(config.num_features(), 0);
+  shard_capacities.resize(config.num_features(), 0);
+  rules_.global_capacities = at::tensor(global_capacities, at::kLong).to(options);
+  rules_.shard_capacities = at::tensor(shard_capacities, at::kLong).to(options);
   fanout_words_ = at::zeros({kFanoutWords}, at::kLong).to(options);
   auto view = [&](void *buffer, at::IntArrayRef shape, at::ScalarType dtype) {
     return at::from_blob(buffer, shape, options.dtype(dtype));
@@ -131,13 +138,13 @@ InDist InChannel::input_dist(const PlanInput &input) {
               "weights (",
               weighted_ ? "with" : "without", ")");
   const Topo &topo = sizes_.topo;
-  check_bucketize_input(input, dist_types_, topo.world_size);
+  check_bucketize_input(input, rules_, topo.world_size);
   check_fanout_input(input.reverse_indices);
   // The bucketize up to its gather (the push gathers), and the fan-out of its rows. Its offsets
   // per bucket feature are those node_exchange reads: each owner's first one, and every one of
   // this node's owners.
   const BucketizedKeys bucketized = bucketize_rows(
-      input, dist_types_, topo.world_size, (int64_t)topo.node * topo.local_size, topo.local_size);
+      input, rules_, topo.world_size, (int64_t)topo.node * topo.local_size, topo.local_size);
   const FanoutTables fanout = fanout_tables(input.reverse_indices, bucketized.inv, fanout_words_);
   const int64_t local_size = topo.local_size, num_nodes = topo.num_nodes,
                 num_features = sizes_.num_features;

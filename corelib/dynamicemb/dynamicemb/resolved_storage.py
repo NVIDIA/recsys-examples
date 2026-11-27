@@ -20,14 +20,16 @@ if TYPE_CHECKING:
     from .batched_dynamicemb_function import PrefetchState
 
 
-def matching_rows(source_keys, source_tids, target_keys, target_tids, table_num):
+def matching_rows(
+    source_keys, source_tids, target_keys, target_tids, table_num, *, only_tables=None
+):
     """Positions of matching (table, key) pairs, without narrowing 64-bit keys."""
     source, target = [], []
     source_keys = source_keys.to(torch.int64)
     target_keys = target_keys.to(torch.int64)
     # Signed sorting is also a bijection for uint64 keys; both sides use the
     # same ordering, including keys whose high bit is set.
-    for tid in range(table_num):
+    for tid in range(table_num) if only_tables is None else only_tables:
         si = (source_tids == tid).nonzero().flatten()
         ti = (target_tids == tid).nonzero().flatten()
         if si.numel() == 0 or ti.numel() == 0:
@@ -109,6 +111,7 @@ class ActiveStorageRows:
         # The distributed input and autograd context own a batch. The registry
         # must not keep it alive when its graph is discarded without backward.
         self._states: WeakValueDictionary[int, "PrefetchState"] = WeakValueDictionary()
+        self._erase_epochs: dict[int, int] = {}
 
     @property
     def states(self):
@@ -120,7 +123,27 @@ class ActiveStorageRows:
         return _StorageWithActiveRows(storage, self)
 
     def add(self, batch):
+        batch.storage_restore_epochs = tuple(
+            self._erase_epochs.get(tid, 0) for tid in range(batch.table_num)
+        )
         self._states[id(batch)] = batch
+
+    def begin_erase_chunk(self, table_ids):
+        # Erase-by-score records a count, not a key list. Do not use older
+        # snapshots to restore misses in the tables that could have been erased.
+        # Hits still use the backing store, and ordinary eviction in other
+        # tables retains the existing snapshot recovery.
+        for tid in table_ids:
+            self._erase_epochs[tid] = self._erase_epochs.get(tid, 0) + 1
+
+    def restorable_tables(self, batch):
+        if not self._erase_epochs:
+            return None
+        return [
+            tid
+            for tid, epoch in enumerate(batch.storage_restore_epochs)
+            if epoch == self._erase_epochs.get(tid, 0)
+        ]
 
     def release(self, batch):
         self._states.pop(id(batch), None)
@@ -145,8 +168,8 @@ class _StorageWithActiveRows:
     def __getattr__(self, name):
         return getattr(self._storage, name)
 
-    def find(self, keys, table_ids, **kwargs):
-        result = self._storage.find(keys, table_ids, **kwargs)
+    def find(self, keys, table_ids, copy_mode, score_input=None):
+        result = self._storage.find(keys, table_ids, copy_mode, score_input)
         # Updates are written through under TableAccessGate before publication.
         # A backing-store hit is therefore current; only evicted/missing keys
         # need restoration from an outstanding snapshot.
@@ -176,6 +199,7 @@ class _StorageWithActiveRows:
                 keys,
                 table_ids,
                 batch.table_num,
+                only_tables=self._active.restorable_tables(batch),
             )
             values[ti] = batch.unique_values[persisted[si]]
             live[ti] = True

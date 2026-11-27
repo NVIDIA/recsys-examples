@@ -233,3 +233,51 @@ def test_prepared_batches_preserve_complete_optimizer_rows(
     else:
         torch.testing.assert_close(actual_rows, reference_rows, rtol=1e-5, atol=1e-6)
     assert not actual._active_rows.states
+
+
+def test_pre_erase_host_snapshot_cannot_restore_deleted_rows():
+    from dynamicemb import (
+        DynamicEmbInitializerArgs,
+        DynamicEmbInitializerMode,
+        DynamicEmbScoreStrategy,
+        DynamicEmbTableOptions,
+    )
+    from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_names=["host"],
+        table_options=[
+            DynamicEmbTableOptions(
+                dim=8,
+                max_capacity=4096,
+                index_type=torch.int64,
+                embedding_dtype=torch.float32,
+                device_id=device.index,
+                score_strategy=DynamicEmbScoreStrategy.LFU,
+                local_hbm_for_values=0,
+                initializer_args=DynamicEmbInitializerArgs(
+                    mode=DynamicEmbInitializerMode.CONSTANT, value=2.0
+                ),
+            )
+        ],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=EmbOptimType.SGD,
+        learning_rate=0.25,
+    )
+    keys = torch.arange(32, device=device)
+    offsets = torch.tensor([0, keys.numel()], device=device)
+    model(keys, offsets).sum().backward()
+    old = model.resolve_input(keys, offsets)
+    torch.testing.assert_close(
+        old.unique_values, torch.full_like(old.unique_values, 1.75)
+    )
+    handle = model.erase_by_score_async(DynamicEmbScoreStrategy.LFU, 1 << 20)
+    assert handle.result() == (keys.numel(), 0)
+    assert not old.released
+    with torch.no_grad():
+        fresh = model.resolve_input(keys, offsets)
+        actual = model(keys, offsets, prefetch_state=fresh)
+    torch.testing.assert_close(actual, torch.full_like(actual, 2.0))
+    old.release()

@@ -522,9 +522,9 @@ def erase_by_score_async(
     Notes
     -----
     Everything is checked before anything starts: an error leaves nothing erased.
-    Supported are HBM-only storage and a cache over host storage (only the storage behind
-    the cache is erased; the cache is not read or changed). ``HybridStorage``,
-    host-only storage and external storage (PS) are refused when a table qualifies.
+    Supported are HBM-only storage, host-only storage and a cache over host storage (only
+    the storage behind the cache is erased; the cache is not read or changed).
+    ``HybridStorage`` and external storage (PS) are refused when a table qualifies.
 
     The erase can overlap training (forward, backward, prefetch) and nothing else: wait
     for the handle before :func:`DynamicEmbDump`, :func:`DynamicEmbLoad`, an incremental

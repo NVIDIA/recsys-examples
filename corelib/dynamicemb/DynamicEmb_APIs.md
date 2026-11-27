@@ -68,12 +68,17 @@ bucketize by the same rule -- the supported `dist_type` values are:
 - `continuous`
 - `roundrobin`
 - `hash_roundrobin`
+- `hash_bucket`
 
 `hash_roundrobin` hashes the raw key before rank assignment and is intended to reduce sensitivity to pathological raw-key patterns that can break plain modulo-based `roundrobin`. It is an opt-in routing mode; the default remains `roundrobin` for compatibility with existing checkpoints. It should be understood as a routing robustness improvement, not as a general solution to arbitrary hot-key or Zipf-skew load balancing.
 
 `roundrobin` sends a key to rank `key % world_size`, and `hash_roundrobin` to rank `murmur3_fmix64(key) % world_size`, where `world_size` is the number of ranks the table is split over. Both read the key as an unsigned 64-bit number. An int32 key is widened to int64 with its sign first, so it goes to the rank of the int64 key with the same value. That is the key the table stores and a checkpoint holds, and checkpoint load and `replay_increment` place each key by it.
 
-The hierarchical dist (`output_dist="hierarchical"`, see [Hierarchical sequence dist](#hierarchical-sequence-dist)) takes `roundrobin` and `hash_roundrobin` only.
+`hash_bucket` goes one step further and fixes the table's bucket layout independently of the number of ranks. The key's **global bucket** is `(murmur3(key) & INT64_MAX) % global_capacity // bucket_capacity`, where `global_capacity = ceil(num_embeddings / bucket_capacity) * bucket_capacity` is the capacity of the whole table (the planner writes it to `DynamicEmbTableOptions.global_capacity`), and the key goes to the rank holding that bucket: rank `r` holds buckets `[r * P, (r + 1) * P)` with `P = ceil(global_buckets / fanout)`. The keys that share a bucket therefore do not depend on the fan-out, and a checkpoint written at one world size is reloaded at another **without a bucket overflowing**: no row is lost on an 8 → 1 (or 1 → 8) restore of an in-memory table, which the per-rank layouts of `roundrobin` and `hash_roundrobin` cannot promise. This holds for HBM-only and host-only `DynamicEmbStorage` and for the storage tier of a caching table. A `NO_EVICTION` table is **refused** (`ValueError`): it never evicts, so the layout buys it nothing, and the rank of a key would follow from `num_embeddings`, which it only starts from. Two kinds of table are **accepted but get no such guarantee**: a HYBRID table (its two tiers are rescaled parts of the shard, so each keeps its own per-tier hashing and a reload loses rows where a bucket overflows, as under `roundrobin`), and a `MAX_BUCKET_CAPACITY` table (one bucket per shard, so its global capacity is the shards laid end to end and changes with the fan-out; the planner warns). The key of such a table is still routed to its rank by the global rule, so routing, dumping and loading at the same fan-out agree with every other `hash_bucket` table. **A `hash_bucket` table grows like any other** (`init_capacity` below `max_capacity`, `max_load_factor`): the bucket map it hashes into is fixed by `num_embeddings` (the global bucket count is `ceil(num_embeddings / bucket_capacity)`), not by how many buckets the table has allocated, so growing only splits its buckets and every key stays on its rank. The lossless reload at another world size is the one of the full-size layout. A load sizes a table that has not grown to `max_capacity` by the number of keys it keeps, not by how many land in each bucket, so it does not guarantee that a checkpoint built key by key into a few global buckets fits (hashed keys do, with overwhelming probability); start the table at `max_capacity`, or use `roundrobin` or `hash_roundrobin`, where that matters. What does change every key's global bucket is `num_embeddings` or `bucket_capacity`, so a table of another logical size is a different layout: a checkpoint is loaded into it by the migration described below, with every rank reading every shard file and rows lost where a bucket overflows. A checkpoint written under another `dist_type` (`roundrobin` or `hash_roundrobin`; `continuous` stores shard-local ids and is still refused) or another `hash_bucket` layout is read whole by every rank and re-partitioned, with one warning per table -- a one-time migration that may lose rows where buckets overflow. See `docs/global_bucket_layout_design.md`.
+
+**Loading a checkpoint written under another `dist_type`.** A checkpoint records the `dist_type` it was dumped with. Between `roundrobin`, `hash_roundrobin` and `hash_bucket`, in any direction, a load is allowed even when the two differ: these rules all store the global key, so every rank reads every shard file and keeps the keys the table's own rule gives it, and shard 0 warns once per table. The keys then land in buckets the source never grouped them by, so a full bucket evicts: the migration may lose rows, once, where a bucket overflows. This includes `roundrobin` <-> `hash_roundrobin`, which earlier releases refused with a `ValueError`; a mistaken `dist_type` is now only a warning, and the load reads every shard file, which is slower for a large table. `continuous` is the exception: it stores shard-local ids that no other rule can re-partition, so a load across `continuous` raises `ValueError` in either direction. Load it into a table of the same `dist_type`. Dump a table at another shard count into a **new directory**: the files are named by the shard count (`..._world_size_<S>`), so a dump into a directory that still holds the files of an earlier one at another count leaves both sets, and the load refuses the table as corrupted.
+
+The hierarchical dist (`output_dist="hierarchical"`, see [Hierarchical sequence dist](#hierarchical-sequence-dist)) takes `roundrobin`, `hash_roundrobin` and `hash_bucket`; it refuses `continuous` (a `ValueError` under `"hierarchical"`, TorchRec's dists with a warning under `"auto"`). A `hash_bucket` table gives it its owner from the same global bucket: the op reads each feature's whole-table and shard capacities from the table's options, as the input distributor does.
 
     ```python
     #How to import
@@ -166,7 +171,7 @@ At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the 
 | Step | Field(s) | What happens |
 |------|-----------|----------------|
 | 1 | `initializer_args` | **`complete_initializer_args`** returns a new `DynamicEmbInitializerArgs` when needed. For **`UNIFORM`** initialization only: if `lower` or `upper` is `None`, they are filled. With a TorchREC `embedding_config`, bounds are `±sqrt(1 / num_embeddings)`; without it, `0.0` and `1.0`. Other modes are returned unchanged. |
-| 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (after `MAX_BUCKET_CAPACITY` / alignment rules). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (multiple of **`BUCKET_ALIGNMENT` (16)** unless **`MAX_BUCKET_CAPACITY`** = `2**63 - 1`). **Sentinel:** layout is `(1, aligned_per_rank_rows)` — one bucket spanning the shard. **Otherwise:** `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
+| 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (after `MAX_BUCKET_CAPACITY` / alignment rules). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (multiple of **`BUCKET_ALIGNMENT` (16)** unless **`MAX_BUCKET_CAPACITY`** = `2**63 - 1`). **Sentinel:** layout is `(1, aligned_per_rank_rows)` — one bucket spanning the shard. **Otherwise:** `num_buckets = ceil(ceil(N / bucket_capacity) / world)` -- the whole table's bucket count (`_global_table_bucket_layout`) split over the ranks, equal to the former `align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. **`global_capacity`:** for `dist_type="hash_bucket"` set to `ceil(N / bucket_capacity) * bucket_capacity` (**`get_global_table_capacity(embedding_config, bucket_capacity)`**; `fanout * max_capacity` under the `MAX_BUCKET_CAPACITY` sentinel); `None` for every other `dist_type`. **Startup memory is the same for every `dist_type`:** the table is allocated at `init_capacity` as resolved above (`max_capacity` when unset), and `max_capacity` is its upper limit. A `hash_bucket` table does not need to start at `max_capacity`: `global_capacity` is not changed by `init_capacity`, and the table folds that bucket map into the buckets it has and grows (`max_load_factor`) up to `max_capacity`, going straight to `max_capacity` once its next size would pass half of it (see `docs/global_bucket_layout_design.md`). |
 | 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / fanout)`** so each rank holding the table gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). **It is the table's own budget, even when the runtime fuses it with others:** the fused group takes one layout decision on the sums of its sizes and budgets -- if every row fits the summed budget the whole group is HBM-only -- but when it does not fit, each table keeps `min(its size, its own budget)` in HBM and the rest of its rows go to the host tier; a spare budget is not lent to groupmates. The planner reserves memory the same way. A budget that resolves to zero also turns `caching` off for the table, with a warning, before grouping and cost see it. |
 
 **The divisor (`fanout`) is per table.** It is how many pieces the table's rows are split into: `world_size` for a `ROW_WISE` table, which sits on every rank, and `local_world_size` for a `TABLE_ROW_WISE` one, which sits on a single node. The same number decides the shard metadata, so capacity and placement cannot disagree. Steps 2 and 3 both use it.
@@ -215,6 +220,7 @@ A `TableKey` is the pair `(collection, name)` -- the collection being the path t
 
 - `from dynamicemb.dynamicemb_config import complete_initializer_args` (initializer completion; not re-exported from `dynamicemb` top-level today)
 - `from dynamicemb import get_sharded_table_capacity` — returns **per-rank row capacity** after sharding and bucket alignment (``num_buckets * effective_bucket_width``), matching **`max_capacity`** set by the planner. With **`MAX_BUCKET_CAPACITY`**, the table is one bucket per rank whose width is the aligned shard row count.
+- `from dynamicemb import get_global_table_capacity` — returns the **whole table's** row capacity as one hash space, `ceil(num_embeddings / bucket_capacity) * bucket_capacity`, matching **`global_capacity`** the planner sets on a `hash_bucket` table (independent of the world size); `None` for **`MAX_BUCKET_CAPACITY`**.
 - `from dynamicemb import get_table_value_bytes` — total bytes for **all ranks**’ value storage (embedding + optimizer state rows), using the same row layout as `get_sharded_table_capacity` for the given `bucket_capacity` (including **`MAX_BUCKET_CAPACITY`**). Use this to size **`global_hbm_for_values`** before planning; apply your own **caching** fraction or **HBM budget scale** on top if needed (as in benchmarks / examples).
 - `from dynamicemb import BUCKET_ALIGNMENT, MAX_BUCKET_CAPACITY`
 
@@ -896,6 +902,19 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
                 set **`caching=False`** will create a hybrid table which use GPU and host memory in a concatenated way to store value.
                 All keys and other meta data are always stored on GPU for both cases.
             A table whose resolved `local_hbm_for_values` is zero has caching turned off, with a warning, at plan/construction time: a cache is an HBM tier, and without a budget it would be a single bucket whose overflow cannot absorb a batch's admitted keys.
+        global_capacity : Optional[int], optional
+            Set by the planner for ``dist_type="hash_bucket"`` tables only: the row
+            capacity of the whole table across every rank,
+            ``ceil(num_embeddings / bucket_capacity) * bucket_capacity``. A key's home
+            bucket is ``(murmur3(key) & INT64_MAX) % global_capacity // bucket_capacity``
+            and the input distributor sends the key to the rank holding that bucket, so
+            the bucket layout does not depend on the world size and a checkpoint reloads
+            at another world size without a bucket overflowing. ``None`` (the default,
+            and what the planner writes for other ``dist_type`` values) keeps the table
+            hashing within its per-rank capacity. Such a table may start below
+            ``max_capacity`` and grow: the map does not change with its size, so growing
+            only splits buckets and every key stays on its rank. See
+            ``docs/global_bucket_layout_design.md``.
         init_capacity : Optional[int], optional
             The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
             ``BatchedDynamicEmbeddingTablesV2`` also sets ``init_capacity`` to ``max_capacity`` when it is still ``None``.
@@ -903,6 +922,8 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             With ``DynamicEmbeddingShardingPlanner``, it is rounded up to a multiple of the effective
             ``bucket_capacity`` in ``_prepare_dynemb_table_options``, then capped at ``max_capacity`` if the aligned value is larger.
             As the `load_factor` of the table increases, its capacity will gradually double (rehash) until it reaches `max_capacity`.
+            A ``dist_type="hash_bucket"`` table grows the same way; its keys stay on their rank, since the bucket map
+            it hashes into (``global_capacity``) does not change with its size.
             Rehash will be done implicitly.
             Note: This is the setting for a single table at each rank.
         max_load_factor : float
@@ -957,9 +978,19 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             (same ``bucket_capacity`` you pass into ``get_sharded_table_capacity``, e.g. ``128`` or ``MAX_BUCKET_CAPACITY``),
             then multiply by a cache ratio or scale if desired. The planner overwrites **per-rank**
             ``local_hbm_for_values`` to ``ceil(global_hbm_for_values / world_size)``.
+        global_ddr_for_values : int
+            Total host memory (DDR) for the values of the ``DynamicEmbStorage`` tier of a caching table, in bytes.
+            Default is 0 (unset). Only read with ``caching=True`` **and** an ``external_storage``, where it selects the
+            cache path (see ``external_storage``); ignored, with a warning, without one. The planner overwrites
+            **per-rank** ``local_ddr_for_values`` to ``ceil(global_ddr_for_values / fanout)``.
         external_storage: Storage
             The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
             If not provided, will using DynamicEmbeddingTable as the Storage.
+            With ``caching=True`` the cache path follows from it: without an ``external_storage``, or with one and a
+            ``global_ddr_for_values``, the **inclusive** path (HBM cache ⊂ ``DynamicEmbStorage``, which owns the scores;
+            the PS, if any, sits below the storage and receives what it evicts); with one and no
+            ``global_ddr_for_values``, the **NINE** path (HBM cache + PS, no ``DynamicEmbStorage``; the cache owns the
+            scores). ``NO_EVICTION`` is not supported with an ``external_storage``.
         index_type : Optional[torch.dtype], optional
             Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
         admit_strategy : Optional[AdmissionStrategy], optional
@@ -992,7 +1023,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             the sharding's keys, whatever the sharder's ``use_index_dedup`` (tables that clip
             gradients need that flag). It carries no score per key (``PRECISE_CUSTOMIZED``
             tables raise ``ValueError``). ``"auto"``: ``"hierarchical"`` where the build has
-            it, ``output_dist_capacity`` is set and no table is ``continuous``, takes a score
+            it, ``output_dist_capacity`` is set and every table is ``roundrobin`` or ``hash_roundrobin``, takes a score
             per key or clips gradients without index dedup, else TorchRec's dists. See
             ``docs/hier_output_dist.md``, section 4.
         node_dedup : bool, optional
@@ -1019,6 +1050,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
         embedding_dtype: Optional[torch.dtype] = None
         dim: Optional[int] = None
         max_capacity: Optional[int] = None
+        global_capacity: Optional[int] = None
         evict_strategy: DynamicEmbEvictStrategy = DynamicEmbEvictStrategy.LRU
         local_hbm_for_values: int = 0  # in bytes
         device_id: Optional[int] = None
@@ -1161,7 +1193,7 @@ The meaning of the threshold depends on the table's `score_strategy`:
 - Strategies without a timestamp column (e.g. `STEP`, single `LFU`) instead threshold on the **absolute score value**: items whose score is not less than the threshold are dumped. This is not a time-based increment.
 - Tables whose strategy contains `NO_EVICTION` (alone or as `(NO_EVICTION, CUSTOMIZED)`) are **skipped** with a `UserWarning` and are absent from the result; nothing is drained from them. They have no timestamp to take a delta by, and their erased keys are the user's to manage.
 
-> **Limitation — `dist_type`:** `incremental_dump` supports only `roundrobin` and `hash_roundrobin` sharding. A table sharded with `dist_type="continuous"` raises `NotImplementedError`. The returned `slot_index` is meant for precise `replay_increment`, which reconstructs each key's owning rank from the key via `(key or hash(key)) % world_size`; `continuous` uses a different, range-based key→rank mapping that this path does not implement. Use `roundrobin` or `hash_roundrobin` if you need incremental dump.
+> **Limitation — `dist_type`:** `incremental_dump` supports only `roundrobin`, `hash_roundrobin` and `hash_bucket` sharding. A table sharded with `dist_type="continuous"` raises `NotImplementedError`. The returned `slot_index` is meant for precise `replay_increment`, which reconstructs each key's owning rank from the key (`key % world_size` for `roundrobin`, `murmur3(key) % world_size` for `hash_roundrobin`, the global-bucket rule of `dynamicemb.key_ownership` for `hash_bucket`); `continuous` uses a different, range-based key→rank mapping that this path does not implement. Use `roundrobin` or `hash_roundrobin` if you need incremental dump.
 
     ```python
     #How to import
@@ -1262,7 +1294,7 @@ More usage please see [test](https://github.com/NVIDIA/recsys-examples/blob/main
 **Behavior**
 For every table in the delta, `replay_increment` erases the table's `erased_keys` (so the target converges to the source) and then upserts `keys` / `values` at the slots in `meta["slot_index"]`. `evicted_keys` is never applied: the key that took an evicted key's slot is in the same delta and overwrites it.
 
-*Write-back is by slot.* Every key is written at the slot and value row it held in the source table, leaving the target layout-identical to it. A key can only be found inside its own home bucket, and that bucket is `hash(key) % capacity / bucket_capacity`, so this requires the target's layout to match the source's. `replay_increment` compares the delta's `meta` (`current_capacity`, `row_capacity`, `bucket_capacity`, `num_scores`, `world_size`, and the `table_options` fields `score_strategy` / `dim` / `dist_type`) against the target table, and checks that every column has the shape the write path needs. Both happen for **all** of the delta's tables before any of them is written, so a mismatch anywhere raises `ValueError` naming the first offending field with the collection untouched — a delta spans a whole collection, and a partly applied one is worse to recover from than a rejected one. Configure the target to match the source, or rebuild it from a full checkpoint (`DynamicEmbLoad`) instead.
+*Write-back is by slot.* Every key is written at the slot and value row it held in the source table, leaving the target layout-identical to it. A key can only be found inside its own home bucket, and that bucket is `hash(key) % capacity / bucket_capacity`, so this requires the target's layout to match the source's. `replay_increment` compares the delta's `meta` (`current_capacity`, `row_capacity`, `bucket_capacity`, `num_scores`, `world_size`, and the `table_options` fields `score_strategy` / `dim` / `dist_type` / `global_capacity`) against the target table, and checks that every column has the shape the write path needs. Both happen for **all** of the delta's tables before any of them is written, so a mismatch anywhere raises `ValueError` naming the first offending field with the collection untouched — a delta spans a whole collection, and a partly applied one is worse to recover from than a rejected one. Configure the target to match the source, or rebuild it from a full checkpoint (`DynamicEmbLoad`) instead.
 
 The same rule is enforced per key inside the kernel — a slot that does not land in its key's home bucket raises rather than dropping the key.
 
@@ -1276,7 +1308,7 @@ The same rule is enforced per key inside the kernel — a slot that does not lan
 
 *Scores and optimizer state travel under `ReplayContent`,* which asks for both by default. Drop `SCORE` and a restored key is scored as if it had just been inserted into the target, so the replica ranks its own future evictions by when it received each key rather than by how the source ranked it — the two can evict in different orders, but never disagree on the value of a key they both hold. Drop `OPTIMIZER_STATE` and a key keeps its state only if it already occupies the target row. 
 
-*Sharding.* Replay keeps only the keys this rank owns, recomputing ownership from the key with **this** model's global world size — the fan-out the tables were sharded over. There is deliberately no process-group argument: replay is local (filter, then write), so a group could only narrow the modulus and mis-route every key. A delta gathered over a process group (`incremental_dump(..., pg)`) holds the whole group's keys and so fans out correctly when the same delta is handed to every rank. A per-rank delta (`pg=None`) holds only the producing rank's keys and should be replayed there — replaying it on another rank is not an error, every key simply belongs to someone else and is skipped, which `ReplayStats.skipped` reports. Like `incremental_dump`, only `roundrobin` and `hash_roundrobin` are supported; `continuous` raises `NotImplementedError`.
+*Sharding.* Replay keeps only the keys this rank owns, recomputing ownership from the key with **this** model's global world size — the fan-out the tables were sharded over. There is deliberately no process-group argument: replay is local (filter, then write), so a group could only narrow the modulus and mis-route every key. A delta gathered over a process group (`incremental_dump(..., pg)`) holds the whole group's keys and so fans out correctly when the same delta is handed to every rank. A per-rank delta (`pg=None`) holds only the producing rank's keys and should be replayed there — replaying it on another rank is not an error, every key simply belongs to someone else and is skipped, which `ReplayStats.skipped` reports. Like `incremental_dump`, only `roundrobin`, `hash_roundrobin` and `hash_bucket` are supported; `continuous` raises `NotImplementedError`.
 
 *Optimizer state* is not part of a delta. A key that already occupies its target row keeps its optimizer state; a row taken over from another key (or a brand-new one) is reset to the table's initial optimizer state.
 
@@ -1416,7 +1448,7 @@ The call returns at once with a handle; the scan runs on a thread of its own, on
 **Behavior**
 - *Which tables.* Those whose score strategy has the one you name as a member, so `CUSTOMIZED` takes `CUSTOMIZED` and `(NO_EVICTION, CUSTOMIZED)` tables, and `PRECISE_CUSTOMIZED` takes `PRECISE_CUSTOMIZED` and `(NO_EVICTION, PRECISE_CUSTOMIZED)` tables. A table that is `NO_EVICTION` alone keeps no score and is never picked; naming `NO_EVICTION` is an error. With no table that qualifies the call is not an error: the handle is done at once and says `(0, 0)`. A table that keeps two score words (`(TIMESTAMP, LFU)`, in either order) is taken by both `TIMESTAMP` and `LFU`, and the one you name is the word compared: `TIMESTAMP` its last-access timestamp (an expiry, whatever the key's frequency), `LFU` its frequency (whatever its age). The other word is not looked at, and an erased key loses both. `table_names` narrows the call to the tables you name, each of which must qualify; a name that is in no module, a table that does not qualify, or an empty list is an error, raised before anything starts. With `strict=False` a name that no module of this rank holds is skipped instead, so the same call works on every rank when a table is not on every rank (`TABLE_ROW_WISE`); a held name that does not qualify is still an error. Tables that need different thresholds take one call each (example below).
 - *The threshold.* A key is erased when its score is **strictly below** `threshold`, an int in `[0, 2**64)`, in the unit the score has: the number you set or gave per key, a step, a frequency, or for `TIMESTAMP` the device clock, in ns, which you read with `dynamicemb.device_timestamp()` on the tables' device. An `LFU` frequency is the raw access count: it never decays (a `score_function` only changes how evictions rank), and a key just admitted starts at its first count, so an erase by `LFU` alone also removes the keys that came in recently. A frequency floor usually wants an age condition with it, which this call does not combine. For `(NO_EVICTION, CUSTOMIZED)` and `(NO_EVICTION, PRECISE_CUSTOMIZED)` tables the scores of the keys you keep must be at least 1: an erased slot is cleared to 0, so a key scored 0 ties with one.
-- *Layouts.* Supported: GPU-only tables, and a cache over host storage (only the storage behind the cache is erased; the cache is neither read nor changed, so a key it still holds can be written back when the cache lets it go). Refused when a table of the module would be scanned: host-only tables, `HybridStorage`, and any layout with an `external_storage`.
+- *Layouts.* Supported: GPU-only tables, host-only tables (no HBM for values, `caching=False`), and a cache over host storage (only the storage behind the cache is erased; the cache is neither read nor changed, so a key it still holds can be written back when the cache lets it go). Refused when a table of the module would be scanned: `HybridStorage`, and any layout with an `external_storage`. Host-only tables pin no key: a key a batch is using can be erased between its forward and backward if its score is below the threshold, and that batch's update to it is then dropped (it is never `spared`). Not handled: if a later forward inserts the key again before that backward runs, the backward writes the erased row's updated embedding and optimizer state over the new row (the score is kept). Nothing raises; the row holds those values until the later batch's backward writes it, and a forward, dump or evaluation in between reads them. A loop that runs each backward before the next forward never hits this.
 - *What is spared.* Best effort. A key a prefetched batch is using -- from its prefetch to its backward -- is not erased even if its score is below the threshold; it is counted as spared instead. A key whose score is raised or lowered while the scan runs is erased or not by the score it has when the scan reaches it. If the table is expanded while it is scanned (the training inserted more keys than it has room for), that table is scanned again from its first bucket.
 - *What it overlaps.* Forward, backward and prefetch. **Not** dump, load, `incremental_dump`, `replay_increment`, `pop_evicted_keys`, `pop_erased_keys` or evaluation: call `wait()` on the handle first; this is not checked. The prefetch of a batch waits for the chunk the scan is in and the few it has in flight, not for the whole scan.
 - *Which stream.* By default each module makes one stream of its own and keeps it, and the scan overlaps the training. You can pass a stream of the tables' device. The one the training runs on, the default stream or the prefetch stream also work, but the scan is then queued among the training's kernels, does not overlap them, and a `UserWarning` says so.
@@ -1701,8 +1733,12 @@ class MultiTableAdmitter(abc.ABC):
 
         ``frequencies`` is how often each key occurred in *this batch*, where
         the module counts occurrences at all; None means treat each key as one.
-        It is an increment, not a running total -- any total is the admitter's
-        own to keep.
+        On input it is an increment, not a running total -- any total is
+        the admitter's own to keep. It is a copy made for this call and it is
+        where an answer goes back: an admitter that keeps a running total
+        overwrites it in place with each key's total (this batch included),
+        which a table that evicts by LFU takes as the score the key is inserted
+        with; one that keeps none leaves it as it is.
         """
 
     def state(self) -> Optional[Counter]:
@@ -1728,6 +1764,10 @@ class MultiTableAdmitter(abc.ABC):
 `FrequencyAdmissionStrategy` admits a key once it has been seen often enough,
 and carries the counter it accumulates into, so admission is configured in one
 place. Its admitter erases a key from that counter the moment it is admitted.
+On a table that evicts by LFU (`LFU`, or `(TIMESTAMP, LFU)` in either order) it
+also writes each key's running count over its score, so an admitted key's score
+includes the occurrences it waited with and it ranks as if it had been in the
+table since it was first seen.
 
 ```python
 class FrequencyAdmissionStrategy(AdmissionStrategy):
@@ -1829,7 +1869,7 @@ Due to limited resources, the dynamic embedding table does not pre allocate memo
 `output_dist="hierarchical"` in `DynamicEmbTableOptions` replaces TorchRec's input and output dists of row-wise `EmbeddingCollection` shardings with DynamicEmb's hierarchical dist.
 
 - Set `output_dist_capacity` from what the model's batches need: `hier_needs` and `hier_capacities` in `benchmark/benchmark_utils.py` count it.
-- Use tables of `dist_type` `roundrobin` (the default) or `hash_roundrobin`. With a `continuous` table, `"hierarchical"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
+- Use tables of `dist_type` `roundrobin` (the default), `hash_roundrobin` or `hash_bucket`. With a `continuous` table, `"hierarchical"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
 - A call on the dist deduplicates the sharding's keys (index dedup), whatever the sharder's `use_index_dedup`; without that flag the sharding warns so once, at its first `input_dist()` ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 7.4). Tables that clip gradients need `use_index_dedup=True`: without it, `"hierarchical"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
 - The dist carries no score per key. With tables that take one (`PRECISE_CUSTOMIZED`), `"hierarchical"` raises `ValueError` when the model is sharded, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
 - A node of the dist is NCCL's LSA team, the GPUs that reach each other's memory over NVLink: a host of 8 GPUs on H100 machines, and on GB200 and GB300 NVL72 with multi-node NVLink the job's GPUs of a rack when the job runs inside one rack. The dist reads it at its first `input_dist()` ([node_size](#node_size) gives it too); `LOCAL_WORLD_SIZE`, the GPUs of a host, does not set it. Across racks it is what the NCCL you run gives: check it there ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.2).
@@ -1871,6 +1911,16 @@ dynamicemb supports caching hot embeddings on GPU memory, and you can prefetch k
 
 dynamicemb supports external storage once `external_storage` in `DynamicEmbTableOptions` inherits the `Storage` interface under [types.py](./dynamicemb/types.py). 
 Refer to demo `PyDictStorage` in [unit test](./test/test_batched_dynamic_embedding_tables_v2.py) for detailed usage.
+
+With `caching=True` an `external_storage` takes one of two places, chosen by `global_ddr_for_values`:
+
+| `external_storage` | `global_ddr_for_values` | Cache path | Tiers | Scores owned by |
+|---|---|---|---|---|
+| unset | (ignored) | inclusive | cache ⊂ `DynamicEmbStorage` (whole table) | the storage |
+| set | > 0 | inclusive | cache ⊂ `DynamicEmbStorage` (`local_ddr_for_values`) ⊂ PS | the storage |
+| set | unset | NINE | cache + PS | the cache (a single `score_strategy`; not a compound one) |
+
+The inclusive path ranks the cache by timestamp only. The NINE path (non-inclusive, non-exclusive: the PS is opaque, so a key can be in both) keeps the table's own `score_strategy` in the cache and writes each evicted key to the PS with its score. `NO_EVICTION` is not supported with an `external_storage`, and neither is a compound `score_strategy` (e.g. `(TIMESTAMP, LFU)`) on the NINE path, which keeps one score word per key; evaluation does not read a PS that sits below the storage (inclusive + PS) and raises, while NINE evaluates through cache and PS. Async erase and `incremental_dump` support the inclusive path without a PS only.
 
 
 ## Table expansion
