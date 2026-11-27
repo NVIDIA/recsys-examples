@@ -1,9 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 // All rights reserved. SPDX-License-Identifier: Apache-2.0
 #pragma once
-#include "replica_sync_batch.h"
+#include <ATen/ATen.h>
+#include <optional>
+#include <tuple>
 
 namespace dyn_emb::replica {
+using Layout = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>;
+struct Table {
+  at::Tensor values, buckets, row_map, sizes, fresh;
+  Layout layout; // embedding/optimizer widths, optimizer bytes, bucket
+                 // capacity, scores
+  bool constant;
+  int64_t global_capacity;
+};
+struct Route {
+  at::Tensor keys, rows,
+      slots;           // signed key bits; negative rows and slots mean absent
+  bool dense = false;  // every replica holds every union key
+  bool cached = false; // validated previous key/row/slot triple
+};
+
 void validate(const at::Tensor &, const at::Tensor &, const at::Tensor &,
               const at::Tensor &, const at::Tensor &, int64_t, int64_t, int64_t,
               const at::Tensor &);

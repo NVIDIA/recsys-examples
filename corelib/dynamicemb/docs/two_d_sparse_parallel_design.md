@@ -63,9 +63,10 @@ score layouts. The returned statistics follow the original table order.
 2. **Exchange rows.** CUDA kernels pack the embedding, live optimizer state
    and optional LFU counters for each held row. FP8 values keep their stored
    encoding and packed Adagrad accumulators keep their fp32 precision. A
-   packed NCCL slab can span several tables. A shared mask identifies which
-   replicas contributed sparse rows. The next slab's all-gather can overlap
-   writeback for the preceding slab.
+   packed NCCL slab can span several tables. All replica groups use this
+   collective, and NCCL selects the transport for the available topology.
+   A shared mask identifies which replicas contributed sparse rows. The next
+   slab's all-gather can overlap writeback for the preceding slab.
 3. **Merge and place.** The operator averages in fp32. For a constant
    initializer, an absent replica contributes the initial embedding at table
    precision and fresh optimizer state. For a random initializer, only the
@@ -82,14 +83,6 @@ The smallest `max_staging_bytes` requested by the replicas sets the payload
 staging budget. NCCL processes at least one row per slab. The routing metadata
 and the output rows awaiting local insertion are separate from the payload
 budget.
-
-Two local GPUs with mutual peer access and native atomics can share a symmetric
-workspace. When all active tables have eligible aligned rows and a single
-timestamp score, the pair exchanges the whole batch through that workspace.
-Compact tables whose combined payload and control words fit can DMA directly
-into one inbox. The bounded path reuses two slabs across table boundaries.
-When the pair cannot allocate the direct inbox, it tries the slabs and then
-packed NCCL. A sparse or otherwise ineligible batch uses packed NCCL.
 
 ## 5. Checkpoints
 

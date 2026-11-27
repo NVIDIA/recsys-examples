@@ -14,8 +14,7 @@ using Group = c10::intrusive_ptr<c10d::ProcessGroup>;
 using Work = c10::intrusive_ptr<c10d::Work>;
 using Config =
     std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t>;
-using Result =
-    std::tuple<at::Tensor, Tensors, Tensors, Tensors, Tensors, Tensors>;
+using Result = std::tuple<at::Tensor, Tensors, Tensors, Tensors, Tensors>;
 
 struct Gather {
   Work work;
@@ -139,13 +138,10 @@ int64_t align16(int64_t x) { return (x + 15) / 16 * 16; }
 // Slabs can straddle table boundaries. Even thousands of small tables cost
 // one NCCL work item per slab. Packets for each table keep its native dtype.
 std::vector<Slab> partition(const std::vector<Table> &tables,
-                            const std::vector<Route> &routes,
-                            const std::vector<bool> &done, int64_t budget) {
+                            const std::vector<Route> &routes, int64_t budget) {
   std::vector<Slab> slabs;
   int64_t used = 0;
   for (size_t i = 0; i < tables.size(); ++i) {
-    if (done[i])
-      continue;
     int64_t width = wire_width(tables[i]);
     for (int64_t start = 0; start < routes[i].keys.numel();) {
       if (slabs.empty() || budget - used < width) {
@@ -283,9 +279,8 @@ void exchange_rows(const std::vector<Table> &tables,
 Result sync_batch(const Tensors &values, const Tensors &buckets,
                   const Tensors &rows, const Tensors &sizes,
                   const Tensors &fresh, const std::vector<Config> &layouts,
-                  const Tensors &cache, const Tensors &peer_state,
-                  const std::string &group_name, int64_t threshold,
-                  int64_t max_staging_bytes) {
+                  const Tensors &cache, const std::string &group_name,
+                  int64_t threshold, int64_t max_staging_bytes) {
   size_t n = values.size();
   TORCH_CHECK(n && buckets.size() == n && rows.size() == n &&
                   sizes.size() == n && fresh.size() == n &&
@@ -324,11 +319,10 @@ Result sync_batch(const Tensors &values, const Tensors &buckets,
     wire_width(tables.back());
   }
   auto routes = route_batch(tables, cache, threshold, group);
-  std::vector<bool> done(n, false);
-  auto peers =
-      batch_peer(tables, routes, peer_state, group, max_staging_bytes, done);
-  auto slabs = partition(tables, routes, done,
-                         max_staging_bytes / (2 * (group->getSize() + 1)));
+  // Two slabs overlap; each needs one packed input and one output per rank.
+  // Round down to the packet alignment, retaining the one-row minimum.
+  auto slab_bytes = max_staging_bytes / (2 * (group->getSize() + 1));
+  auto slabs = partition(tables, routes, slab_bytes / 16 * 16);
   auto insert = prepare_inserts(tables, routes);
   exchange_rows(tables, routes, group, slabs, insert);
   auto stats = at::empty({int64_t(n), 2},
@@ -344,16 +338,15 @@ Result sync_batch(const Tensors &values, const Tensors &buckets,
     else
       next.insert(next.end(), 3, at::empty({0}, r.keys.options()));
   }
-  return {stats, next, insert.keys, insert.values, insert.scores, peers};
+  return {stats, next, insert.keys, insert.values, insert.scores};
 }
 
 TORCH_LIBRARY_FRAGMENT(dyn_emb, m) {
   m.def("replica_sync_batch_(Tensor(a!)[] tables, Tensor(b!)[] buckets, "
         "Tensor[] row_maps, Tensor[] sizes, "
         "Tensor[] fresh, (int, int, int, int, int, bool, int)[] layouts, "
-        "Tensor[] cache, Tensor(c!)[] peer_state, "
-        "str group_name, int threshold, int max_staging_bytes) -> (Tensor, "
-        "Tensor[], Tensor[], Tensor[], Tensor[], Tensor[])");
+        "Tensor[] cache, str group_name, int threshold, int max_staging_bytes) "
+        "-> (Tensor, Tensor[], Tensor[], Tensor[], Tensor[])");
 }
 TORCH_LIBRARY_IMPL(dyn_emb, CUDA, m) {
   m.impl("replica_sync_batch_", TORCH_FN(sync_batch));

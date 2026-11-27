@@ -15,7 +15,6 @@ namespace dyn_emb::replica {
 
 // The dispatcher represents a plain layout as a tuple of integers. It is
 // unpacked once on the host; both kernels take the same POD by value.
-using LayoutTuple = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>;
 using Bucket = LinearBucket<int64_t>;
 struct RowLayout {
   int embedding, opt_columns, opt_bytes, bucket_capacity, scores;
@@ -24,7 +23,7 @@ struct RowLayout {
 };
 
 RowLayout get_layout(const at::Tensor &table, const at::Tensor &buckets,
-                     const LayoutTuple &layout) {
+                     const Layout &layout) {
   const auto [embedding, opt, opt_bytes, capacity, scores] = layout;
   TORCH_CHECK(table.dim() == 2 && table.is_contiguous() && table.is_cuda());
   TORCH_CHECK(buckets.device() == table.device() && buckets.is_contiguous() &&

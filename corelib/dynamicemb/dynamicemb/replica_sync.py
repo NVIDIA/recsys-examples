@@ -30,7 +30,6 @@ import torch.distributed as dist
 from dynamicemb.dump_load import get_dynamic_emb_module
 from dynamicemb.dynamicemb_config import score_strategy_has_timestamp_column
 from dynamicemb.key_value_table import DynamicEmbStorage
-from dynamicemb.replica_peer import peer_state
 from dynamicemb.types import DynamicEmbInitializerMode
 from dynamicemb.utils import encode_table_values
 from dynamicemb_extensions import device_timestamp, table_scatter_score_blocks
@@ -175,7 +174,6 @@ class DynamicEmbReplicaSync:
         # Until mark_synced, a sync merges every key the tables hold.
         self.threshold = 0
         self._routes = []
-        self._peer = peer_state(self.replica_group, torch.cuda.current_device())
         self._generations = None
         self._names = []
         self._fresh = []
@@ -254,7 +252,6 @@ class DynamicEmbReplicaSync:
             keys,
             values,
             scores,
-            self._peer,
         ) = torch.ops.dyn_emb.replica_sync_batch_(
             self._values,
             self._buckets,
@@ -263,7 +260,6 @@ class DynamicEmbReplicaSync:
             self._fresh,
             self._layouts,
             self._routes,
-            self._peer,
             self.replica_group.group_name,
             self.threshold,
             self.max_staging_bytes,
