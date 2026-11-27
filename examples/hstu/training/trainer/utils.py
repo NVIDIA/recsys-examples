@@ -56,6 +56,7 @@ def create_hstu_config(
     tensor_model_parallel_args: TensorModelParallelArgs,
     mixed_precision_args: MixedPrecisionArgs | None = None,
 ):
+    """Build the HSTU configuration from training and precision arguments."""
     dtype = None
     if network_args.dtype_str == "bfloat16":
         dtype = torch.bfloat16

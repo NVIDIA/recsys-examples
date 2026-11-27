@@ -360,9 +360,15 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 q_descale = k_descale = v_descale = None
                 if ctx.attention_quant_mode == 5:
                     with nvtx.annotate("fp8 attention prepare operands fwd"):
-                        (attn_q, q_descale), (attn_k, k_descale), (attn_v, v_descale) = (
+                        (
+                            (attn_q, q_descale),
+                            (attn_k, k_descale),
+                            (attn_v, v_descale),
+                        ) = (
                             hstu.quantize_for_head_batch_tensor(
-                                tensor, seq_offsets_q, quant_mode=ctx.attention_quant_mode
+                                tensor,
+                                seq_offsets_q,
+                                quant_mode=ctx.attention_quant_mode,
                             )
                             for tensor in (q, k, v)
                         )
@@ -627,6 +633,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         None,
         None,
     ]:
+        """Compute input and parameter gradients for the fused HSTU layer."""
+
         def _linear_residual_bwd(
             grad_output,
             x,
@@ -749,7 +757,9 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                             (dout, do_descale),
                         ) = (
                             hstu.quantize_for_head_batch_tensor(
-                                tensor, seq_offsets_q, quant_mode=ctx.attention_quant_mode
+                                tensor,
+                                seq_offsets_q,
+                                quant_mode=ctx.attention_quant_mode,
                             )
                             for tensor in (q, k, v, dout)
                         )
@@ -1175,6 +1185,7 @@ def fused_hstu_op(
     linear_fp8: bool = False,
     linear_fp8_backward: bool = True,
 ):
+    """Apply the fused HSTU layer with optional Hopper FP8 kernels."""
     if attention_quant_mode not in (-1, 5):
         raise ValueError("attention_quant_mode must be -1 or 5")
     if (attention_quant_mode == 5 or linear_fp8) and (

@@ -28,7 +28,6 @@ import triton
 # @manual=//triton:triton
 import triton.language as tl
 from commons.ops.triton_ops.common import triton_autotune
-
 from ops.pt_ops.te_addmm import te_fp8_linear_bwd
 
 ENABLE_FULL_TURNING_SPACE = False
@@ -288,6 +287,7 @@ def triton_addmm_silu_bwd(
     wgrad_event: Optional[torch.cuda.Event] = None,
     linear_fp8: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return the input, weight, and addend gradients for addmm and optional SiLU."""
     if silu:
         assert z is not None, "z is required for silu"
         dz = torch.ops.aten.silu_backward(grad_output, z)

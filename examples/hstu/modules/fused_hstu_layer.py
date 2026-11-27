@@ -124,6 +124,7 @@ class FusedHSTULayer(MegatronModule):
 
     @output_nvtx_hook(nvtx_tag="FusedHSTULayer")
     def forward(self, jd: JaggedData) -> JaggedData:
+        """Apply the fused HSTU layer to packed jagged values."""
         input = jd.values
         output = fused_hstu_op(
             input=input,

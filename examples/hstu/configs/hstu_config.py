@@ -105,6 +105,9 @@ class HSTUConfig(TransformerConfig):
       async_wgrad_event (torch.cuda.Event): Event for async wgrad. Defaults to None.
       recompute_input_layernorm (bool): Flag to enable recompute input layernorm. Defaults to False.
       recompute_input_silu (bool): Flag to enable recompute input silu. Defaults to False.
+      attention_quant_mode (int): Use -1 for unquantized attention or 5 for per-tensor FP8.
+      linear_fp8 (bool): Enable FP8 projection forward GEMMs.
+      linear_fp8_backward (bool): Enable FP8 projection gradients when linear_fp8 is enabled.
     """
 
     hstu_preprocessing_config: Optional[HSTUPreprocessingConfig] = None
@@ -198,6 +201,9 @@ def get_hstu_config(
         recompute_input_layernorm (bool, optional): Whether to recompute input layernorm. Defaults to False.
         recompute_input_silu (bool, optional): Whether to recompute input silu. Defaults to False.
         is_inference (bool, optional): Whether is the inference mode
+        attention_quant_mode (int, optional): Use -1 for unquantized attention or 5 for per-tensor FP8.
+        linear_fp8 (bool, optional): Enable FP8 projection forward GEMMs.
+        linear_fp8_backward (bool, optional): Enable FP8 projection gradients when linear_fp8 is enabled.
     Returns:
         HSTUConfig: The HSTU configuration object.
     """
