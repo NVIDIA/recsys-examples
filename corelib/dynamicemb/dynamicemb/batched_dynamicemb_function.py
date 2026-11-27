@@ -229,9 +229,6 @@ class _PinnedRowLease:
                 self._last_use = torch.cuda.Event()
             self._last_use.record(torch.cuda.current_stream(self._device_index))
 
-    def finish_forward(self):
-        self.record_use()
-
     def release(self, *, after_use=False):
         with self._lock:
             if self.released:
@@ -328,7 +325,6 @@ class PrefetchState:
             if tensor is not None:
                 tensor.record_stream(stream)
 
-    table_gate: Optional[Callable[[], ContextManager]] = None
     pin_lease: Optional[_PinnedRowLease] = field(default=None, repr=False)
     released: bool = False
 
@@ -1614,7 +1610,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.prefetch_state = prefetch_state
             ctx.input_count = len(ctx.needs_input_grad)
             if prefetch_state.pin_lease is not None:
-                prefetch_state.pin_lease.finish_forward()
+                prefetch_state.pin_lease.record_use()
 
             return output_embs
 
