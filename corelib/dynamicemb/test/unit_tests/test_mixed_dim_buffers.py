@@ -13,8 +13,9 @@ from typing import Sequence
 
 import pytest
 import torch
-from dynamicemb.state.mixed_dim_buffers import MixedDimBuffers
+from dynamicemb.state.mixed_dim_buffers import MixedDimBuffers, PaddedBuffer
 from dynamicemb.types import CopyMode
+from dynamicemb_extensions import PaddedBufferView
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -245,3 +246,37 @@ def test_gather_emb_by_entry_gathers_and_skips_negative_rows():
     torch.testing.assert_close(out[1, :4], vals[0, :4])  # row 0 of table 0, 4 wide
     assert (out[1, 4:] == -7.0).all()  # past its width: untouched
     assert (out[2] == -7.0).all()  # the missing row: left as it was
+
+
+def _padded_view(emb_dims, max_value_dim, device="cuda"):
+    return PaddedBufferView(
+        torch.tensor(emb_dims, dtype=torch.int64, device=device),
+        max(emb_dims),
+        max_value_dim,
+        all(d % 4 == 0 for d in emb_dims),
+    )
+
+
+def test_padded_buffer_finds_the_parts_of_a_row():
+    view = _padded_view([4, 8], 12)
+    rows = PaddedBuffer.empty(view, 3, torch.float16, torch.device("cuda"))
+    assert (
+        rows.has_state
+        and not PaddedBuffer.empty(
+            _padded_view([8], 8), 1, torch.float16, torch.device("cuda")
+        ).has_state
+    )
+    assert rows.values.shape == (3, 12) and rows.values.dtype == torch.float16
+    assert rows.max_emb_dim == 8 and rows.max_value_dim == 12
+
+    rows.values.zero_()
+    rows.emb().fill_(1)
+    rows.state().fill_(2)
+    # Both are views of the rows, not copies, and they split a row at max_emb_dim.
+    assert rows.values[:, :8].eq(1).all() and rows.values[:, 8:].eq(2).all()
+    assert rows.emb().shape == (3, 8) and rows.state().shape == (3, 4)
+
+
+def test_padded_buffer_rejects_values_of_the_wrong_width():
+    with pytest.raises(ValueError):
+        PaddedBuffer(torch.zeros(3, 10, device="cuda"), _padded_view([4, 8], 12))

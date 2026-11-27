@@ -30,6 +30,7 @@ that work on a padded buffer (the output of ``load_to_padded``), which needs onl
 The buffers themselves know nothing of optimizers.
 """
 
+from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import torch
@@ -47,6 +48,66 @@ from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
 from dynamicemb_extensions import load_from_flat_table_value as _load_value
 from dynamicemb_extensions import store_to_flat_table_contiguous as _store_contiguous
 from dynamicemb_extensions import store_to_flat_table_value as _store_value
+
+
+@dataclass(frozen=True)
+class PaddedBuffer:
+    """A batch of padded rows -- the output of ``load_to_padded`` and the input of
+    ``store_from_padded``, whatever tables they come from -- and the dims that describe it.
+
+    A row is the embedding, padded to ``max_emb_dim``, followed by the optimizer state, in
+    ``max_value_dim`` columns altogether; when the two widths are equal there is no state.
+    ``values`` is ``[num_rows, max_value_dim]``, and ``view`` carries what is not in its
+    shape: each table's own embedding dimension (``view.emb_dims``, on the device) and the
+    two maxima. This is the one place that knows where the parts of a row are.
+
+    The buffer lives for a batch; ``view`` is built from the tables' configuration and
+    shared by every buffer of the batch (see ``empty``).
+    """
+
+    values: torch.Tensor
+    view: PaddedBufferView
+
+    def __post_init__(self):
+        if self.values.dim() != 2 or self.values.size(1) != self.view.max_value_dim:
+            raise ValueError(
+                f"values must be [rows, {self.view.max_value_dim}], "
+                f"not {list(self.values.shape)}"
+            )
+
+    @classmethod
+    def empty(
+        cls,
+        view: PaddedBufferView,
+        num_rows: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> "PaddedBuffer":
+        """Uninitialized padded rows."""
+        return cls(
+            torch.empty(num_rows, view.max_value_dim, dtype=dtype, device=device), view
+        )
+
+    @property
+    def max_emb_dim(self) -> int:
+        return self.view.max_emb_dim
+
+    @property
+    def max_value_dim(self) -> int:
+        return self.view.max_value_dim
+
+    @property
+    def has_state(self) -> bool:
+        return self.view.max_value_dim != self.view.max_emb_dim
+
+    def emb(self) -> torch.Tensor:
+        """The embedding columns, as a writable view."""
+        return self.values[:, : self.view.max_emb_dim]
+
+    def state(self) -> torch.Tensor:
+        """The optimizer-state columns, as a writable view. Slicing, not indexing, so that
+        writing to it writes to ``values``."""
+        return self.values[:, self.view.max_emb_dim :]
 
 
 class MixedDimBuffers:
