@@ -27,7 +27,11 @@ def _table_lookup_fake(
     ovf_storage: Optional[torch.Tensor] = None,
     ovf_bucket_capacity: int = 0,
     ovf_output_offsets: Optional[torch.Tensor] = None,
+    table_global_capacities: Optional[torch.Tensor] = None,
 ):
+    # Mirrors the schema in src/table_operation/lookup_torch_binding.cu: the
+    # dispatcher hands a fake kernel every schema argument, so a parameter the
+    # schema has and this signature lacks is a TypeError under fake tensors.
     del (
         table_storage,
         table_bucket_offsets,
@@ -35,6 +39,8 @@ def _table_lookup_fake(
         policy_type,
         ovf_bucket_capacity,
     )
+    if table_global_capacities is not None:
+        _validate_1d("table_global_capacities", table_global_capacities)
 
     _validate_1d("keys", keys)
     _validate_1d("table_ids", table_ids)

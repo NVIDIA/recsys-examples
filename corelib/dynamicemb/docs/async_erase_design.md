@@ -26,9 +26,9 @@
 | --- | --- | --- |
 | `HBM_DIRECT` (`DynamicEmbStorage`, values in HBM) | yes | in-flight keys are pinned by the storage's own ref counter |
 | `CACHE` (`DynamicEmbCache` over a `DynamicEmbStorage`) | yes | only the backing storage is erased, the cache is left alone; see §5 |
-| `DEFAULT` (host values, no `PrefetchState`) | **no** | no ref counter: a key can be erased between forward and the key-based write-back in backward |
+| `DEFAULT` with a `DynamicEmbStorage` (host-only, tier `DDR`) | yes | no ref counter: forward's find/insert and backward's write-back take the gate, and the write-back updates only the keys still there, so a key erased between forward and backward loses that batch's update instead of coming back with a score of 0. Not handled: a later forward inserts the key again before that backward; the backward then writes the erased row's updated embedding and optimizer state over the new row, with no error, until the later batch's backward writes it |
 | `HybridStorage` | **no** | two tiers, no ref counter in use |
-| `CACHE` with an `external_storage` (`CACHING_PS`), or the PS alone (`HOST_PS`) | **no** | erase drops data that is no longer used, so it has nothing to do with a PS; the table is rejected rather than left with a stale copy there (§5, consequence 2) |
+| `CACHE` with an `external_storage` (an `EXTERNAL` tier under a cache), or the PS alone | **no** | erase drops data that is no longer used, so it has nothing to do with a PS; the table is rejected rather than left with a stale copy there (§5, consequence 2) |
 
 An unsupported layout is rejected at call time (an error, not a silent skip), but only
 when a table of the module would be scanned: a module with no table that qualifies
@@ -41,7 +41,7 @@ answers with an already-finished handle, whatever its layout.
    event or CPU lock on the table path.
 2. **A prefetched batch borrows slots until backward.** Prefetch resolves keys to
    `slot_indices` (kept in `PrefetchState`) and `increment_counter`s them; backward
-   `decrement_counter`s them (`_prefetch_cache_path`, `_prefetch_hbm_direct_path`,
+   `decrement_counter`s them (`_prefetch_inclusive_cache_path`, `_prefetch_hbm_direct_path`,
    backward).
 3. **The ref counter is the existing pin.** The evict kernel re-reads `counter[slot]`
    after `try_lock` and skips a slot with `counter > 0`. `_ref_counter` used to be
@@ -80,11 +80,15 @@ not enough: a **CPU lock** is needed as well (§4.4).
 
 A key a batch is using should not have a score below the threshold; if one does, it is
 **spared**, not erased. So erase honours the ref counter but need not wait for in-flight
-batches. Forward and backward are covered by the counters once prefetch has incremented
-them, so erase only has to be mutually exclusive with **prefetch**, not with
-forward/backward. (Checked: for `HBM_DIRECT` and `CACHE`, forward and backward only
-write values and `decrement_counter`; the paths that touch the key map in forward or
-backward are `DEFAULT`'s, which is rejected.)
+batches. For `HBM_DIRECT` and `CACHE`, forward and backward are covered by the counters
+once prefetch has incremented them, so erase only has to be mutually exclusive with
+**prefetch**, not with their forward/backward. (Checked: there, forward and backward only
+write values and `decrement_counter`.) The `DEFAULT` path on a host-only
+`DynamicEmbStorage` is the exception: it pins nothing, and its forward (find and insert
+of the missing keys) and its backward (write-back) touch the key map, so they take the
+gate too (§4.4). A key an erase takes between that forward and backward is not spared
+(nothing pinned it); the backward's write-back drops that batch's update to it rather
+than inserting it again with a score of 0.
 
 ### 4.3 The windows that need mutual exclusion
 
@@ -92,6 +96,9 @@ backward are `DEFAULT`'s, which is rejected.)
   is not yet pinned; an erase on another stream could reclaim it, and the batch would
   then train a row that no longer belongs to its key. The cache path has no such window
   for erase, since it does not consult the cache (§5).
+- **`DEFAULT` (host-only) forward's find + insert and backward's write-back.** No
+  counter pins a key here, so an erase chunk must not run between a key's find and its
+  insert, nor between the lookup and the store of the write-back.
 - **Table expansion.** The swap of `state.key_index_map` and the rehash must not
   interleave with an erase that holds the old key map.
 - Host-side `estimated_table_sizes` / `collect_table_sizes` read a size that erase
@@ -120,7 +127,10 @@ A lock orders *launches*, not GPU execution: two threads that launch on two stre
 lock order may still run out of that order on the device. So the holder, on leaving,
 records an event on the stream it launched on, and the next holder's stream waits for it
 before anything it launches. The kernels of the sections are then one chain on the
-device, in the order of the lock. Forward and backward never enter, so their streams are
+device, in the order of the lock. Who enters: prefetch (from the expansion through the
+find and the counter increment), and, on the `DEFAULT` path (host-only), forward's find
+and insert and backward's write-back, with the gate carried in `PrefetchState.table_gate`.
+The forward and backward of `HBM_DIRECT` and `CACHE` never enter, so their streams are
 not part of the chain. The lock is held while *launching*, never while waiting for the
 device. Waiting on an event recorded on the same stream is a no-op, so the gate also
 works when both sides use one stream (without overlap). A copy or pickle of a gate or a
@@ -131,7 +141,7 @@ worker is a new one (a lock and an event belong to one process and device).
 - **Prefetch** (`dynamicemb_prefetch(..., table_gate=...)`) takes a section from
   `expand_if_need` through the find and the `increment_counter`, for both storage
   modes. Two things were moved to before the section, because they do not read the
-  tables: `expand_table_ids_cuda` and the choice of `storage_mode`. The rest of
+  tables: `expand_table_ids_cuda` and the choice of the path (cache, HBM-direct, generic). The rest of
   `dynamicemb_prefetch` is unchanged apart from indentation.
 - **Erase** takes a section per chunk of its scan (§4.8, `_erase_state_by_score`). Inside
   it the key map and the table's bucket range are read **again** each time: between two
@@ -329,7 +339,7 @@ the way a cached copy of any key storage has evicted does.
 Why that is safe (checked, not assumed):
 
 - **Scores live only in storage.** The cache ranks by timestamp, and prefetch
-  `_find_keys` every key in storage, hits included (step 2 of `_prefetch_cache_path`).
+  `_find_keys` every key in storage, hits included (step 2 of `_prefetch_inclusive_cache_path`).
   "Score below the threshold" is decided on storage.
 - **"In storage but not in cache" and "in cache but not in storage" are both already
   legal states.** `_write_back_evicted` looks each key the cache evicts up in storage: one
@@ -426,8 +436,9 @@ reader from seeing a half-filled buffer.
   `UserWarning` says. (An earlier draft required a dedicated stream and rejected the
   others; the requirement was for overlap, which a warning conveys without refusing a
   correct use.)
-- Only `HBM_DIRECT` and `CACHE`; `DEFAULT`, `HybridStorage` and any layout with a PS are
-  rejected at call time, when a table of the module would be scanned.
+- Only `HBM_DIRECT`, `CACHE` and `DEFAULT` on host-only storage (a `DynamicEmbStorage`);
+  `HybridStorage` and any layout with a PS are rejected at call time, when a table of the
+  module would be scanned.
 - Consistency: best effort, in-flight keys are spared and counted.
 - A background thread per module, serial; the call returns an `EraseHandle`.
 - Async erase overlaps **training only** (forward, backward, prefetch); concurrent dump /
@@ -473,8 +484,8 @@ reader from seeing a half-filled buffer.
 - **Chunk size: 2^22 slots**, in whole buckets, clamped to the table's own bucket range
   (§4.8), a parameter. **The key map is read again for every chunk**, and a table's scan
   restarts if its key map was replaced (`key_map_generation`).
-- **`external_storage`: not supported.** A table whose layout has a PS (`CACHING_PS`,
-  `HOST_PS`) is rejected at call time, like `DEFAULT` and `HybridStorage`.
+- **`external_storage`: not supported.** A table whose layout has the `EXTERNAL` tier
+  (`StorageLayout.tiers`) is rejected at call time, like `HybridStorage`.
 - **Return value**: the number erased and the number spared (a key whose score is below
   the threshold but that was pinned, so it stays).
 - **`NO_EVICTION` tables can be erased**, as `(NO_EVICTION, CUSTOMIZED)` /
@@ -496,7 +507,7 @@ reader from seeing a half-filled buffer.
 | Kernel, one slot at a time: read the key; if live and `score < threshold`, `try_lock`, re-read the score under the lock, spare a pinned slot (`slot_is_pinned`, a volatile read of the counter), else clear the score block, write the reclaimed digest, unlock with `reclaimed_key`, `atomicSub(bucket_sizes)`; counts by ballot; grid-stride, 64-bit | `src/table_operation/kernels.cuh` (`table_erase_by_score_kernel`), `erase_by_score.cu`; binding releases the GIL |
 | A reclaimed slot has a digest of its own (`reclaimed_digest`, apart from the empty one), written by every place that makes one: erase, erase by score, rehash placement, replay restore | `types.cuh`, `table_rows.cu`, `kernels.cuh` (`4ec7d48`) |
 | Python wrapper of the kernel over a slot range `[begin, end)` of one table | `scored_hashtable.py`: `LinearBucketTable.erase_by_score` |
-| Chunks, `key_map_generation`, the in-flight limit | `key_value_table.py`: `next_erase_chunk_end`, `_erase_state_by_score`, `DynamicEmbStorage.erase_by_score`, `ERASE_CHUNK_SLOTS`, `ERASE_MAX_CHUNKS_IN_FLIGHT` |
+| Chunks, `key_map_generation`, the in-flight limit | `state/erase.py`: `next_erase_chunk_end`, `_erase_state_by_score`, `ERASE_CHUNK_SLOTS`, `ERASE_MAX_CHUNKS_IN_FLIGHT`; `key_value_table.py`: `DynamicEmbStorage.erase_by_score` |
 | `FairLock`, `TableAccessGate`, `AsyncEraser`, `EraseHandle`, `EraseHandleGroup`, `check_erase_arguments`, `erase_by_score_async` | `async_erase.py` |
 | Prefetch's section | `batched_dynamicemb_function.py`: `dynamicemb_prefetch(table_gate=...)` |
 | The module's gate and worker, `erasable_table_ids`, the method | `batched_dynamicemb_tables.py` |
@@ -512,9 +523,9 @@ ranks). 127 pytest items and one distributed script, passing on an H100 node.
 | `test_erase_by_score.py` | the kernel through the table wrapper: exactly the keys below the threshold (thresholds, with and without a counter), chunked = whole, only the named table, a pinned slot is spared (tables 0 and 1), an erased slot takes a new key and the sizes stay right, argument checks, the digest of a reclaimed slot, the binding's tensor checks |
 | `test_storage_erase_by_score.py` | the chunk rule (a pure function) and its tiling at all sizes, the scan of a storage in chunks, with one, two or eight in flight, erasing the same keys each way (guard once per chunk, untouched tables untouched), a key map replaced between two chunks restarts that table, a table the scan removed keys from is marked `erase_untracked` and no other, a table that is not there is refused first, the in-flight limit (1, 2, 4, with a control that shows the chunks pile up without it) |
 | `test_async_erase.py` | the lock (order, never free while one waits, a waiter interrupted before and after the hand-over, a hot loop does not keep another thread out of the gate), the gate (sections ordered on two streams, with a control; a failed section lets go; copies), the worker and the handle (thread, stream, counts; serial; the three moments; every way of asking raises; `wait_stream`), a real prefetch held back by the chunk the scan is in, and the stress test (three scans in chunks of eight buckets while training grows the table; no step limit) |
-| `test_erase_api.py` | strategy matching, argument checks (also for a model with no module), two-score-word tables, layouts refused (two real, two stand-ins) only where a table is picked, streams (type, device, the ones the training uses warn, the default one, kept), the new parameters (checked, passed through), nothing started when one module is refused, a model with several modules |
+| `test_erase_api.py` | strategy matching, argument checks (also for a model with no module), two-score-word tables, layouts refused (one real, the rest stand-ins) only where a table is picked, streams (type, device, the ones the training uses warn, the default one, kept), the new parameters (checked, passed through), nothing started when one module is refused, a model with several modules |
 | `test_erase_end_to_end.py` | the sliding window of a table that never evicts (does not grow), training beside the call, by time with `device_timestamp()`, a key a prefetched batch uses is spared until its backward, the same key in two tables with opposite ages, a cache (only the storage is erased, the cache is unchanged) |
-| `test_erase_distributed.py` (`torchrun`, 2 ranks) | `erase_by_score_async` on a `DistributedModelParallel` of row-wise `EmbeddingCollection`: per table, per key and per key in tables that never evict, with and without `use_index_dedup`, and beside training; the ranks erase every old key once between them; a host-only layout is refused |
+| `test_erase_distributed.py` (`torchrun`, 2 ranks) | `erase_by_score_async` on a `DistributedModelParallel` of row-wise `EmbeddingCollection`: per table, per key and per key in tables that never evict, with and without `use_index_dedup`, and beside training; the ranks erase every old key once between them; and the same on a host-only layout |
 | elsewhere | `test_table_rows.py` (digest of a reclaimed slot: rehash, restore), `incremental_dump/test_replay_increment.py` (a delta dumped after an erase by score is refused by `replay_increment`; one after a call that removed nothing is replayed), `table_operation/` (`test_table_without_ref_counter`), `test_no_eviction_row_indexing.py` (the `FLAG` policy, reuse) |
 
 **Not covered, chosen:**

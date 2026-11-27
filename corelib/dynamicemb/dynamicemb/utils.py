@@ -208,3 +208,8 @@ def assert_tensors_equal(
             )
         raise AssertionError("Values are different")
     print("Assert success: Shapes and values are equal.")
+
+
+def _slice(t: Optional[torch.Tensor], start: int, end: int) -> Optional[torch.Tensor]:
+    """Slice an optional column, keeping ``None`` as ``None``."""
+    return None if t is None else t[start:end]

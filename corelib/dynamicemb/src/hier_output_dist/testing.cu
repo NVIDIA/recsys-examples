@@ -58,10 +58,12 @@ namespace {
 // offsets relative to its block (feature_offsets [world_size][num_features + 1]),
 // which TorchRec's bucketize gives. The keys by owner are the KJT's keys
 // gathered at inv, widened to int64 with their sign. dist_types are the
-// rules' codes on the host, kCyclic or kHashedCyclic, the op's (it raises for
-// any other, as Config::validate refuses them); their copy to the GPU does
-// not wait for the device (the tests run the planner under the sync debug
-// mode "error"). num_nodes, local_size and node (all or none): the bucketize
+// rules' codes on the host, kCyclic, kHashedCyclic or kHashedBucket, the op's
+// (it raises for any other, as Config::validate refuses them); their copy to
+// the GPU does not wait for the device (the tests run the planner under the
+// sync debug mode "error"). global_capacities and shard_capacities are
+// kHashedBucket's two parameters of each feature (num_features each, or empty
+// when no feature takes that rule). num_nodes, local_size and node (all or none): the bucketize
 // of the in channel of a rank of that node, whose offset_per_bucket_feature
 // holds each owner's first entry and every entry of its node's owners, and
 // garbage elsewhere (then no feature_offsets); none, every entry.
@@ -72,13 +74,35 @@ std::map<std::string, at::Tensor> bucketize_test(
     at::Tensor values, c10::optional<at::Tensor> offsets, c10::optional<at::Tensor> lengths,
     int64_t batch_size, c10::optional<at::Tensor> weights, std::vector<int> dist_types,
     int64_t world_size, at::Tensor input_offsets, c10::optional<int64_t> num_nodes,
-    c10::optional<int64_t> local_size, c10::optional<int64_t> node,
-    c10::optional<bool> sorted_path) {
-  for (const int code : dist_types)
-    TORCH_CHECK(code == (int)DistType::kCyclic || code == (int)DistType::kHashedCyclic,
+    c10::optional<int64_t> local_size, c10::optional<int64_t> node, c10::optional<bool> sorted_path,
+    std::vector<int64_t> global_capacities, std::vector<int64_t> shard_capacities) {
+  const int64_t num_features = (int64_t)dist_types.size();
+  bool takes_capacities = false;
+  for (const int code : dist_types) {
+    TORCH_CHECK(code == (int)DistType::kCyclic || code == (int)DistType::kHashedCyclic ||
+                    code == (int)DistType::kHashedBucket,
                 "hier_output_dist: the bucketize takes dist_type codes ", (int)DistType::kCyclic,
-                " (roundrobin) and ", (int)DistType::kHashedCyclic, " (hash_roundrobin), got ",
-                code);
+                " (roundrobin), ", (int)DistType::kHashedCyclic, " (hash_roundrobin) and ",
+                (int)DistType::kHashedBucket, " (hash_bucket), got ", code);
+    takes_capacities |= code == (int)DistType::kHashedBucket;
+  }
+  TORCH_CHECK((global_capacities.empty() || (int64_t)global_capacities.size() == num_features) &&
+                  (shard_capacities.empty() || (int64_t)shard_capacities.size() == num_features) &&
+                  (!takes_capacities || (!global_capacities.empty() && !shard_capacities.empty())),
+              "hier_output_dist: the bucketize's capacities: a global and a shard capacity per "
+              "feature, none only when no feature is hash_bucket");
+  global_capacities.resize(num_features, 0);
+  shard_capacities.resize(num_features, 0);
+  // what Config::validate checks of the op's: a rule that names no rank would write past the
+  // buckets
+  for (int64_t f = 0; f < num_features; ++f) {
+    if (dist_types[f] != (int)DistType::kHashedBucket) continue;
+    const int64_t global = global_capacities[f], shard = shard_capacities[f];
+    TORCH_CHECK(global >= 1 && shard >= 1 && global / shard + (global % shard != 0) <= world_size,
+                "hier_output_dist: the bucketize's hash_bucket capacities of feature ", f,
+                " must be positive, and name no more ranks than there are (", world_size,
+                "), got ", global, " over ", shard);
+  }
   const bool of_node = node.has_value();
   TORCH_CHECK(num_nodes.has_value() == of_node && local_size.has_value() == of_node &&
                   (!of_node ||
@@ -94,15 +118,18 @@ std::map<std::string, at::Tensor> bucketize_test(
   input.batch_size = batch_size;
   input.weights = weights;
   input.input_offsets = input_offsets;
-  const at::Tensor rules = at::tensor(dist_types, at::kInt)
-                               .pin_memory()
-                               .to(values.options().dtype(at::kInt), /*non_blocking=*/true);
+  auto on_gpu = [&](const at::Tensor &host, at::ScalarType dtype) {
+    return host.pin_memory().to(values.options().dtype(dtype), /*non_blocking=*/true);
+  };
+  OwnerRules rules;
+  rules.dist_types = on_gpu(at::tensor(dist_types, at::kInt), at::kInt);
+  rules.global_capacities = on_gpu(at::tensor(global_capacities, at::kLong), at::kLong);
+  rules.shard_capacities = on_gpu(at::tensor(shard_capacities, at::kLong), at::kLong);
   check_bucketize_input(input, rules, world_size);
   const int64_t first_owner = of_node ? *node * *local_size : 0,
                 owners = of_node ? *local_size : world_size;
   const BucketizedKeys bucketized =
       bucketize_keys(input, rules, world_size, first_owner, owners, sorted_path);
-  const int64_t num_features = (int64_t)dist_types.size();
   std::map<std::string, at::Tensor> named{
       {"keys", bucketized.keys},
       {"inv", bucketized.inv},
@@ -551,7 +578,9 @@ void bind_testing(py::module &py_module) {
                 py::arg("weights"), py::arg("dist_types"), py::arg("world_size"),
                 py::arg("input_offsets"), py::arg("num_nodes") = py::none(),
                 py::arg("local_size") = py::none(), py::arg("node") = py::none(),
-                py::arg("sorted_path") = py::none());
+                py::arg("sorted_path") = py::none(),
+                py::arg("global_capacities") = std::vector<int64_t>{},
+                py::arg("shard_capacities") = std::vector<int64_t>{});
   py_module.def("hier_output_dist_fanout", &fanout_test,
                 "Index dedup's fan-out of the bucketized rows, by name; words: the kernel's "
                 "counter and CTA ticket (int64 [2], zero), which it leaves at zero, or None",

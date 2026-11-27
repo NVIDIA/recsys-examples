@@ -17,6 +17,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
+from dynamicemb.key_ownership import hashed_shard_capacity
 from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
@@ -36,7 +37,7 @@ from torchrec.distributed.types import Awaitable
 from torchrec.fx.utils import assert_fx_safe
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-from ..scored_kjt import ScoredKeyedJaggedTensor
+from ..score.kjt import ScoredKeyedJaggedTensor
 from .hier_output_dist import DynamicEmbSequenceShardingContext, HierDist
 
 torch.fx.wrap("len")
@@ -68,6 +69,89 @@ def dist_type_codes(
     return torch.tensor(codes, dtype=torch.int32, device=device)
 
 
+def routing_param_tensors(
+    dist_types: List[str],
+    routing_params: Optional[List[Tuple[int, int, int]]],
+    num_shards: int,
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The per-feature ``(global_capacity, shard_capacity)`` as two int64 tensors:
+    :func:`routing_param_lists` on the device."""
+    global_caps, shard_caps = routing_param_lists(
+        dist_types, routing_params, num_shards
+    )
+    return (
+        torch.tensor(global_caps, dtype=torch.int64, device=device),
+        torch.tensor(shard_caps, dtype=torch.int64, device=device),
+    )
+
+
+def routing_param_lists(
+    dist_types: List[str],
+    routing_params: Optional[List[Tuple[int, int, int]]],
+    num_shards: int,
+) -> Tuple[List[int], List[int]]:
+    """The per-feature ``(global_capacity, shard_capacity)`` as two lists of ints.
+
+    The parameters of the ``hash_bucket`` rule, in the same feature order as
+    :func:`dist_type_codes`; the kernel indexes all three with the same ``t``.
+    ``routing_params`` carries, per feature, ``(global_capacity, bucket_capacity,
+    max_capacity)`` from the table's options; the shard capacity is **derived**
+    here, ``hashed_shard_capacity(global_capacity, bucket_capacity, num_shards)``,
+    the way the host rule (:func:`~dynamicemb.key_ownership.owning_shard`) derives
+    it, so the two cannot disagree. ``max_capacity`` is the capacity the table
+    was sized to at plan time; it has to equal the derived value, or the plan was
+    made for another number of shards than this distributor has, and the kernel
+    would route keys by one rule while a checkpoint load filters them by another.
+
+    Built once, when the distributor is, and validated here on the host so the
+    per-batch kernel call stays free of checks and syncs. A ``hash_bucket``
+    feature needs all three numbers positive and ``global_capacity`` a multiple
+    of ``bucket_capacity``; the derived shard capacity then satisfies
+    ``ceil(global / shard) <= num_shards``, so the kernel never names a shard that
+    does not exist. Features under another rule carry ``(0, 0)``, which the kernel
+    does not read.
+    """
+    if routing_params is None:
+        routing_params = [(0, 0, 0)] * len(dist_types)
+    if len(routing_params) != len(dist_types):
+        raise ValueError(
+            f"routing_params has {len(routing_params)} entries for "
+            f"{len(dist_types)} features"
+        )
+    global_caps: List[int] = []
+    shard_caps: List[int] = []
+    for t, (dist_type, (global_capacity, bucket_capacity, max_capacity)) in enumerate(
+        zip(dist_types, routing_params)
+    ):
+        shard_capacity = 0
+        if dist_type != "hash_bucket":
+            global_capacity = 0
+        else:
+            global_capacity = int(global_capacity)
+            bucket_capacity, max_capacity = int(bucket_capacity), int(max_capacity)
+            if global_capacity <= 0 or bucket_capacity <= 0 or max_capacity <= 0:
+                raise ValueError(
+                    f"feature {t} uses dist_type 'hash_bucket' and needs a "
+                    "positive global_capacity, bucket_capacity and max_capacity, "
+                    f"got ({global_capacity}, {bucket_capacity}, {max_capacity})"
+                )
+            shard_capacity = hashed_shard_capacity(
+                global_capacity, bucket_capacity, num_shards
+            )
+            if shard_capacity != max_capacity:
+                raise ValueError(
+                    f"feature {t}: a hash_bucket table of global_capacity "
+                    f"{global_capacity} and bucket_capacity {bucket_capacity} holds "
+                    f"{shard_capacity} rows per shard over {num_shards} shards, but "
+                    f"its max_capacity is {max_capacity}: the plan was made for "
+                    "another number of shards than this distributor has"
+                )
+        global_caps.append(global_capacity)
+        shard_caps.append(shard_capacity)
+    return global_caps, shard_caps
+
+
 def bucketize_kjt_before_all2all(
     kjt: KeyedJaggedTensor,
     num_buckets: int,
@@ -76,6 +160,8 @@ def bucketize_kjt_before_all2all(
     bucketize_pos: bool = False,
     block_bucketize_row_pos: Optional[List[torch.Tensor]] = None,
     dist_type_per_feature: Optional[torch.Tensor] = None,
+    global_capacity_per_feature: Optional[torch.Tensor] = None,
+    shard_capacity_per_feature: Optional[torch.Tensor] = None,
 ) -> Tuple[KeyedJaggedTensor, Optional[torch.Tensor]]:
     """
     Bucketizes the `values` in KeyedJaggedTensor into `num_buckets` buckets,
@@ -92,9 +178,16 @@ def bucketize_kjt_before_all2all(
         bucketize_pos (bool): output the changed position of the bucketized values or
             not.
         block_bucketize_row_pos (Optional[List[torch.Tensor]]): The offsets of shard size for each feature.
+            Only for features whose dist_type is ``continuous``: the kernel places keys by
+            these row ranges and ignores ``dist_type_per_feature``, so any other dist_type
+            raises ``ValueError`` instead of being routed by a rule it does not follow.
         dist_type_per_feature (Optional[torch.Tensor]): int32 key -> rank rule per
             feature, from :func:`dist_type_codes`, in the same feature order as
             ``block_sizes`` -- the kernel indexes both with the same ``t``.
+        global_capacity_per_feature / shard_capacity_per_feature (Optional[torch.Tensor]):
+            int64 parameters of the ``hash_bucket`` rule per feature, from
+            :func:`routing_param_tensors`. Required when any feature uses that
+            rule; left ``None`` otherwise, the kernel gets zeros it never reads.
 
     Returns:
         Tuple[KeyedJaggedTensor, Optional[torch.Tensor]]: the bucketized `KeyedJaggedTensor` and the optional permute mapping from the unbucketized values to bucketized value.
@@ -111,6 +204,50 @@ def bucketize_kjt_before_all2all(
     )
     block_sizes_new_type = _fx_wrap_tensor_to_device_dtype(block_sizes, kjt.values())
     dist_type_t = dist_type_per_feature.to(device=kjt.values().device)
+    if block_bucketize_row_pos is not None:
+        # The positions are the starts of uneven row ranges, one per rank, and
+        # the kernel then places every key by binary search in them without
+        # reading the feature's dist_type -- which is right for 'continuous'
+        # and for nothing else: a roundrobin, hash_roundrobin or hash_bucket
+        # key would be sent by its row range and stored by a rank whose rule
+        # never looks there, with nothing raising. This path is not on the
+        # distributors' call (they pass no positions), so the host sync is
+        # paid only by a caller that asked for it.
+        not_continuous = dist_type_t != DIST_TYPE_CODES["continuous"]
+        if bool(not_continuous.any().item()):
+            names = [
+                key
+                for key, bad in zip(kjt.keys(), not_continuous.tolist())
+                if bad
+            ]
+            raise ValueError(
+                "block_bucketize_row_pos places keys by row range, which only "
+                "dist_type 'continuous' means; features "
+                f"{names} use another dist_type. Pass no positions, or give "
+                "every feature dist_type 'continuous'."
+            )
+    if global_capacity_per_feature is None or shard_capacity_per_feature is None:
+        # Only a caller outside the distributors gets here (they always pass
+        # both). A hash_bucket feature cannot be routed without them, and
+        # the kernel would divide by zero rather than say so -- check on the
+        # host instead, at the price of one sync on this path.
+        if bool((dist_type_t == DIST_TYPE_CODES["hash_bucket"]).any().item()):
+            raise ValueError(
+                "a feature uses dist_type 'hash_bucket', which needs "
+                "global_capacity_per_feature and shard_capacity_per_feature "
+                "(see routing_param_tensors)"
+            )
+        zeros = torch.zeros(num_features, dtype=torch.int64, device=kjt.values().device)
+        global_capacity_per_feature = zeros
+        shard_capacity_per_feature = zeros
+    assert_fx_safe(
+        global_capacity_per_feature.numel() == num_features
+        and shard_capacity_per_feature.numel() == num_features,
+        f"Expecting routing parameters for {num_features} features, but "
+        f"{global_capacity_per_feature.numel()}/{shard_capacity_per_feature.numel()} received.",
+    )
+    global_capacity_t = global_capacity_per_feature.to(device=kjt.values().device)
+    shard_capacity_t = shard_capacity_per_feature.to(device=kjt.values().device)
 
     (
         bucketized_lengths,
@@ -130,6 +267,8 @@ def bucketize_kjt_before_all2all(
         max_B=_fx_wrap_max_B(kjt),
         block_bucketize_pos=block_bucketize_row_pos,  # each tensor should have the same dtype as kjt.lengths()
         dist_type_per_feature=dist_type_t,
+        global_capacity_per_feature=global_capacity_t,
+        shard_capacity_per_feature=shard_capacity_t,
     )
 
     return (
@@ -249,7 +388,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             ``feature_hash_sizes`` -- the kernel indexes both with the same
             ``t``, and building them together here is what keeps them aligned.
         per_key_score: the sparse features carry a score per key
-            (:class:`~dynamicemb.scored_kjt.ScoredKeyedJaggedTensor`), sent by
+            (:class:`~dynamicemb.score.kjt.ScoredKeyedJaggedTensor`), sent by
             an all2all of their own beside the keys', and handed on with the
             received keys.
         hier: the sharding's hierarchical dist (``shard/hier_output_dist.py``),
@@ -271,6 +410,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         dist_types: Optional[List[str]] = None,
         per_key_score: bool = False,
         hier: Optional[HierDist] = None,
+        routing_params: Optional[List[Tuple[int, int, int]]] = None,
     ) -> None:
         super().__init__(
             pg=pg,
@@ -284,6 +424,25 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         self.register_buffer(
             "_dist_type_tensor",
             dist_type_codes(dist_types, device=device),
+            persistent=False,
+        )
+        # The hash_bucket parameters per feature (see routing_param_tensors),
+        # validated against this distributor's fan-out, the world.
+        # The same on the host, which the hierarchical dist takes (a host sync
+        # to read them back from the device would come with every call).
+        self._global_capacity_list, self._shard_capacity_list = routing_param_lists(
+            dist_types, routing_params, self._world_size
+        )
+        self.register_buffer(
+            "_global_capacity_tensor",
+            torch.tensor(
+                self._global_capacity_list, dtype=torch.int64, device=device
+            ),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_shard_capacity_tensor",
+            torch.tensor(self._shard_capacity_list, dtype=torch.int64, device=device),
             persistent=False,
         )
         self._score_dist: Optional[KJTAllToAll] = (
@@ -361,6 +520,8 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
                 else self._need_pos
             ),
             dist_type_per_feature=self._dist_type_tensor,
+            global_capacity_per_feature=self._global_capacity_tensor,
+            shard_capacity_per_feature=self._shard_capacity_tensor,
         )
 
     def hier_setup(self, weighted: bool, index_dedup: bool) -> bool:
@@ -370,7 +531,14 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         (index dedup's frequency counters); ``index_dedup``: the sharder's
         ``use_index_dedup``. A call on that dist deduplicates the sharding's
         keys either way; tables that clip gradients need the flag."""
-        return self.hier.setup(self._dist_type_codes, weighted, index_dedup)
+        # hash_bucket's two parameters of each feature (0 for the other rules), on the host
+        return self.hier.setup(
+            self._dist_type_codes,
+            weighted,
+            index_dedup,
+            global_capacities=self._global_capacity_list,
+            shard_capacities=self._shard_capacity_list,
+        )
 
     def hier_forward(
         self,

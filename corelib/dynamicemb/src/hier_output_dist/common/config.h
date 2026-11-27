@@ -118,6 +118,10 @@ struct Config {
                                    // the lookup writes each group's rows into a slice of
                                    // lookup_rows of their own (empty: one group of every feature)
   std::vector<int> dist_types;  // [num_features]: each feature's DistType code (src/utils.h)
+  // kHashedBucket's two parameters of each feature, the rows of its whole table and of one
+  // shard of it ([num_features] each); empty when no feature takes that rule (the entries of the
+  // other features are not read)
+  std::vector<int64_t> global_capacities, shard_capacities;
   int64_t dim = 0;              // a row of the lookup output: dim values of dtype
   at::ScalarType dtype = at::kFloat;
   bool weighted = false;   // the requesters' keys carry weights, and so the owner's KJT:
@@ -140,9 +144,11 @@ struct Config {
   // Throws std::invalid_argument (Python: ValueError) for a configuration the
   // op cannot take. It builds nothing, so the ranks can compare their
   // configurations and answers before any of them builds the op. It also
-  // refuses a rule other than roundrobin and hash_roundrobin, a table whose
-  // features have different rules (check_rules), and lookup groups that are
-  // not runs of the features (an empty one, or not num_features in all).
+  // refuses a rule other than roundrobin, hash_roundrobin and hash_bucket, a
+  // hash_bucket feature without positive capacities that name only ranks of the
+  // sharding, a table whose features have different rules or capacities
+  // (check_rules), and lookup groups that are not runs of the features (an
+  // empty one, or not num_features in all).
   void validate() const;
 };
 
@@ -152,7 +158,8 @@ Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
                  const std::vector<int64_t> &lookup_groups, int64_t dim, at::ScalarType dtype,
                  bool weighted, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
                  int64_t proxy_bytes, double timeout_s, int64_t out_ctas, int64_t reduce_ctas,
-                 int64_t payload_kb);
+                 int64_t payload_kb, const std::vector<int64_t> &global_capacities = {},
+                 const std::vector<int64_t> &shard_capacities = {});
 
 // Why the op does not apply to a sharding of these ranks, features and rows
 // (ranks that are not whole nodes, int32 bucket feature numbers, rows the

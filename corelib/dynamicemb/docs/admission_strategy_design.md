@@ -170,6 +170,9 @@ class MultiTableAdmitter(abc.ABC):
         ``frequencies`` is how often each key occurred in *this batch*, where
         the module counts occurrences at all; None means treat each key as one.
         An increment, not a running total -- any total is the admitter's own.
+        It is also where an answer goes back: an admitter that keeps a running
+        total overwrites it in place with each key's total, which an LFU table
+        takes as the key's score.
         """
 
     def state(self) -> Optional[Counter]:
@@ -471,6 +474,7 @@ signature.
 | `AdmissionStrategy.initialize_non_admitted_embeddings` | `MultiTableAdmitter.non_admitted_initializer` | removed |
 | `AdmissionStrategy.admit` | `MultiTableAdmitter.admit` | a configuration no longer decides; `create_admitter` builds what does |
 | `admit(keys, frequencies)` | `admit(keys, table_ids, frequencies=None)` | `frequencies` is now a per-batch increment, not a running total |
+| `frequencies` of `admit` | same signature | `MultiTableFrequencyAdmitter` writes each key's running total over it, and an LFU table takes that as the admitted key's score, so it starts from all its occurrences instead of the admitting batch's alone. An admitter that keeps no count leaves it as it is |
 
 `admission_counter` keeps working: `__post_init__` warns, then folds it into a
 *copy* of the strategy. A copy because one strategy is commonly handed to every

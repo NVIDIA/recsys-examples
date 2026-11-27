@@ -59,6 +59,7 @@ from dynamicemb.optimizer import (
     RowWiseAdaGradDynamicEmbeddingOptimizer,
     get_optimizer_ckpt_state_dim,
 )
+from dynamicemb.state.storage_layout import CachePolicy, StorageLayout, StorageTier
 from dynamicemb.types import KEY_TYPE, CopyMode
 from dynamicemb.utils import FP8_STORAGE_DTYPE
 from fbgemm_gpu.split_embedding_configs import SparseType
@@ -981,7 +982,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        score_input: Optional[torch.Tensor] = None,
         *,
         find_debug_context: Optional[str] = None,
     ) -> Tuple[
@@ -1008,11 +1009,23 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             missing_scores,
             founds,
             output_scores,
-        ) = self.find_impl(
-            unique_keys, table_ids, unique_vals, lfu_accumulated_frequency
-        )
+        ) = self.find_impl(unique_keys, table_ids, unique_vals, score_input)
 
         h_table_ids = table_ids.cpu()
+        if (
+            score_input is not None
+            and self.options[0].score_strategy == DynamicEmbScoreStrategy.LFU
+        ):
+            # An LFU score accumulates: what a key is found with is the count
+            # the store kept for it plus this batch's, and the store keeps that.
+            h_keys = unique_keys.cpu()
+            h_freq = score_input.cpu()
+            h_founds = founds.cpu()
+            for i in h_founds.nonzero().flatten().tolist():
+                composite_key = (h_table_ids[i].item(), h_keys[i].item())
+                total = self.scores.get(composite_key, 0) + h_freq[i].item()
+                self.scores[composite_key] = total
+                output_scores[i] = total
         missing_table_ids_list = []
         for idx in missing_indices.cpu().tolist():
             missing_table_ids_list.append(h_table_ids[idx].item())
@@ -1074,12 +1087,15 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         opt_file_path: Optional[str],
         include_optim: bool = False,
         include_meta: bool = False,
+        current_score: Optional[int] = None,
         timestamp: int = 0,
     ) -> None:
         if include_meta:
             meta_data = {}
             meta_data.update(self.optimizer.get_opt_args())
             meta_data["dist_type"] = self.options[table_id].dist_type
+            if current_score is not None:
+                meta_data["step_score"] = current_score
             with open(meta_file_path, "w") as f:
                 json.dump(meta_data, f)
 
@@ -1126,10 +1142,12 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         # which a table-row-wise table does not share.
         shard_index: Optional[int] = None,
         num_shards: Optional[int] = None,
-    ) -> None:
+    ) -> Optional[int]:
+        loaded_score = None
         if meta_file_path and os.path.exists(meta_file_path):
             with open(meta_file_path, "r") as f:
                 meta_data = json.load(f)
+            loaded_score = meta_data.get("step_score", None)
             opt_type = meta_data.get("opt_type", None)
             if (
                 opt_type
@@ -1255,6 +1273,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             fscore.close()
         if fopt_states:
             fopt_states.close()
+        return loaded_score
 
     def export_keys_values(
         self,
@@ -1366,22 +1385,22 @@ def init_embedding_tables(stbe, bdet):
         table_ids = torch.full(
             (num_emb,), table_idx, dtype=torch.int64, device=split.device
         )
-        if isinstance(storage, DynamicEmbStorage):
-            max_emb_dim = storage.max_embedding_dim()
-            max_value_dim = storage.max_value_dim()
-            values = torch.zeros(
-                num_emb, max_value_dim, dtype=split.dtype, device=split.device
+        # Any Storage takes the rows: ours, or the PS that is the only tier below
+        # a NINE cache.
+        max_emb_dim = storage.max_embedding_dim()
+        max_value_dim = storage.max_value_dim()
+        values = torch.zeros(
+            num_emb, max_value_dim, dtype=split.dtype, device=split.device
+        )
+        values[:, :emb_dim] = split
+        if opt_state_dim > 0:
+            optimizer.reset_optimizer_states(
+                values[:, max_emb_dim : max_emb_dim + opt_state_dim],
+                emb_dims=emb_dim,
             )
-            values[:, :emb_dim] = split
-            if opt_state_dim > 0:
-                optimizer.reset_optimizer_states(
-                    values[:, max_emb_dim : max_emb_dim + opt_state_dim],
-                    emb_dims=emb_dim,
-                )
+        if isinstance(storage, DynamicEmbStorage):
             storage.set_score(1)
-            storage.insert(indices, table_ids, values)
-        else:
-            raise ValueError("Not support table type")
+        storage.insert(indices, table_ids, values)
 
 
 @pytest.mark.parametrize(
@@ -1527,10 +1546,14 @@ def test_forward_train_eval(
         assert embs_train.shape == (batch_size, total_D)
 
     if PS is not None:
-        # Evaluation does not read the PS, so it refuses to run with one.
+        # No ddr budget: the PS is the cache's only backing (NINE), so there is
+        # no storage of ours, and evaluation reads cache and PS.
+        assert bdebt._storage_layout.cache_policy == CachePolicy.NINE
+        assert bdebt._external_storage is None
+        assert isinstance(bdebt._storage, PyDictStorage)
         bdebt.eval()
-        with pytest.raises(RuntimeError, match="external_storage"):
-            bdebt(indices, offsets)
+        with torch.no_grad():
+            assert bdebt(indices, offsets).shape == embs_train.shape
         if deterministic:
             del os.environ["DEMB_DETERMINISM_MODE"]
         return
@@ -1635,8 +1658,24 @@ For torchrec's adam optimizer, it will increment the optimizer_step in every for
     ],
 )
 @pytest.mark.parametrize("deterministic", [True, False])
-@pytest.mark.parametrize("PS", [None, PyDictStorage])
-def test_backward(opt_type, opt_params, caching, pooling_mode, dims, deterministic, PS):
+@pytest.mark.parametrize(
+    "PS, local_ddr_for_values",
+    [
+        (None, 0),  # cache ⊂ DynamicEmbStorage
+        (PyDictStorage, 0),  # NINE: cache + PS
+        (PyDictStorage, 128 * 1024),  # cache ⊂ DynamicEmbStorage ⊂ PS
+    ],
+)
+def test_backward(
+    opt_type,
+    opt_params,
+    caching,
+    pooling_mode,
+    dims,
+    deterministic,
+    PS,
+    local_ddr_for_values,
+):
     print(f"step in test_backward , opt_type = {opt_type} opt_params = {opt_params}")
 
     if deterministic:
@@ -1666,8 +1705,9 @@ def test_backward(opt_type, opt_params, caching, pooling_mode, dims, determinist
             score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
             caching=caching,
             # HBM-only mode ignores external_storage; a PS needs a cache smaller
-            # than the table so the three-tier path is the one under test.
+            # than the table so a cache path is the one under test.
             local_hbm_for_values=64 * 1024 if (caching and PS) else 1024**3,
+            local_ddr_for_values=local_ddr_for_values,
             external_storage=PS,
         )
         dyn_emb_table_options_list.append(dyn_emb_table_options)
@@ -1791,8 +1831,17 @@ def _unique_table_keys(indices, offsets, feature_table_map):
     ],
 )
 @pytest.mark.parametrize("deterministic", [True, False])
-@pytest.mark.parametrize("PS", [None, PyDictStorage])
-def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
+@pytest.mark.parametrize(
+    "PS, local_ddr_for_values",
+    [
+        (None, 0),  # cache ⊂ DynamicEmbStorage
+        (PyDictStorage, 0),  # NINE: cache + PS
+        (PyDictStorage, 128 * 1024),  # cache ⊂ DynamicEmbStorage ⊂ PS
+    ],
+)
+def test_prefetch_flush_in_cache(
+    opt_type, opt_params, deterministic, PS, local_ddr_for_values
+):
     print(
         f"step in test_prefetch_flush , opt_type = {opt_type} opt_params = {opt_params}"
     )
@@ -1821,8 +1870,9 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
             score_strategy=DynamicEmbScoreStrategy.STEP,
             caching=True,
             # HBM-only mode ignores external_storage; a PS needs a cache smaller
-            # than the table so the three-tier path is the one under test.
+            # than the table so a cache path is the one under test.
             local_hbm_for_values=64 * 1024 if PS else 1024**3,
+            local_ddr_for_values=local_ddr_for_values,
             external_storage=PS,
         )
         dyn_emb_table_options_list.append(dyn_emb_table_options)
@@ -2679,7 +2729,11 @@ def test_multi_table_dump_load_preserves_dist_type(dist_type, tmp_path):
     torch.testing.assert_close(vals0_src[idx0_src], vals0_dst[idx0_dst])
 
 
-def test_multi_table_load_rejects_dist_type_mismatch(tmp_path):
+def test_multi_table_load_dist_type_mismatch_warns_and_repartitions(tmp_path):
+    """A checkpoint of another key -> rank rule still loads: ownership is
+    recomputed from the key by the table's rule, and shard 0 warns that rows may
+    be lost where a bucket overflows. Only ``continuous`` is refused
+    (test_global_bucket_layout.py::test_continuous_checkpoint_is_refused)."""
     import torch.distributed as dist
 
     assert torch.cuda.is_available()
@@ -2732,7 +2786,7 @@ def test_multi_table_load_rejects_dist_type_mismatch(tmp_path):
         device_id,
         dist_type="hash_roundrobin",
     )
-    with pytest.raises(ValueError, match="Input dist_type mismatch"):
+    with pytest.warns(UserWarning, match="differs from the table's"):
         bdeb_dst.load(save_dir)
 
 
@@ -4095,13 +4149,19 @@ def test_fill_tables(
         )
 
 
-def test_caching_ps_spills_storage_evictions():
-    """Keys evicted from the score-bearing storage land in the PS and come back
-    from it unchanged when they are looked up again."""
+@pytest.mark.parametrize("nine", [False, True], ids=["inclusive", "nine"])
+def test_caching_ps_takes_the_evictions(nine):
+    """What is evicted lands in the PS and comes back unchanged when looked up
+    again.
+
+    * inclusive (a ddr budget): cache ⊂ DynamicEmbStorage ⊂ PS, so it is the
+      score-bearing storage whose evictions spill to the PS.
+    * NINE (no ddr budget): the PS is the cache's only backing, so the cache's
+      own evictions land in it.
+    """
     device = torch.device("cuda:0")
-    dim = 8
     options = DynamicEmbTableOptions(
-        dim=dim,
+        dim=8,
         max_capacity=256,
         index_type=torch.int64,
         embedding_dtype=torch.float32,
@@ -4109,6 +4169,7 @@ def test_caching_ps_spills_storage_evictions():
         score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
         caching=True,
         local_hbm_for_values=1024,
+        local_ddr_for_values=0 if nine else 2048,
         external_storage=PyDictStorage,
     )
     bdebt = BatchedDynamicEmbeddingTablesV2(
@@ -4120,13 +4181,31 @@ def test_caching_ps_spills_storage_evictions():
         use_index_dedup=True,
         learning_rate=0.1,
     )
-    ps = bdebt._external_storage
+    if nine:
+        assert bdebt._storage_layout == StorageLayout(
+            StorageTier.HBM | StorageTier.EXTERNAL, CachePolicy.NINE
+        )
+        # The PS is the storage; there is no tier of ours between it and the
+        # cache, and the cache keeps the table's own strategy.
+        assert bdebt._external_storage is None
+        ps = bdebt._storage
+        assert bdebt._cache._state.score_policy.name == "timestamp"
+    else:
+        assert bdebt._storage_layout == StorageLayout(
+            StorageTier.HBM | StorageTier.DDR | StorageTier.EXTERNAL,
+            CachePolicy.INCLUSIVE,
+        )
+        ps = bdebt._external_storage
     assert isinstance(ps, PyDictStorage)
 
     def lookup(keys):
         keys = torch.tensor(keys, dtype=torch.int64, device=device)
         offsets = torch.tensor([0, keys.numel()], dtype=torch.int64, device=device)
-        return bdebt(keys, offsets).detach().clone()
+        # Under no_grad the batch's pins on the cache are released after the
+        # gather: a grad-mode forward keeps them until a backward that never
+        # comes here, and a pinned key is never evicted.
+        with torch.no_grad():
+            return bdebt(keys, offsets).detach().clone()
 
     first = list(range(32))
     # One SGD step moves the values off their initial draw, so what comes back
@@ -4135,13 +4214,237 @@ def test_caching_ps_spills_storage_evictions():
     offsets = torch.tensor([0, keys.numel()], dtype=torch.int64, device=device)
     bdebt(keys, offsets).mean().backward()
     ref = lookup(first)
-    # Far more keys than the storage can hold: the first batch must be pushed out.
+    # Far more keys than the evicting tier can hold: the first batch is pushed out.
     for start in range(1000, 1000 + 32 * 40, 32):
         lookup(list(range(start, start + 32)))
     torch.cuda.synchronize()
 
-    assert ps.size() > 0, "storage evictions never reached the PS"
+    assert ps.size() > 0, "evictions never reached the PS"
     torch.testing.assert_close(lookup(first), ref)
+    if nine:
+        # Flushing writes the rest of the cache down: afterwards the PS has
+        # every key.
+        bdebt.flush()
+        assert ps.size() >= 32
+
+
+def test_caching_nine_ps_lfu_admission_carries_the_accumulated_count():
+    """NINE with an LFU table and frequency admission: a key enters the cache
+    with the count it waited with, and a key the PS keeps comes back with the
+    count the PS kept plus this batch's -- not the frequency of the batch alone."""
+    from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
+
+    device = torch.device("cuda:0")
+    threshold = 3
+    options = DynamicEmbTableOptions(
+        dim=8,
+        max_capacity=256,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=0,
+        score_strategy=DynamicEmbScoreStrategy.LFU,
+        caching=True,
+        local_hbm_for_values=1024,
+        external_storage=PyDictStorage,
+        admit_strategy=FrequencyAdmissionStrategy(
+            threshold=threshold, counter=KVCounter(capacity=4096)
+        ),
+    )
+    bdebt = BatchedDynamicEmbeddingTablesV2(
+        table_names=["t0"],
+        table_options=[options],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=EmbOptimType.SGD,
+        use_index_dedup=True,
+        learning_rate=0.1,
+    )
+    assert bdebt._storage_layout.cache_policy == CachePolicy.NINE
+    ps = bdebt._storage
+    assert isinstance(ps, PyDictStorage)
+
+    def lookup(keys):
+        keys = torch.tensor(keys, dtype=torch.int64, device=device)
+        offsets = torch.tensor([0, keys.numel()], dtype=torch.int64, device=device)
+        out = bdebt(keys, offsets)
+        out.mean().backward()
+        torch.cuda.synchronize()
+
+    def score(key):
+        return ps.scores.get((0, key))
+
+    hot = 7
+    # Seen once: waiting in the counter, not admitted.
+    lookup([hot])
+    # Seen twice more, 3 in all: admitted, with the whole count it waited with
+    # (this batch alone would be 2).
+    lookup([hot, hot])
+    bdebt.flush()
+    assert score(hot) == 3, f"admitted with {score(hot)}, expected 3"
+
+    # Keys seen 4 times each, in one batch, outrank it, so a full bucket gives up
+    # the hot key first and the PS takes it with its count.
+    for start in range(1000, 1000 + 32 * 40, 32):
+        lookup([k for k in range(start, start + 32) for _ in range(4)])
+    assert (0, hot) in ps.dict, "the hot key was never evicted to the PS"
+    assert score(hot) == 3
+
+    # Back from the PS: its kept 3 plus this batch's 3. The batch alone (3) would
+    # rank it below the keys it has to displace.
+    lookup([hot, hot, hot])
+    bdebt.flush()
+    assert score(hot) == 6, f"back with {score(hot)}, expected 3 + 3"
+
+
+def test_caching_nine_ps_checkpoint_round_trip(tmp_path):
+    """NINE has no storage of ours, so the module's dump and load go to the PS
+    itself: what a trained table dumped comes back from a fresh one, whose cache
+    starts empty and reads the PS."""
+    device = torch.device("cuda:0")
+
+    def build():
+        options = DynamicEmbTableOptions(
+            dim=8,
+            max_capacity=256,
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=0,
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+            caching=True,
+            local_hbm_for_values=1024,
+            external_storage=PyDictStorage,
+        )
+        return BatchedDynamicEmbeddingTablesV2(
+            table_names=["t0"],
+            table_options=[options],
+            feature_table_map=[0],
+            pooling_mode=DynamicEmbPoolingMode.NONE,
+            optimizer=EmbOptimType.SGD,
+            use_index_dedup=True,
+            learning_rate=0.1,
+        )
+
+    keys = torch.arange(32, dtype=torch.int64, device=device)
+    offsets = torch.tensor([0, keys.numel()], dtype=torch.int64, device=device)
+
+    src = build()
+    assert src._storage_layout.cache_policy == CachePolicy.NINE
+    # One SGD step moves the rows off their initial draw, so a loaded row that
+    # was re-initialized instead would differ.
+    src(keys, offsets).mean().backward()
+    torch.cuda.synchronize()
+    src.eval()
+    with torch.no_grad():
+        ref = src(keys, offsets).detach().clone()
+
+    src.dump(str(tmp_path))
+
+    dst = build()
+    assert dst._storage.size() == 0
+    dst.load(str(tmp_path))
+    assert dst._storage.size() >= keys.numel()
+    dst.eval()
+    with torch.no_grad():
+        torch.testing.assert_close(dst(keys, offsets), ref)
+
+
+def test_caching_ps_below_storage_is_not_evaluated():
+    """With a ddr budget the PS sits below our storage and evaluation would not
+    read it, so it refuses to run (NINE, where the PS is read, evaluates)."""
+    options = DynamicEmbTableOptions(
+        dim=8,
+        max_capacity=256,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=0,
+        score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+        caching=True,
+        local_hbm_for_values=1024,
+        local_ddr_for_values=2048,
+        external_storage=PyDictStorage,
+    )
+    bdebt = BatchedDynamicEmbeddingTablesV2(
+        table_names=["t0"],
+        table_options=[options],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=EmbOptimType.SGD,
+        use_index_dedup=True,
+        learning_rate=0.1,
+    )
+    keys = torch.arange(8, dtype=torch.int64, device="cuda:0")
+    offsets = torch.tensor([0, 8], dtype=torch.int64, device="cuda:0")
+    bdebt.eval()
+    with pytest.raises(RuntimeError, match="external_storage"):
+        bdebt(keys, offsets)
+
+
+def test_ddr_budget_without_ps_is_ignored_with_a_warning():
+    """Without a PS our storage holds the whole table: a ddr budget means nothing."""
+    options = DynamicEmbTableOptions(
+        dim=8,
+        max_capacity=256,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=0,
+        score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+        caching=True,
+        local_hbm_for_values=1024,
+        local_ddr_for_values=2048,
+        global_ddr_for_values=2048,
+    )
+    with pytest.warns(UserWarning, match="global_ddr_for_values is ignored"):
+        bdebt = BatchedDynamicEmbeddingTablesV2(
+            table_names=["t0"],
+            table_options=[options],
+            feature_table_map=[0],
+            pooling_mode=DynamicEmbPoolingMode.NONE,
+            optimizer=EmbOptimType.SGD,
+            use_index_dedup=True,
+            learning_rate=0.1,
+        )
+    assert bdebt._storage_layout.cache_policy == CachePolicy.INCLUSIVE
+    assert bdebt._storage_layout == StorageLayout(
+        StorageTier.HBM | StorageTier.DDR, CachePolicy.INCLUSIVE
+    )
+    assert bdebt._external_storage is None
+    assert bdebt._storage._state.options_list[0].max_capacity == 256
+
+
+@pytest.mark.parametrize("local_ddr_for_values", [0, 128 * 1024])
+def test_caching_ps_compound_score_needs_a_ddr_budget(local_ddr_for_values):
+    """The NINE path (a PS and no DDR budget) keeps one score word per key, so a
+    compound score_strategy is refused there; with a DDR budget the storage owns
+    the scores and the compound strategy is accepted."""
+    options = DynamicEmbTableOptions(
+        dim=8,
+        max_capacity=256,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=0,
+        score_strategy=(DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU),
+        caching=True,
+        local_hbm_for_values=1024,
+        local_ddr_for_values=local_ddr_for_values,
+        external_storage=PyDictStorage,
+    )
+
+    def build():
+        return BatchedDynamicEmbeddingTablesV2(
+            table_names=["t0"],
+            table_options=[options],
+            feature_table_map=[0],
+            pooling_mode=DynamicEmbPoolingMode.NONE,
+            optimizer=EmbOptimType.SGD,
+            use_index_dedup=True,
+            learning_rate=0.1,
+        )
+
+    if local_ddr_for_values == 0:
+        with pytest.raises(NotImplementedError, match="compound score_strategy"):
+            build()
+    else:
+        assert build()._storage_layout.cache_policy == CachePolicy.INCLUSIVE
 
 
 def test_caching_ps_rejects_no_eviction():

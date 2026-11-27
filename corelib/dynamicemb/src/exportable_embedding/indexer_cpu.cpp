@@ -38,18 +38,19 @@ struct Buckets {
   at::Tensor storage;
   at::Tensor offsets;
   int64_t width;
+  uint8_t* data = storage.data_ptr<uint8_t>();
+  const int64_t* bounds = offsets.data_ptr<int64_t>();
 
   int64_t& key(int64_t slot) const {
-    auto* base = storage.data_ptr<uint8_t>() + (slot / width) * 17 * width;
+    auto* base = data + (slot / width) * 17 * width;
     return reinterpret_cast<int64_t*>(base)[slot % width];
   }
   int64_t& value(int64_t slot) const {
-    auto* base = storage.data_ptr<uint8_t>() + (slot / width) * 17 * width;
+    auto* base = data + (slot / width) * 17 * width;
     return reinterpret_cast<int64_t*>(base + 9 * width)[slot % width];
   }
   // Return an existing key, or an empty slot; -1 means the bucket is full.
   int64_t find(int64_t table, int64_t id) const {
-    auto* bounds = offsets.data_ptr<int64_t>();
     const auto h = hash_key(id);
     const auto capacity = (bounds[table + 1] - bounds[table]) * width;
     const auto base = bounds[table] * width + (h % capacity / width) * width;
@@ -57,19 +58,21 @@ struct Buckets {
     // matches before empties. Fill from that aligned start, so an earlier
     // empty word cannot hide a key from the CUDA reader.
     const auto start = (h % width / 16) * 16;
+    const auto* keys = reinterpret_cast<const int64_t*>(data + (base / width) * 17 * width);
     int64_t empty = -1;
+    auto index = start;
     for (int64_t step = 0; step < width; ++step) {
-      auto slot = base + (start + step) % width;
-      if (key(slot) == id) return slot;
-      if (key(slot) == -1 && empty < 0) empty = slot;
+      const auto current = keys[index];
+      if (current == id) return base + index;
+      if (current == -1 && empty < 0) empty = base + index;
+      if (++index == width) index = 0;
     }
     return empty;
   }
   void put(int64_t slot, int64_t id, int64_t row) {
     key(slot) = id;
     value(slot) = row;
-    storage.data_ptr<uint8_t>()[(slot / width) * 17 * width +
-                               8 * width + slot % width] =
+    data[(slot / width) * 17 * width + 8 * width + slot % width] =
         static_cast<uint8_t>(hash_key(id) >> 32);
   }
 };
@@ -202,14 +205,19 @@ at::Tensor linear_hash_lookup_cpu(
   TORCH_CHECK(ids.numel() == tables.numel() && offsets.numel() == misses.numel() + 1,
               "CPU hash lookup shape mismatch");
   auto rows = at::empty_like(ids);
+  const auto* table_ids = tables.data_ptr<int64_t>();
+  const auto* key_ids = ids.data_ptr<int64_t>();
+  const auto* miss_rows = misses.data_ptr<int64_t>();
+  auto* row_out = rows.data_ptr<int64_t>();
+  const auto table_count = misses.numel();
   at::parallel_for(0, ids.numel(), 1024, [&](int64_t begin, int64_t end) {
     for (auto i = begin; i < end; ++i) {
-      auto table = tables.data_ptr<int64_t>()[i];
-      auto id = ids.data_ptr<int64_t>()[i];
-      TORCH_CHECK(table >= 0 && table < misses.numel(), "Invalid lookup table ID");
+      auto table = table_ids[i];
+      auto id = key_ids[i];
+      TORCH_CHECK(table >= 0 && table < table_count, "Invalid lookup table ID");
       auto slot = reserved_key(id) ? -1 : buckets.find(table, id);
-      rows.data_ptr<int64_t>()[i] = slot >= 0 && buckets.key(slot) == id
-          ? buckets.value(slot) : misses.data_ptr<int64_t>()[table];
+      row_out[i] = slot >= 0 && buckets.key(slot) == id
+          ? buckets.value(slot) : miss_rows[table];
     }
   });
   return rows;

@@ -48,7 +48,11 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
     seed: int = 42,
     caching: bool = False,
     key_dtype: torch.dtype = torch.int64,
-) -> Tuple[List[KeyedJaggedTensor], Dict[str, Dict[int, int]]]:
+) -> Tuple[
+    List[KeyedJaggedTensor],
+    Dict[str, Dict[int, int]],
+    List[Dict[str, Dict[int, int]]],
+]:
     """
     Generate deterministic sparse features and track frequency for each embedding table.
 
@@ -60,6 +64,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
     Returns:
         kjts: List of KeyedJaggedTensor for each iteration
         table_frequency_counters: Dict mapping table_name -> {key: frequency}
+        iteration_frequencies: The same counts, one dict per iteration
     """
     random.seed(seed)
     torch.manual_seed(seed)
@@ -69,6 +74,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
     batch_size_per_rank = batch_size // world_size
     kjts = []
     table_frequency_counters = {}
+    iteration_frequencies = []
 
     # Initialize frequency counters for each table
     for embedding_collection_id in range(num_embedding_collections):
@@ -80,6 +86,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
         cur_indices = []
         cur_lengths = []
         keys = []
+        this_iteration = defaultdict(lambda: defaultdict(int))
 
         for embedding_collection_id in range(num_embedding_collections):
             for embedding_id, num_embedding in enumerate(num_embeddings):
@@ -104,6 +111,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
                     # Track frequency for all generated indices
                     for idx in indices:
                         table_frequency_counters[embedding_name][idx] += 1
+                        this_iteration[embedding_name][idx] += 1
 
                     if sample_rank == rank:
                         cur_indices.extend(indices)
@@ -111,6 +119,9 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
 
                 keys.append(feature_name)
 
+        iteration_frequencies.append(
+            {name: dict(counts) for name, counts in this_iteration.items()}
+        )
         kjts.append(
             KeyedJaggedTensor.from_lengths_sync(
                 keys=keys,
@@ -125,19 +136,22 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
             table_frequency_counters[table_name]
         )
 
-    return kjts, table_frequency_counters
+    return kjts, table_frequency_counters, iteration_frequencies
 
 
-def get_table_keys(
+def get_table_scores(
     model: nn.Module,
     table_names: Optional[Dict[str, List[str]]] = None,
     pg: Optional[dist.ProcessGroup] = None,
-) -> Dict[str, Set[int]]:
+) -> Dict[str, Dict[int, int]]:
     """
-    Get keys from dynamic embedding tables directly (without disk I/O).
+    Get keys and their scores from dynamic embedding tables directly (without disk I/O).
+
+    For the compound (TIMESTAMP, LFU) strategy a key exports two score words;
+    the frequency is the last one, and that is the score returned.
 
     Returns:
-        Dict[table_name, Set[key]]: Keys stored in each table
+        Dict[table_name, Dict[key, score]]: What each table stores
     """
 
     if torch.cuda.is_available():
@@ -147,7 +161,7 @@ def get_table_keys(
 
     batch_size = 65536
 
-    all_table_keys = {}
+    all_table_scores = {}
 
     for _, collection_name, sharded_module in find_sharded_modules(model, ""):
         dynamic_emb_modules = get_dynamic_emb_module(sharded_module)
@@ -162,22 +176,24 @@ def get_table_keys(
                 ):
                     continue
 
-                table_keys = set()
+                table_scores = {}
 
-                for keys, _, _, _ in storage.export_keys_values(
+                for keys, _, _, scores in storage.export_keys_values(
                     device, batch_size, table_id=table_idx
                 ):
-                    for key in keys:
-                        table_keys.add(int(key))
+                    if scores.dim() == 2:
+                        scores = scores[:, -1]
+                    for key, score in zip(keys, scores):
+                        table_scores[int(key)] = int(score)
 
-                all_table_keys[table_name] = table_keys
+                all_table_scores[table_name] = table_scores
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
     dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
 
-    return all_table_keys
+    return all_table_scores
 
 
 def validate_admission_keys(
@@ -257,6 +273,56 @@ def validate_admission_keys(
         )
 
 
+def expected_admitted_scores(
+    iteration_frequencies: List[Dict[str, Dict[int, int]]],
+    threshold: int,
+) -> Dict[str, Dict[int, int]]:
+    """
+    The LFU score each key should hold after every iteration ran.
+
+    A key waits in the counter until its occurrences reach the threshold. The
+    iteration that admits it gives it a score: the whole count it waited with,
+    that iteration's occurrences included. Every later occurrence adds one, like
+    any LFU key.
+    """
+    expected: Dict[str, Dict[int, int]] = defaultdict(dict)
+    waiting: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
+    for counts in iteration_frequencies:
+        for table_name, table_counts in counts.items():
+            scores = expected[table_name]
+            for key, frequency in table_counts.items():
+                if key in scores:
+                    scores[key] += frequency
+                    continue
+                waiting[table_name][key] += frequency
+                if waiting[table_name][key] >= threshold:
+                    scores[key] = waiting[table_name][key]
+    return dict(expected)
+
+
+def validate_admitted_scores(
+    expected: Dict[str, Dict[int, int]],
+    actual: Dict[str, Dict[int, int]],
+):
+    """Validate that every key a table stores holds the score its history gives it."""
+    for table_name, table_scores in actual.items():
+        mismatched = [
+            (key, score, expected[table_name][key])
+            for key, score in table_scores.items()
+            if score != expected[table_name][key]
+        ]
+        if mismatched:
+            examples = ", ".join(
+                f"key {key}: score {score}, expected {want}"
+                for key, score, want in mismatched[:5]
+            )
+            raise AssertionError(
+                f"Table {table_name}: {len(mismatched)} of {len(table_scores)} "
+                f"admitted keys hold the wrong score, e.g. {examples}"
+            )
+        print(f"✓ Table {table_name}: {len(table_scores)} admitted keys' scores match")
+
+
 def validate_non_admitted_embedding_values(
     output: torch.Tensor,
     expected_value: float,
@@ -319,9 +385,9 @@ def validate_non_admitted_embedding_values(
 )
 @click.option(
     "--score-strategy",
-    type=click.Choice(["timestamp", "lfu", "step"]),
+    type=click.Choice(["timestamp", "lfu", "step", "lru_lfu"]),
     default="timestamp",
-    help="Score strategy",
+    help="Score strategy. lru_lfu is the compound (TIMESTAMP, LFU).",
 )
 @click.option(
     "--global-hbm-budget-scale",
@@ -329,8 +395,8 @@ def validate_non_admitted_embedding_values(
     default=1.0,
     help=(
         "Scale DynamicEmb HBM byte budget vs full table (after planner: per-rank "
-        "local_hbm). Values < 1.0 force HybridStorage and prefetch StorageMode "
-        "DEFAULT (_generic_forward_path), not HBM_DIRECT."
+        "local_hbm). Values < 1.0 force HybridStorage and the generic "
+        "prefetch path (_generic_forward_path), not the HBM-direct one."
     ),
 )
 @click.option(
@@ -396,7 +462,7 @@ def test_admission_strategy_validation(
     This test validates that the tables store exactly the keys with frequency >= threshold.
     It supports:
     - Storage-only (default): HBM-only DynamicEmbStorage when budget fits (HBM_DIRECT)
-    - StorageMode DEFAULT: pass --global-hbm-budget-scale < 1 to use HybridStorage
+    - the generic prefetch path: pass --global-hbm-budget-scale < 1 to use HybridStorage
     - Cache + Storage (--caching): admission through cache to storage
     """
 
@@ -434,7 +500,9 @@ def test_admission_strategy_validation(
         print(f"  - Caching: DISABLED")
     print(f"  - Global HBM budget scale: {global_hbm_budget_scale}")
     if not caching and global_hbm_budget_scale < 1.0:
-        print(f"  - Storage path: expect HybridStorage (prefetch StorageMode DEFAULT)")
+        print(
+            f"  - Storage path: expect HybridStorage (prefetch the generic prefetch path)"
+        )
 
     # Create admission strategy. Without an initializer of its own, a rejected
     # key's row is left to the table initializer.
@@ -487,6 +555,7 @@ def test_admission_strategy_validation(
     (
         kjts,
         expected_frequencies,
+        iteration_frequencies,
     ) = generate_deterministic_sparse_features_with_frequency_tracking(
         num_embedding_collections=num_embedding_collections,
         num_embeddings=num_embeddings,
@@ -520,13 +589,20 @@ def test_admission_strategy_validation(
         torch.cuda.synchronize()
 
     # Extract actual keys stored in tables
-    actual_keys = get_table_keys(model)
+    actual_scores = get_table_scores(model)
+    actual_keys = {name: set(scores) for name, scores in actual_scores.items()}
 
     torch.cuda.synchronize()
 
     # Validate admission logic
     print(f"\nValidating admission with threshold={threshold}...")
     validate_admission_keys(expected_frequencies, actual_keys, threshold, dist_type)
+
+    if score_strategy in ("lfu", "lru_lfu"):
+        validate_admitted_scores(
+            expected_admitted_scores(iteration_frequencies, threshold),
+            actual_scores,
+        )
 
     if expect_all_rejected:
         for table_name, keys in actual_keys.items():
@@ -641,6 +717,36 @@ def _build_cases():
         if storage == "cache":
             options["threshold"] = 2
         cases[f"int32-keys-{storage}"] = {"gpus": (1, 8), "options": options}
+
+    for storage, storage_options in STORAGE_MODES.items():
+        for score_strategy in ("lfu", "lru_lfu"):
+            options = {
+                **_FOUR_TABLES,
+                **storage_options,
+                "optimizer_type": "sgd",
+                "score_strategy": score_strategy,
+            }
+            if storage == "cache":
+                options["threshold"] = 2
+            cases[f"admitted-score-{storage}-{score_strategy}"] = {
+                "gpus": (1, 8),
+                "options": options,
+            }
+
+    cases["admitted-score-tiny-cache"] = {
+        "gpus": (1,),
+        "options": {
+            **_ONE_TABLE,
+            "num_embeddings": "20000",
+            "multi_hot_sizes": "5",
+            "batch_size": 256,
+            "num_iterations": 25,
+            "caching": True,
+            "cache_capacity_ratio": 0.05,
+            "threshold": 2,
+            "score_strategy": "lfu",
+        },
+    }
 
     # A threshold no key can reach, so every value the forward returns comes
     # from whichever initializer owns the rows admission rejects.

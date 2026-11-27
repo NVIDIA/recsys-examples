@@ -31,6 +31,7 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.key_value_table import DynamicEmbStorage, _expand_tables_impl
 from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
+from dynamicemb.score.jit import register_score_function
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import InsertResult, ScorePolicy
 
@@ -380,7 +381,7 @@ def test_lru_lfu_storage_rehash_preserves_frequency(current_device):
 # ---------------------------------------------------------------------------
 # Custom score_function eviction (numba JIT + nvJitLink). Decay functions are
 # written in the *logical* (tuple) order and remapped to physical device order by
-# score_jit; the functions below use the (TIMESTAMP, LFU) order (scores[0]=ts,
+# score.jit; the functions below use the (TIMESTAMP, LFU) order (scores[0]=ts,
 # scores[1]=freq), which matches the physical layout, plus one written for the
 # (LFU, TIMESTAMP) order to exercise the remap. float(...) keeps the module
 # import numba-free (only register_score_function pulls numba in).
@@ -414,8 +415,6 @@ def _lfu_decay(scores, cur_timestamp):
 
 
 def _custom_table(score_fn, score_strategy, bc=128):
-    from dynamicemb.jit import register_score_function
-
     cc = torch.cuda.get_device_capability(torch.cuda.current_device())
     key = register_score_function(score_fn, score_strategy, cc[0], cc[1])
     return get_scored_table(
@@ -642,16 +641,12 @@ def _bad_oob(scores, cur_timestamp):
 
 
 def test_score_function_nonconstant_subscript_rejected(current_device):
-    from dynamicemb.jit import register_score_function
-
     cc = torch.cuda.get_device_capability(torch.cuda.current_device())
     with pytest.raises(ValueError):
         register_score_function(_bad_nonconst, LRU_LFU_TS_FIRST, cc[0], cc[1])
 
 
 def test_score_function_out_of_bounds_subscript_rejected(current_device):
-    from dynamicemb.jit import register_score_function
-
     cc = torch.cuda.get_device_capability(torch.cuda.current_device())
     with pytest.raises(IndexError):
         register_score_function(_bad_oob, LRU_LFU_LFU_FIRST, cc[0], cc[1])

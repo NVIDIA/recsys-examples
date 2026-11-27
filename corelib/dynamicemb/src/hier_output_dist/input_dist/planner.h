@@ -93,14 +93,35 @@ struct BucketizedKeys {
 
 // The bucketize places the keys of each feature on their owners by the feature's rule, its
 // dist_types entry (int32 [num_features] on the keys' GPU): a DistType code (src/utils.h),
-// kCyclic or kHashedCyclic (Config::validate refuses the others), which it reads at run time.
+// kCyclic, kHashedCyclic or kHashedBucket (Config::validate refuses the others), which it reads at
+// run time. The rule kHashedBucket takes two parameters of the feature: the capacity of its whole
+// table and of one of its shards (OwnerRules).
+//
+// The device side of OwnerRules: what a kernel reads, [num_features] each.
+struct OwnerRulesView {
+  const int32_t *dist_types;
+  const int64_t *global_capacities;  // kHashedBucket's: the rows of the whole table; else 0
+  const int64_t *shard_capacities;   // kHashedBucket's: the rows of one shard; else 0
+};
+
+// The owner rule of each feature, on the keys' GPU. dist_types are int32 and the capacities int64,
+// all [num_features].
+struct OwnerRules {
+  at::Tensor dist_types;
+  at::Tensor global_capacities;
+  at::Tensor shard_capacities;
+  int64_t num_features() const { return dist_types.numel(); }
+  OwnerRulesView view() const {
+    return {dist_types.data_ptr<int32_t>(), global_capacities.data_ptr<int64_t>(),
+            shard_capacities.data_ptr<int64_t>()};
+  }
+};
 
 // The checks of the bucketize's inputs (the keys, offsets or lengths, the input KJT's offsets,
 // weights, the rules) and of the fan-out's (reverse_indices). Each throws (TORCH_CHECK) with the
 // message of its check. InChannel::input_dist calls both before it takes a sequence number, and
 // the hooks call them; bucketize_rows and fanout_tables do not.
-void check_bucketize_input(const PlanInput &input, const at::Tensor &dist_types,
-                           int64_t world_size);
+void check_bucketize_input(const PlanInput &input, const OwnerRules &rules, int64_t world_size);
 void check_fanout_input(const at::Tensor &reverse_indices);
 // The bucketize up to its gather: the in channel's (its push gathers the keys as it pushes them).
 // keys and key_weights stay undefined. Two kernels sort the keys by owner, a stable counting
@@ -113,12 +134,12 @@ void check_fanout_input(const at::Tensor &reverse_indices);
 // run_offsets) writes every entry. sorted_path: true, that radix sort; false, the counting sort,
 // which raises where it does not fit, with the reason; none, as the sizes choose (the in
 // channel's). counted says which sort ran.
-BucketizedKeys bucketize_rows(const PlanInput &input, const at::Tensor &dist_types,
+BucketizedKeys bucketize_rows(const PlanInput &input, const OwnerRules &rules,
                               int64_t world_size, int64_t first_owner, int64_t owners,
                               c10::optional<bool> sorted_path = c10::nullopt);
 // The whole bucketize: bucketize_rows, then the keys (and weights) gathered into bucketized order
 // (gather_rows): the tests'.
-BucketizedKeys bucketize_keys(const PlanInput &input, const at::Tensor &dist_types,
+BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules,
                               int64_t world_size, int64_t first_owner, int64_t owners,
                               c10::optional<bool> sorted_path = c10::nullopt);
 

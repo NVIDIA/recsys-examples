@@ -23,7 +23,10 @@ import time
 
 import pytest
 import torch
-from dynamicemb.extendable_tensor import DeviceExtendableBuffer, HostExtendableBuffer
+from dynamicemb.state.extendable_buffer import (
+    DeviceExtendableBuffer,
+    HostExtendableBuffer,
+)
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required"

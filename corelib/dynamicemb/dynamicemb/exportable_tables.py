@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Optional
 
 import torch
-from dynamicemb.checkpoint_io import (
+from dynamicemb.checkpoint.files import (
     _iter_batches_from_files,
     encode_meta_json_file_path,
     get_loading_files,
@@ -333,6 +333,10 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                     0,
                     source_device,
                     dist_type=meta_data.get("dist_type", "roundrobin"),
+                    # hash_bucket's rule needs the layout the checkpoint was
+                    # written under (None for the other rules).
+                    global_capacity=meta_data.get("global_capacity"),
+                    bucket_capacity=meta_data.get("bucket_capacity"),
                     emb_dtype=emb_dtype,
                     opt_state_dtype=opt_state_dtype,
                     # A collection contains every checkpoint shard, including in

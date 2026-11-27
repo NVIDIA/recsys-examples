@@ -15,6 +15,9 @@
 
 """JIT glue for the LruLfu (LRU_LFU strategy) eviction cubins.
 
+The packaged eviction fatbins live in ``dynamicemb/score/fatbin/`` (built by
+``setup.py`` from ``src/jit/``).
+
 - ``ensure_lex_fatbin_loaded()`` hands the default (Lex) evictor fatbin to the
   C++ loader once. The default eviction path needs only this -- no numba, and the
   custom fatbin is not read/required.
@@ -37,9 +40,9 @@ _lex_loaded = False
 # score_function group key (int) -> True once registered with the C++ cache.
 _registered_keys = set()
 
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
-_LEX_FATBIN = os.path.join(_PKG_DIR, "evict_lrulfu_lex.fatbin")
-_CUSTOM_FATBIN = os.path.join(_PKG_DIR, "evict_lrulfu_custom.fatbin")
+_FATBIN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fatbin")
+_LEX_FATBIN = os.path.join(_FATBIN_DIR, "evict_lrulfu_lex.fatbin")
+_CUSTOM_FATBIN = os.path.join(_FATBIN_DIR, "evict_lrulfu_custom.fatbin")
 
 
 def _read_fatbin(path: str) -> bytes:

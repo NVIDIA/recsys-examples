@@ -572,7 +572,9 @@ def main(argv) -> None:
         "written under one geometry and read under the other",
     )
     parser.add_argument(
-        "--dist-type", default="roundrobin", choices=["roundrobin", "hash_roundrobin"]
+        "--dist-type",
+        default="roundrobin",
+        choices=["roundrobin", "hash_roundrobin", "hash_bucket"],
     )
     parser.add_argument("--save-path", default="/tmp/dynamicemb_trw_ckpt")
     parser.add_argument(
