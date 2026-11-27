@@ -9,8 +9,6 @@ from dynamicemb.key_value_table import (
     _expand_tables_impl,
     create_table_state,
     get_expand_info,
-    load_from_flat_single_table,
-    store_to_flat_single_table,
 )
 from dynamicemb.optimizer import AdamDynamicEmbeddingOptimizer, OptimizerArgs
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
@@ -46,7 +44,7 @@ def test_expansion_value_capacity(on_host, max_capacity, score_strategy):
     )
     indices = state.key_index_map.insert(keys, table_ids, score)
     values = torch.arange(3 * 384, device=device, dtype=torch.float32).view(3, 384)
-    store_to_flat_single_table(state, indices, 0, values)
+    state.buffers.store(0, indices, values)
 
     # Exercise the max_capacity clamp, including a non-bucket-aligned target
     # as produced when HybridStorage subtracts its HBM capacity budget.
@@ -57,19 +55,17 @@ def test_expansion_value_capacity(on_host, max_capacity, score_strategy):
 
     key_rows = state.key_index_map.per_table_capacity_[0]
     assert key_rows == 384
-    assert state.tables[0].shape[0] == key_rows
+    assert state.buffers.num_rows(0) == key_rows
 
     _, found, new_indices = state.key_index_map.lookup(keys, table_ids, score)
     assert bool(found.all())
-    torch.testing.assert_close(
-        load_from_flat_single_table(state, new_indices, 0), values
-    )
+    torch.testing.assert_close(state.buffers.load(0, new_indices), values)
 
     # Cover the final slot, which was beyond the original value allocation.
     tail = torch.tensor([key_rows - 1], device=device)
     tail_value = torch.full((1, 384), 3.25, device=device)
-    store_to_flat_single_table(state, tail, 0, tail_value)
-    torch.testing.assert_close(load_from_flat_single_table(state, tail, 0), tail_value)
+    state.buffers.store(0, tail, tail_value)
+    torch.testing.assert_close(state.buffers.load(0, tail), tail_value)
 
 
 @pytest.mark.parametrize(

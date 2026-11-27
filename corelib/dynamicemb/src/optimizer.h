@@ -33,82 +33,66 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <torch/extension.h>
 #include <torch/torch.h>
 
+#include "state/mixed_dim_view.h"
+
 namespace dyn_emb {
 
-void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
-                               at::Tensor table_ptrs, at::Tensor table_ids,
-                               at::Tensor table_value_dims,
-                               at::Tensor table_emb_dims, int64_t max_emb_dim,
-                               bool all_dims_vec4, float const lr,
-                               int64_t table_dtype);
+void sgd_update_for_flat_table(const FlatTablesView &view, at::Tensor grads,
+                               at::Tensor indices, at::Tensor table_ids,
+                               float const lr);
 
-void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
-                                at::Tensor table_ptrs, at::Tensor table_ids,
-                                at::Tensor table_value_dims,
-                                at::Tensor table_emb_dims, const float lr,
-                                const float beta1, const float beta2,
-                                const float eps, const float weight_decay,
-                                const uint32_t iter_num, int64_t max_emb_dim,
-                                bool all_dims_vec4, int64_t table_dtype);
+void adam_update_for_flat_table(const FlatTablesView &view, at::Tensor grads,
+                                at::Tensor indices, at::Tensor table_ids,
+                                const float lr, const float beta1,
+                                const float beta2, const float eps,
+                                const float weight_decay,
+                                const uint32_t iter_num);
 
-void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
-                                   at::Tensor table_ptrs, at::Tensor table_ids,
-                                   at::Tensor table_value_dims,
-                                   at::Tensor table_emb_dims, const float lr,
-                                   const float eps, int64_t max_emb_dim,
-                                   bool all_dims_vec4, int64_t table_dtype);
+void adagrad_update_for_flat_table(const FlatTablesView &view,
+                                   at::Tensor grads, at::Tensor indices,
+                                   at::Tensor table_ids, const float lr,
+                                   const float eps);
 
-void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
-                                    at::Tensor table_ptrs, at::Tensor table_ids,
-                                    at::Tensor table_value_dims,
-                                    at::Tensor table_emb_dims, const float lr,
-                                    const float eps, int64_t max_emb_dim,
-                                    bool all_dims_vec4, int64_t table_dtype,
-                                    int64_t state_dtype);
+void rowwise_adagrad_for_flat_table(const FlatTablesView &view,
+                                    at::Tensor grads, at::Tensor indices,
+                                    at::Tensor table_ids, const float lr,
+                                    const float eps, int64_t state_dtype);
 
-void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
-                                at::Tensor table_ptrs, at::Tensor table_ids,
-                                at::Tensor table_value_dims,
-                                at::Tensor table_emb_dims, const float lr,
+void ftrl_update_for_flat_table(const FlatTablesView &view, at::Tensor grads,
+                                at::Tensor indices, at::Tensor table_ids,
+                                const float lr,
                                 const float learning_rate_power,
                                 const float beta, const float l1_reg,
-                                const float l2_reg, int64_t max_emb_dim,
-                                bool all_dims_vec4, int64_t table_dtype,
+                                const float l2_reg,
                                 const float group_lasso_reg = 0.0f);
 
-void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
-                                  at::Tensor table_ids,
-                                  at::Tensor table_emb_dims, int64_t emb_dim,
-                                  int64_t value_dim, bool all_dims_vec4,
-                                  float lr);
+// `values` is a padded buffer of the tables `view` describes (rows
+// view.max_value_dim() apart).
+void sgd_update_for_padded_buffer(const PaddedBufferView &view,
+                                  at::Tensor grads, at::Tensor values,
+                                  at::Tensor table_ids, float lr);
 
-void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
-                                   at::Tensor table_ids,
-                                   at::Tensor table_emb_dims, int64_t emb_dim,
-                                   int64_t value_dim, bool all_dims_vec4,
-                                   float lr, float beta1, float beta2,
-                                   float eps, float weight_decay,
+void adam_update_for_padded_buffer(const PaddedBufferView &view,
+                                   at::Tensor grads, at::Tensor values,
+                                   at::Tensor table_ids, float lr, float beta1,
+                                   float beta2, float eps, float weight_decay,
                                    uint32_t iter_num);
 
-void adagrad_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
-                                      at::Tensor table_ids,
-                                      at::Tensor table_emb_dims,
-                                      int64_t emb_dim, int64_t value_dim,
-                                      bool all_dims_vec4, float lr, float eps);
+void adagrad_update_for_padded_buffer(const PaddedBufferView &view,
+                                      at::Tensor grads, at::Tensor values,
+                                      at::Tensor table_ids, float lr,
+                                      float eps);
 
-void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
-                                       at::Tensor table_ids,
-                                       at::Tensor table_emb_dims,
-                                       int64_t emb_dim, int64_t value_dim,
-                                       bool all_dims_vec4, float lr, float eps,
-                                       int64_t state_dtype);
+void rowwise_adagrad_for_padded_buffer(const PaddedBufferView &view,
+                                       at::Tensor grads, at::Tensor values,
+                                       at::Tensor table_ids, float lr,
+                                       float eps, int64_t state_dtype);
 
-void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
-                                   at::Tensor table_ids,
-                                   at::Tensor table_emb_dims, int64_t emb_dim,
-                                   int64_t value_dim, bool all_dims_vec4,
-                                   float lr, float learning_rate_power,
-                                   float beta, float l1_reg, float l2_reg,
+void ftrl_update_for_padded_buffer(const PaddedBufferView &view,
+                                   at::Tensor grads, at::Tensor values,
+                                   at::Tensor table_ids, float lr,
+                                   float learning_rate_power, float beta,
+                                   float l1_reg, float l2_reg,
                                    float group_lasso_reg);
 
 } // namespace dyn_emb

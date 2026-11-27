@@ -23,6 +23,8 @@ from typing import Any, Dict, Optional, Union
 import torch  # usort:skip
 from dynamicemb.utils import DTYPE_NUM_BYTES, FP8_STORAGE_DTYPE, torch_to_dyn_emb
 from dynamicemb_extensions import (
+    FlatTablesView,
+    PaddedBufferView,
     adagrad_update_for_flat_table,
     adagrad_update_for_padded_buffer,
     adam_update_for_flat_table,
@@ -173,29 +175,24 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
     @abc.abstractmethod
     def fused_update_for_flat_table(
         self,
+        view: FlatTablesView,
         grads: torch.Tensor,
         indices: torch.Tensor,
-        table_ptrs: torch.Tensor,
         table_ids: torch.Tensor,
-        table_value_dims: torch.Tensor,
-        table_emb_dims: torch.Tensor,
-        max_emb_dim: int,
-        all_dims_vec4: bool,
-        table_dtype: torch.dtype,
     ) -> None:
+        """Update the rows ``indices`` (of the tables ``table_ids``) of the tables ``view``
+        describes, with ``grads``, in the tables' own buffers."""
         ...
 
     @abc.abstractmethod
     def update_for_padded_buffer(
         self,
+        view: PaddedBufferView,
         grads: torch.Tensor,
         values: torch.Tensor,
         table_ids: torch.Tensor,
-        table_emb_dims: torch.Tensor,
-        emb_dim: int,
-        value_dim: int,
-        all_dims_vec4: bool,
     ) -> None:
+        """Update ``values``, a padded buffer of the tables ``view`` describes, with ``grads``."""
         ...
 
     @abc.abstractmethod
@@ -362,48 +359,32 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def update_for_padded_buffer(
         self,
+        view: PaddedBufferView,
         grads: torch.Tensor,
         values: torch.Tensor,
         table_ids: torch.Tensor,
-        table_emb_dims: torch.Tensor,
-        emb_dim: int,
-        value_dim: int,
-        all_dims_vec4: bool,
     ) -> None:
         sgd_update_for_padded_buffer(
+            view,
             grads,
             values,
             table_ids,
-            table_emb_dims,
-            emb_dim,
-            value_dim,
-            all_dims_vec4,
             self._opt_args.learning_rate,
         )
 
     def fused_update_for_flat_table(
         self,
+        view: FlatTablesView,
         grads: torch.Tensor,
         indices: torch.Tensor,
-        table_ptrs: torch.Tensor,
         table_ids: torch.Tensor,
-        table_value_dims: torch.Tensor,
-        table_emb_dims: torch.Tensor,
-        max_emb_dim: int,
-        all_dims_vec4: bool,
-        table_dtype: torch.dtype,
     ) -> None:
         sgd_update_for_flat_table(
+            view,
             grads,
             indices,
-            table_ptrs,
             table_ids,
-            table_value_dims,
-            table_emb_dims,
-            max_emb_dim,
-            all_dims_vec4,
             self._opt_args.learning_rate,
-            torch_to_dyn_emb(table_dtype).value,
         )
 
     def get_opt_args(self):
@@ -449,22 +430,16 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def update_for_padded_buffer(
         self,
+        view: PaddedBufferView,
         grads: torch.Tensor,
         values: torch.Tensor,
         table_ids: torch.Tensor,
-        table_emb_dims: torch.Tensor,
-        emb_dim: int,
-        value_dim: int,
-        all_dims_vec4: bool,
     ) -> None:
         adam_update_for_padded_buffer(
+            view,
             grads,
             values,
             table_ids,
-            table_emb_dims,
-            emb_dim,
-            value_dim,
-            all_dims_vec4,
             self._opt_args.learning_rate,
             self._opt_args.beta1,
             self._opt_args.beta2,
@@ -475,32 +450,22 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def fused_update_for_flat_table(
         self,
+        view: FlatTablesView,
         grads: torch.Tensor,
         indices: torch.Tensor,
-        table_ptrs: torch.Tensor,
         table_ids: torch.Tensor,
-        table_value_dims: torch.Tensor,
-        table_emb_dims: torch.Tensor,
-        max_emb_dim: int,
-        all_dims_vec4: bool,
-        table_dtype: torch.dtype,
     ) -> None:
         adam_update_for_flat_table(
+            view,
             grads,
             indices,
-            table_ptrs,
             table_ids,
-            table_value_dims,
-            table_emb_dims,
             self._opt_args.learning_rate,
             self._opt_args.beta1,
             self._opt_args.beta2,
             self._opt_args.eps,
             self._opt_args.weight_decay,
             self._iterations,
-            max_emb_dim,
-            all_dims_vec4,
-            torch_to_dyn_emb(table_dtype).value,
         )
 
     def get_opt_args(self):
@@ -537,50 +502,34 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def update_for_padded_buffer(
         self,
+        view: PaddedBufferView,
         grads: torch.Tensor,
         values: torch.Tensor,
         table_ids: torch.Tensor,
-        table_emb_dims: torch.Tensor,
-        emb_dim: int,
-        value_dim: int,
-        all_dims_vec4: bool,
     ) -> None:
         adagrad_update_for_padded_buffer(
+            view,
             grads,
             values,
             table_ids,
-            table_emb_dims,
-            emb_dim,
-            value_dim,
-            all_dims_vec4,
             self._opt_args.learning_rate,
             self._opt_args.eps,
         )
 
     def fused_update_for_flat_table(
         self,
+        view: FlatTablesView,
         grads: torch.Tensor,
         indices: torch.Tensor,
-        table_ptrs: torch.Tensor,
         table_ids: torch.Tensor,
-        table_value_dims: torch.Tensor,
-        table_emb_dims: torch.Tensor,
-        max_emb_dim: int,
-        all_dims_vec4: bool,
-        table_dtype: torch.dtype,
     ) -> None:
         adagrad_update_for_flat_table(
+            view,
             grads,
             indices,
-            table_ptrs,
             table_ids,
-            table_value_dims,
-            table_emb_dims,
             self._opt_args.learning_rate,
             self._opt_args.eps,
-            max_emb_dim,
-            all_dims_vec4,
-            torch_to_dyn_emb(table_dtype).value,
         )
 
     def get_opt_args(self):
@@ -614,22 +563,16 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def update_for_padded_buffer(
         self,
+        view: PaddedBufferView,
         grads: torch.Tensor,
         values: torch.Tensor,
         table_ids: torch.Tensor,
-        table_emb_dims: torch.Tensor,
-        emb_dim: int,
-        value_dim: int,
-        all_dims_vec4: bool,
     ) -> None:
         rowwise_adagrad_for_padded_buffer(
+            view,
             grads,
             values,
             table_ids,
-            table_emb_dims,
-            emb_dim,
-            value_dim,
-            all_dims_vec4,
             self._opt_args.learning_rate,
             self._opt_args.eps,
             torch_to_dyn_emb(self.get_state_dtype(values.dtype)).value,
@@ -637,29 +580,19 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def fused_update_for_flat_table(
         self,
+        view: FlatTablesView,
         grads: torch.Tensor,
         indices: torch.Tensor,
-        table_ptrs: torch.Tensor,
         table_ids: torch.Tensor,
-        table_value_dims: torch.Tensor,
-        table_emb_dims: torch.Tensor,
-        max_emb_dim: int,
-        all_dims_vec4: bool,
-        table_dtype: torch.dtype,
     ) -> None:
         rowwise_adagrad_for_flat_table(
+            view,
             grads,
             indices,
-            table_ptrs,
             table_ids,
-            table_value_dims,
-            table_emb_dims,
             self._opt_args.learning_rate,
             self._opt_args.eps,
-            max_emb_dim,
-            all_dims_vec4,
-            torch_to_dyn_emb(table_dtype).value,
-            torch_to_dyn_emb(self.get_state_dtype(table_dtype)).value,
+            torch_to_dyn_emb(self.get_state_dtype(view.dtype)).value,
         )
 
     def get_opt_args(self):
@@ -892,22 +825,16 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def update_for_padded_buffer(
         self,
+        view: PaddedBufferView,
         grads: torch.Tensor,
         values: torch.Tensor,
         table_ids: torch.Tensor,
-        table_emb_dims: torch.Tensor,
-        emb_dim: int,
-        value_dim: int,
-        all_dims_vec4: bool,
     ) -> None:
         ftrl_update_for_padded_buffer(
+            view,
             grads,
             values,
             table_ids,
-            table_emb_dims,
-            emb_dim,
-            value_dim,
-            all_dims_vec4,
             self._opt_args.learning_rate,
             self._opt_args.learning_rate_power,
             self._opt_args.ftrl_beta,
@@ -918,31 +845,21 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
 
     def fused_update_for_flat_table(
         self,
+        view: FlatTablesView,
         grads: torch.Tensor,
         indices: torch.Tensor,
-        table_ptrs: torch.Tensor,
         table_ids: torch.Tensor,
-        table_value_dims: torch.Tensor,
-        table_emb_dims: torch.Tensor,
-        max_emb_dim: int,
-        all_dims_vec4: bool,
-        table_dtype: torch.dtype,
     ) -> None:
         ftrl_update_for_flat_table(
+            view,
             grads,
             indices,
-            table_ptrs,
             table_ids,
-            table_value_dims,
-            table_emb_dims,
             self._opt_args.learning_rate,
             self._opt_args.learning_rate_power,
             self._opt_args.ftrl_beta,
             self._opt_args.l1_reg,
             self._opt_args.l2_reg,
-            max_emb_dim,
-            all_dims_vec4,
-            torch_to_dyn_emb(table_dtype).value,
             self._opt_args.group_lasso_reg,
         )
 

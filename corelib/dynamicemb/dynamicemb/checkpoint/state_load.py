@@ -31,7 +31,6 @@ from dynamicemb.checkpoint.files import load_from_json, resolve_checkpoint_value
 from dynamicemb.dynamicemb_config import DynamicEmbTableOptions
 from dynamicemb.key_ownership import OwnershipRule
 from dynamicemb.score.args import ScoreArg
-from dynamicemb.state.value_rows import store_to_flat_single_table
 from dynamicemb.types import (
     EMBEDDING_TYPE,
     KEY_TYPE,
@@ -256,7 +255,7 @@ def _validate_load_meta(
             f"Optimizer file {opt_file_path} does not exist. Will not load optimizer states."
         )
 
-    dim = state.table_emb_dims_cpu[table_id]
+    dim = state.buffers.emb_dims_list[table_id]
     runtime_optstate_dim = state.optimizer.get_state_dim(dim)
 
     if runtime_optstate_dim == 0:
@@ -274,13 +273,13 @@ def _validate_load_meta(
             f"Embedding dim mismatch: {embedding_file_path} holds rows of "
             f"{ckpt_emb_dim} but the runtime table is configured with dim {dim}."
         )
-    if emb_dtype not in (state.emb_dtype, checkpoint_dtype(state.emb_dtype)):
+    if emb_dtype not in (state.buffers.dtype, checkpoint_dtype(state.buffers.dtype)):
         # Not fatal: the insert path casts, so this is a deliberate precision
         # migration as often as it is a mistake. Say which way it goes, since
         # narrowing loses bits that the checkpoint still has.
         warnings.warn(
             f"Checkpoint {embedding_file_path} stores {emb_dtype} embeddings but "
-            f"the runtime table is {state.emb_dtype}; values will be converted on "
+            f"the runtime table is {state.buffers.dtype}; values will be converted on "
             "load.",
             UserWarning,
             stacklevel=2,
@@ -342,7 +341,7 @@ def _load_key_values(
     table_id: int = 0,
 ) -> None:
     dim = embeddings.size(1)
-    emb_dim_cfg = state.table_emb_dims_cpu[table_id]
+    emb_dim_cfg = state.buffers.emb_dims_list[table_id]
     runtime_optstate_dim = state.optimizer.get_state_dim(emb_dim_cfg)
     if not keys.is_cuda:
         raise RuntimeError("Keys must be on GPU")
@@ -360,13 +359,13 @@ def _load_key_values(
     # be the table's dtype (rowwise Adagrad keeps an fp32 accumulator), and an
     # elementwise cast here would round that accumulator away. The branch below
     # only calls it when the state is non-empty, which is the case it casts.
-    embeddings = encode_table_values(embeddings, state.emb_dtype)
+    embeddings = encode_table_values(embeddings, state.buffers.dtype)
 
     if opt_states is None and runtime_optstate_dim > 0:
         opt_states = torch.empty(
             keys.numel(),
             runtime_optstate_dim,
-            dtype=state.emb_dtype,
+            dtype=state.buffers.dtype,
             device=embeddings.device,
         )
         state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
@@ -374,11 +373,11 @@ def _load_key_values(
         opt_states = state.optimizer.states_from_checkpoint(
             opt_states,
             emb_dim_cfg,
-            state.emb_dtype,
+            state.buffers.dtype,
             embeddings.device,
         )
 
-    # Both halves are already state.emb_dtype (normalized above), so this cat
+    # Both halves are already state.buffers.dtype (normalized above), so this cat
     # cannot silently widen the row via type promotion.
     values = (
         torch.cat(
@@ -427,7 +426,7 @@ def _load_key_values(
             state.key_index_map.slots_of(keys, tid_tensor),
             scores.to(SCORE_TYPE).contiguous(),
         )
-        store_to_flat_single_table(state, indices, table_id, values)
+        state.buffers.store(table_id, indices, values)
         return
 
     policy = ScorePolicy.ASSIGN
@@ -454,4 +453,4 @@ def _load_key_values(
     )
 
     indices = state.key_index_map.insert(keys, tid_tensor, score_arg_insert)
-    store_to_flat_single_table(state, indices, table_id, values)
+    state.buffers.store(table_id, indices, values)

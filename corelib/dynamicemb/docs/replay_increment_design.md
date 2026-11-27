@@ -50,7 +50,7 @@ Everything replay needs is already there; §3 records what deliberately is *not*
 `erased_keys`.
 
 **`values` / `optimizer_states` are the two halves of one stored row.**
-`load_from_flat_single_table` returns the table's own compact `[N, value_dim]`
+`state.buffers.load` returns the table's own compact `[N, value_dim]`
 row, so the optimizer state is the trailing `value_dim - dim` columns.
 
 That runtime width is **not** what gets dumped. Rowwise Adagrad reserves a fixed
@@ -183,7 +183,7 @@ Mirrors `_encode_slot_index` (`docs/delta_dump_result_design.md` §4):
 ## 5. Value writes and optimizer state
 
 A value row is an embedding followed by the optimizer state, and the write copies
-from the row base (`store_to_flat_single_table` copies `min(value_dim,
+from the row base (`state.buffers.store` copies `min(value_dim,
 input_dim)` columns), so there is no way to write the tail without the head. The
 embedding is therefore *always* written and the only question is what the tail
 gets — which is what `ReplayContent.OPTIMIZER_STATE` decides:

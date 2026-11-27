@@ -93,13 +93,12 @@ def _train_padded_buffer(
     table_emb_dims = torch.tensor([emb_dim], dtype=torch.int64, device=device)
     for grad in grads:
         optimizer.update_for_padded_buffer(
+            dynamicemb_extensions.PaddedBufferView(
+                table_emb_dims, emb_dim, value_dim, all_dims_vec4
+            ),
             grad,
             values,
             table_ids,
-            table_emb_dims,
-            emb_dim,
-            value_dim,
-            all_dims_vec4,
         )
     torch.cuda.synchronize()
 
@@ -148,16 +147,20 @@ def _flat_table(value_type: torch.dtype, emb_dim: int, seed: int = 0, state_dtyp
 
 
 def _flat_update(optimizer, table, grads, indices, emb_dim, all_dims_vec4):
-    optimizer.fused_update_for_flat_table(
-        grads,
-        indices,
+    view = dynamicemb_extensions.FlatTablesView(
         torch.tensor([table.data_ptr()], dtype=torch.int64, device="cuda"),
-        torch.zeros(grads.size(0), dtype=torch.int64, device="cuda"),
         torch.tensor([table.size(1)], dtype=torch.int64, device="cuda"),
         torch.tensor([emb_dim], dtype=torch.int64, device="cuda"),
         emb_dim,
+        table.size(1),
         all_dims_vec4,
         table.dtype,
+    )
+    optimizer.fused_update_for_flat_table(
+        view,
+        grads,
+        indices,
+        torch.zeros(grads.size(0), dtype=torch.int64, device="cuda"),
     )
 
 

@@ -183,8 +183,8 @@ def _assert_value_buffer_matches_hashtable(
             bc
         ), f"table {table_id}: overflow_bucket_capacity_={ovf} != 3 * bucket ({bc})"
     expected_rows = main + ovf
-    t = state.tables[table_id].tensor()
-    vd = int(state.table_value_dims_cpu[table_id])
+    t = state.buffers.tensor(table_id)
+    vd = int(state.buffers.value_dims_list[table_id])
     assert t.shape == (expected_rows, vd), (
         f"table {table_id}: value buffer shape {tuple(t.shape)} != "
         f"expected ({expected_rows}, {vd}) (main={main}, overflow_extra={ovf})"
@@ -340,6 +340,6 @@ def test_alignment_cache_storage_shapes(
         for tid, name in enumerate(batched.table_names):
             ec = by_name[name]
             assert int(batched._dynamicemb_options[tid].dim) == ec.embedding_dim
-            assert vd_state.table_value_dims_cpu[tid] == int(ec.embedding_dim) + int(
+            assert vd_state.buffers.value_dims_list[tid] == int(ec.embedding_dim) + int(
                 st_dim
             )

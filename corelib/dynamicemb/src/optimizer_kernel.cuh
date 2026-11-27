@@ -19,6 +19,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #define OPTIMIZER_KERNEL_H
 
 #include "lookup_kernel.cuh"
+#include "state/mixed_dim_params.cuh"
 #include "utils.h"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -738,9 +739,8 @@ template <typename wgrad_t, typename weight_t, typename index_t,
           typename OptimizerFunc>
 __global__ void update4_with_index_flat_table_kernel(
     const uint32_t num_keys, const uint32_t grad_stride,
-    const wgrad_t *grad_evs, const int64_t *table_ptrs, const index_t *indices,
-    const int64_t *table_ids, const int64_t *table_value_dims,
-    const int64_t *table_emb_dims, OptimizerFunc optimizer) {
+    const wgrad_t *grad_evs, FlatTablesParams params, const index_t *indices,
+    const int64_t *table_ids, OptimizerFunc optimizer) {
   constexpr int kWarpSize = 32;
   const int warp_num_per_block = blockDim.x / kWarpSize;
   const int warp_id_in_block = threadIdx.x / kWarpSize;
@@ -752,11 +752,12 @@ __global__ void update4_with_index_flat_table_kernel(
       continue;
 
     int64_t table_id = table_ids[ev_id];
-    int64_t vdim = table_value_dims[table_id];
-    int64_t edim = table_emb_dims[table_id];
+    int64_t vdim = params.value_dims[table_id];
+    int64_t edim = params.emb_dims[table_id];
 
-    weight_t *weight_ptr = reinterpret_cast<weight_t *>(table_ptrs[table_id]) +
-                           static_cast<int64_t>(index) * vdim;
+    weight_t *weight_ptr =
+        reinterpret_cast<weight_t *>(params.ptrs[table_id]) +
+        static_cast<int64_t>(index) * vdim;
     const wgrad_t *grad_ptr =
         grad_evs + static_cast<int64_t>(ev_id) * grad_stride;
 
@@ -770,9 +771,8 @@ template <typename wgrad_t, typename weight_t, typename index_t,
           typename OptimizerFunc>
 __global__ void update_with_index_flat_table_kernel(
     const uint32_t num_keys, const uint32_t grad_stride,
-    const wgrad_t *grad_evs, const int64_t *table_ptrs, const index_t *indices,
-    const int64_t *table_ids, const int64_t *table_value_dims,
-    const int64_t *table_emb_dims, OptimizerFunc optimizer) {
+    const wgrad_t *grad_evs, FlatTablesParams params, const index_t *indices,
+    const int64_t *table_ids, OptimizerFunc optimizer) {
 
   for (uint32_t ev_id = blockIdx.x; ev_id < num_keys; ev_id += gridDim.x) {
     index_t const index = indices[ev_id];
@@ -780,11 +780,12 @@ __global__ void update_with_index_flat_table_kernel(
       continue;
 
     int64_t table_id = table_ids[ev_id];
-    int64_t vdim = table_value_dims[table_id];
-    int64_t edim = table_emb_dims[table_id];
+    int64_t vdim = params.value_dims[table_id];
+    int64_t edim = params.emb_dims[table_id];
 
-    weight_t *weight_ptr = reinterpret_cast<weight_t *>(table_ptrs[table_id]) +
-                           static_cast<int64_t>(index) * vdim;
+    weight_t *weight_ptr =
+        reinterpret_cast<weight_t *>(params.ptrs[table_id]) +
+        static_cast<int64_t>(index) * vdim;
     const wgrad_t *grad_ptr =
         grad_evs + static_cast<int64_t>(ev_id) * grad_stride;
 
@@ -798,25 +799,23 @@ __global__ void update_with_index_flat_table_kernel(
 // row and packs the optimizer states immediately after it (see
 // load_from_flat_table / store_to_flat_table). A row's embedding occupies
 // [0, edim) and its states begin at `max_emb_dim`, so `dim` is the per-row
-// embedding width while `state_offset` is the fixed `max_emb_dim`. When the
-// table ids / per-table dims are unavailable (all rows share one dim) the
-// caller passes nullptr and the uniform `max_emb_dim` is used as `dim`.
+// embedding width while `state_offset` is the fixed `max_emb_dim`. Rows are
+// `max_value_dim` apart.
 template <typename wgrad_t, typename weight_t, typename OptimizerFunc>
 __global__ void update4_padded_buffer_kernel(
-    const uint32_t num_rows, const uint32_t grad_stride,
-    const uint32_t value_stride, const uint32_t max_emb_dim,
-    const wgrad_t *grads, weight_t *values, const int64_t *table_ids,
-    const int64_t *table_emb_dims, OptimizerFunc optimizer) {
+    const uint32_t num_rows, const uint32_t grad_stride, const wgrad_t *grads,
+    weight_t *values, const int64_t *table_ids, PaddedBufferParams params,
+    OptimizerFunc optimizer) {
   constexpr int kWarpSize = 32;
   const int warp_num_per_block = blockDim.x / kWarpSize;
   const int warp_id_in_block = threadIdx.x / kWarpSize;
+  const uint32_t max_emb_dim = static_cast<uint32_t>(params.max_emb_dim);
 
   for (uint32_t row = warp_num_per_block * blockIdx.x + warp_id_in_block;
        row < num_rows; row += gridDim.x * warp_num_per_block) {
-    uint32_t edim = table_emb_dims == nullptr
-                        ? max_emb_dim
-                        : (uint32_t)table_emb_dims[table_ids[row]];
-    weight_t *weight_ptr = values + static_cast<int64_t>(row) * value_stride;
+    uint32_t edim = (uint32_t)params.emb_dims[table_ids[row]];
+    weight_t *weight_ptr =
+        values + static_cast<int64_t>(row) * params.max_value_dim;
     const wgrad_t *grad_ptr = grads + static_cast<int64_t>(row) * grad_stride;
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, edim,
                                              max_emb_dim};
@@ -826,15 +825,14 @@ __global__ void update4_padded_buffer_kernel(
 
 template <typename wgrad_t, typename weight_t, typename OptimizerFunc>
 __global__ void update_padded_buffer_kernel(
-    const uint32_t num_rows, const uint32_t grad_stride,
-    const uint32_t value_stride, const uint32_t max_emb_dim,
-    const wgrad_t *grads, weight_t *values, const int64_t *table_ids,
-    const int64_t *table_emb_dims, OptimizerFunc optimizer) {
+    const uint32_t num_rows, const uint32_t grad_stride, const wgrad_t *grads,
+    weight_t *values, const int64_t *table_ids, PaddedBufferParams params,
+    OptimizerFunc optimizer) {
+  const uint32_t max_emb_dim = static_cast<uint32_t>(params.max_emb_dim);
   for (uint32_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
-    uint32_t edim = table_emb_dims == nullptr
-                        ? max_emb_dim
-                        : (uint32_t)table_emb_dims[table_ids[row]];
-    weight_t *weight_ptr = values + static_cast<int64_t>(row) * value_stride;
+    uint32_t edim = (uint32_t)params.emb_dims[table_ids[row]];
+    weight_t *weight_ptr =
+        values + static_cast<int64_t>(row) * params.max_value_dim;
     const wgrad_t *grad_ptr = grads + static_cast<int64_t>(row) * grad_stride;
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, edim,
                                              max_emb_dim};

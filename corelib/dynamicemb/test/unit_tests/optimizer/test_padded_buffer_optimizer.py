@@ -15,7 +15,7 @@
 
 """Regression tests for the contiguous *padded buffer* optimizer kernels.
 
-The padded buffer (produced by ``load_from_flat`` with ``CopyMode.VALUE``) lays
+The padded buffer (produced by ``buffers.load_to_padded`` with ``CopyMode.VALUE``) lays
 each row out as::
 
     [ emb (edim) | pad ... | m (edim) | v (edim) | pad ... ]
@@ -31,7 +31,7 @@ write the velocity slot with the momentum (beta1) formula, corrupting v.
 A second corruption path is covered too: the vectorized (vec4) kernel writes m
 in 4-element chunks, so when a table's ``edim`` is not a multiple of 4 the final
 m store would spill into the start of v with the beta1 rule. ``all_dims_vec4``
-must therefore reflect *per-table* dims (as ``state.all_dims_vec4`` does), not
+must therefore reflect *per-table* dims (as ``state.buffers.all_dims_vec4`` does), not
 just ``max_emb_dim``; a misaligned table must fall back to the scalar kernel.
 
 FTRL has the same shape of exposure: it keeps ``linear`` then ``accum``, each
@@ -117,14 +117,14 @@ def test_adam_padded_buffer_mixed_dims_velocity(dims, dtype):
     )
     grads = torch.zeros(len(dims), max_emb_dim, dtype=dtype, device=device)
 
+    view = dynamicemb_extensions.PaddedBufferView(
+        table_emb_dims, max_emb_dim, value_dim, _all_dims_vec4(dims)
+    )
     dynamicemb_extensions.adam_update_for_padded_buffer(
+        view,
         grads,
         values,
         table_ids,
-        table_emb_dims,
-        max_emb_dim,
-        value_dim,
-        _all_dims_vec4(dims),
         lr,
         beta1,
         beta2,
@@ -179,14 +179,14 @@ def test_adam_padded_buffer_matches_reference_with_grad(dims, dtype):
     vhat = v_ref / (1 - beta2**iter_num)
     w_ref = w_init - lr * (mhat / (vhat**0.5 + eps) + weight_decay * w_init)
 
+    view = dynamicemb_extensions.PaddedBufferView(
+        table_emb_dims, max_emb_dim, value_dim, _all_dims_vec4(dims)
+    )
     dynamicemb_extensions.adam_update_for_padded_buffer(
+        view,
         grads,
         values,
         table_ids,
-        table_emb_dims,
-        max_emb_dim,
-        value_dim,
-        _all_dims_vec4(dims),
         lr,
         beta1,
         beta2,
@@ -264,14 +264,14 @@ def test_ftrl_padded_buffer_mixed_dims_accum(dims, dtype):
     before = values.clone()
     grads = torch.full((len(dims), max_emb_dim), grad, dtype=dtype, device=device)
 
+    view = dynamicemb_extensions.PaddedBufferView(
+        table_emb_dims, max_emb_dim, value_dim, _all_dims_vec4(dims)
+    )
     dynamicemb_extensions.ftrl_update_for_padded_buffer(
+        view,
         grads,
         values,
         table_ids,
-        table_emb_dims,
-        max_emb_dim,
-        value_dim,
-        _all_dims_vec4(dims),
         lr,
         learning_rate_power,
         ftrl_beta,

@@ -34,18 +34,17 @@ from dynamicemb.key_value_table import (
     eval_lookup,
     get_find_score_arg,
     get_insert_score_arg,
-    load_from_flat,
-    load_from_flat_by,
     score_source,
-    store_to_flat,
 )
 from dynamicemb.lookup.embedding_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb.state.mixed_dim_buffers import PaddedBuffer
 from dynamicemb.state.storage_layout import CachePolicy, StorageLayout
 from dynamicemb.types import CopyMode, MultiTableAdmitter
 from dynamicemb.utils import decode_table_values, gradient_dtype
 from dynamicemb_extensions import (
     EvictStrategy,
+    PaddedBufferView,
     expand_table_ids_cuda,
     flagged_compact,
     gather_embedding,
@@ -276,15 +275,31 @@ def refresh_slots_after_rehash(state: DynamicEmbTableState, batch) -> None:
     batch.key_map_generation = state.key_map_generation
 
 
+def _padded_buffer_view(storage: Storage) -> PaddedBufferView:
+    """The dims of the padded rows ``storage`` hands out, for the whole batch.
+
+    Per-table embedding dims (on the CUDA device) let the padded-buffer kernels place each
+    row's optimizer state at the max_emb_dim offset using the row's own width.
+    ``all_dims_vec4`` must reflect per-table dims, not just max_emb_dim: a vec4 store on a
+    row whose edim % 4 != 0 would run past its m region into v. ``storage.all_dims_vec4()``
+    is the per-table-correct flag used by load/store too.
+    """
+    return PaddedBufferView(
+        storage.embedding_dims(on_device=True),
+        storage.max_embedding_dim(),
+        storage.max_value_dim(),
+        storage.all_dims_vec4(),
+    )
+
+
 def _apply_admission(
     missing_keys: torch.Tensor,
     missing_indices: torch.Tensor,
     missing_table_ids: torch.Tensor,
     missing_scores: Optional[torch.Tensor],
-    values: torch.Tensor,
+    values: PaddedBuffer,
     unique_keys: torch.Tensor,
     unique_table_ids: torch.Tensor,
-    max_emb_dim: int,
     freq_for_admission: Optional[torch.Tensor],
     admitter: Optional[MultiTableAdmitter],
     scores_are_frequencies: bool = False,
@@ -333,7 +348,7 @@ def _apply_admission(
         if non_admitted_initializer is not None and non_admitted_indices.numel() > 0:
             with torch.cuda.nvtx.range("op:initializer"):
                 non_admitted_initializer(
-                    values[:, :max_emb_dim],
+                    values.emb(),
                     # Alongside ``values``, which is why these are the whole
                     # unique vectors and not the missing slice; the rows to
                     # write come last.
@@ -388,7 +403,7 @@ def _load_storage_values(
     """
     st = storage._state
     rows = slots
-    return load_from_flat(st, rows, miss_tids, copy_mode=CopyMode.VALUE)
+    return st.buffers.load_to_padded(rows, miss_tids, copy_mode=CopyMode.VALUE)
 
 
 def _lookup_next_tier(
@@ -424,23 +439,22 @@ def _initialize_rows(
     initializer: MultiTableInitializer,
     keys: torch.Tensor,
     table_ids: torch.Tensor,
-    max_emb_dim: int,
-    max_val_dim: int,
+    padded_view: PaddedBufferView,
     emb_dtype: torch.dtype,
-) -> torch.Tensor:
-    """Fresh ``[len(keys), max_val_dim]`` rows: initialized embedding, reset optimizer state."""
+) -> PaddedBuffer:
+    """Fresh ``[len(keys), max_value_dim]`` rows: initialized embedding, reset optimizer state."""
     n = keys.numel()
-    rows = torch.empty(n, max_val_dim, dtype=emb_dtype, device=keys.device)
+    rows = PaddedBuffer.empty(padded_view, n, emb_dtype, keys.device)
     with torch.cuda.nvtx.range("op:initializer"):
         initializer(
-            rows[:, :max_emb_dim],
+            rows.emb(),
             keys,
             table_ids,
             torch.arange(n, dtype=torch.int64, device=keys.device),
         )
-    if max_val_dim != max_emb_dim:
+    if rows.has_state:
         state.optimizer.reset_optimizer_states(
-            rows[:, max_emb_dim:], emb_dims=state.table_emb_dims[table_ids]
+            rows.state(), emb_dims=padded_view.emb_dims[table_ids]
         )
     return rows
 
@@ -470,15 +484,15 @@ def _insert_into_storage(
         _,
     ) = _insert_and_evict_keys(st, keys, table_ids, scores)
     if num_evicted > 0:
-        evicted_values = load_from_flat(
-            st, evicted_slots, evicted_table_ids, copy_mode=CopyMode.VALUE
+        evicted_values = st.buffers.load_to_padded(
+            evicted_slots, evicted_table_ids, copy_mode=CopyMode.VALUE
         )
         # A key the storage refused (e.g. its bucket is full and the score does
         # not beat any stored one) comes back as an "evicted" row with a negative
-        # slot: load_from_flat left its value unwritten, so take the key's own
+        # slot: load_to_padded left its value unwritten, so take the key's own
         # input value instead, as HybridStorage.insert does.
         select_insert_failed_values(evicted_slots, values, evicted_values)
-    store_to_flat(st, slots, table_ids, values)
+    st.buffers.store_from_padded(slots, table_ids, values)
     if num_evicted > 0:
         next_tier.insert(evicted_keys, evicted_table_ids, evicted_values)
 
@@ -488,8 +502,7 @@ def _prefetch_inclusive_cache_path(
     storage: DynamicEmbStorage,
     unique_keys: torch.Tensor,
     unique_table_ids: torch.Tensor,
-    max_emb_dim: int,
-    max_val_dim: int,
+    padded_view: PaddedBufferView,
     emb_dtype: torch.dtype,
     initializer: MultiTableInitializer,
     evict_strategy: Optional[EvictStrategy],
@@ -636,10 +649,9 @@ def _prefetch_inclusive_cache_path(
                 initializer,
                 adm_keys,
                 adm_tids,
-                max_emb_dim,
-                max_val_dim,
+                padded_view,
                 emb_dtype,
-            )
+            ).values
         with torch.cuda.nvtx.range("op:flagged_compact"):
             num_st, into_storage, (st_keys, st_tids, st_score_input) = flagged_compact(
                 to_cache & ~in_storage, [miss_keys, miss_tids, miss_score_input]
@@ -686,12 +698,11 @@ def _prefetch_inclusive_cache_path(
 
         # 8. What it evicted: read before the slots are overwritten, then write back
         with torch.cuda.nvtx.range("op:load_from_flat"):
-            evicted_values = load_from_flat(
-                state, evicted_slots, evicted_tids, copy_mode=CopyMode.VALUE
+            evicted_values = state.buffers.load_to_padded(
+                evicted_slots, evicted_tids, copy_mode=CopyMode.VALUE
             )
         with torch.cuda.nvtx.range("op:store_to_flat"):
-            store_to_flat(
-                state,
+            state.buffers.store_from_padded(
                 cache_slots,
                 cache_tids,
                 _select(values, into_cache, num_cache == values.size(0)),
@@ -711,8 +722,7 @@ def _prefetch_hbm_direct_path(
     storage: DynamicEmbStorage,
     unique_keys: torch.Tensor,
     unique_table_ids: torch.Tensor,
-    max_emb_dim: int,
-    max_val_dim: int,
+    padded_view: PaddedBufferView,
     initializer: MultiTableInitializer,
     evict_strategy: Optional[EvictStrategy],
     accumulated_frequency: Optional[torch.Tensor],
@@ -818,22 +828,23 @@ def _prefetch_hbm_direct_path(
         # Initialize and insert admitted keys
         if admitted_keys.numel() > 0:
             n_admitted = admitted_keys.numel()
-            init_values = torch.empty(
-                n_admitted, max_val_dim, dtype=state.emb_dtype, device=device
+            init_buffer = PaddedBuffer.empty(
+                padded_view, n_admitted, state.buffers.dtype, device
             )
+            init_values = init_buffer.values
             init_idx = torch.arange(n_admitted, dtype=torch.int64, device=device)
             with torch.cuda.nvtx.range("op:initializer"):
                 initializer(
-                    init_values[:, :max_emb_dim],
+                    init_buffer.emb(),
                     admitted_keys,
                     admitted_tids,
                     init_idx,
                 )
 
-            if max_val_dim != max_emb_dim:
+            if init_buffer.has_state:
                 state.optimizer.reset_optimizer_states(
-                    init_values[:, max_emb_dim:],
-                    emb_dims=state.table_emb_dims[admitted_tids],
+                    init_buffer.state(),
+                    emb_dims=padded_view.emb_dims[admitted_tids],
                 )
 
             score_arg = get_insert_score_arg(state, n_admitted, device, admitted_scores)
@@ -868,7 +879,7 @@ def _prefetch_hbm_direct_path(
             # counter is indexed by slot, the value buffer by row.
             new_rows = new_indices
             with torch.cuda.nvtx.range("op:store_to_flat"):
-                store_to_flat(state, new_rows, admitted_tids, init_values)
+                state.buffers.store_from_padded(new_rows, admitted_tids, init_values)
 
             # Keys the insert could not place (-1) are skipped by the kernel.
             storage.increment_counter(new_slots, admitted_tids)
@@ -925,8 +936,7 @@ def dynamicemb_prefetch(
         table_num = feature_offsets.numel() - 1
         assert table_num != 0
         emb_dtype = storage.embedding_dtype()
-        max_emb_dim = storage.max_embedding_dim()
-        max_val_dim = storage.max_value_dim()
+        padded_view = _padded_buffer_view(storage)
 
         evict_strat = EvictStrategy(evict_strategy.value) if evict_strategy else None
         # todo: double check
@@ -987,8 +997,7 @@ def dynamicemb_prefetch(
                         storage,
                         unique_keys,
                         unique_table_ids,
-                        max_emb_dim,
-                        max_val_dim,
+                        padded_view,
                         emb_dtype,
                         initializer,
                         evict_strat,
@@ -1005,8 +1014,7 @@ def dynamicemb_prefetch(
                         storage,
                         unique_keys,
                         unique_table_ids,
-                        max_emb_dim,
-                        max_val_dim,
+                        padded_view,
                         emb_dtype,
                         initializer,
                         evict_strat,
@@ -1028,8 +1036,7 @@ def dynamicemb_prefetch(
                     storage,
                     unique_keys,
                     unique_table_ids,
-                    max_emb_dim,
-                    max_val_dim,
+                    padded_view,
                     initializer,
                     evict_strat,
                     lfu_accumulated_frequency,
@@ -1174,15 +1181,14 @@ def _generic_forward_path(
     optimizer: BaseDynamicEmbeddingOptimizer,
     unique_keys: torch.Tensor,
     unique_table_ids: torch.Tensor,
-    max_emb_dim: int,
-    max_val_dim: int,
+    padded_view: PaddedBufferView,
     emb_dtype: torch.dtype,
     initializer: MultiTableInitializer,
     evict_strategy: Optional[EvictStrategy],
     accumulated_frequency: Optional[torch.Tensor],
     admitter: Optional[MultiTableAdmitter],
     key_scores: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[PaddedBuffer, torch.Tensor]:
     """Standalone forward for generic (DEFAULT) storage mode.
 
     Does storage.find + admission + init + insert
@@ -1207,7 +1213,7 @@ def _generic_forward_path(
                 missing_scores,
                 founds,
                 _,
-                unique_values,
+                found_values,
             ) = storage.find(
                 unique_keys,
                 unique_table_ids,
@@ -1217,6 +1223,7 @@ def _generic_forward_path(
                 score_source(evict_strategy, accumulated_frequency, key_scores),
             )
 
+        unique_values = PaddedBuffer(found_values, padded_view)
         key_persisted = founds.clone()
 
         if h_num_missing == 0:
@@ -1250,7 +1257,6 @@ def _generic_forward_path(
             unique_values,
             unique_keys,
             unique_table_ids,
-            max_emb_dim,
             freq_for_admission,
             admitter,
             scores_are_frequencies=evict_strategy == EvictStrategy.KLfu,
@@ -1259,20 +1265,20 @@ def _generic_forward_path(
         if indices_to_init.numel() > 0:
             with torch.cuda.nvtx.range("op:initializer"):
                 initializer(
-                    unique_values[:, :max_emb_dim],
+                    unique_values.emb(),
                     unique_keys,
                     unique_table_ids,
                     indices_to_init,
                 )
 
-        if max_val_dim != max_emb_dim:
+        if unique_values.has_state:
             optimizer.reset_optimizer_states(
-                unique_values[:, max_emb_dim:],
+                unique_values.state(),
                 indices=missing_indices,
-                emb_dims=storage.embedding_dims(on_device=True)[missing_table_ids],
+                emb_dims=padded_view.emb_dims[missing_table_ids],
             )
 
-        values_to_insert = unique_values[positions_in_unique]
+        values_to_insert = unique_values.values[positions_in_unique]
 
         with torch.cuda.nvtx.range("op:storage_insert"):
             storage.insert(
@@ -1332,7 +1338,7 @@ def write_back_generic(
         _, founds, rows = km.lookup_with_overflow(keys, table_ids, score_arg)
     else:
         _, founds, rows = km.lookup(keys, table_ids, score_arg)
-    store_to_flat(state, torch.where(founds, rows, -1), table_ids, values)
+    state.buffers.store_from_padded(torch.where(founds, rows, -1), table_ids, values)
 
 
 class DynamicEmbeddingFunction(torch.autograd.Function):
@@ -1359,8 +1365,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         output_alloc: Optional[OutputAlloc] = None,
     ):
         with torch.cuda.nvtx.range("DynamicEmbeddingFunction.forward"):
-            max_emb_dim = storage.max_embedding_dim()
-            max_val_dim = storage.max_value_dim()
+            padded_view = _padded_buffer_view(storage)
             emb_dtype = storage.embedding_dtype()
 
             # pooling_weights is validated by the sole caller,
@@ -1379,13 +1384,11 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 direct = (
                     not is_pooling
                     and prefetch_state.non_admitted_positions is None
-                    and output_dtype == state.emb_dtype
+                    and output_dtype == state.buffers.dtype
                 )
                 if not direct:
                     with torch.cuda.nvtx.range("op:load_from_flat"):
-                        unique_embs = load_from_flat(
-                            state,
-                            # Value buffer: address by row (the slot, for a
+                        unique_embs = state.buffers.load_to_padded(  # Value buffer: address by row (the slot, for a
                             # cache).
                             prefetch_state.value_row_indices,
                             prefetch_state.unique_table_ids,
@@ -1402,7 +1405,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         # Whichever initializer owns rejected rows was settled
                         # at construction, so this is one call either way.
                         (non_admitted_initializer or initializer)(
-                            unique_embs[:, :max_emb_dim],
+                            unique_embs[:, : padded_view.max_emb_dim],
                             prefetch_state.unique_keys,
                             prefetch_state.unique_table_ids,
                             na,
@@ -1420,8 +1423,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         optimizer,
                         prefetch_state.unique_keys,
                         prefetch_state.unique_table_ids,
-                        max_emb_dim,
-                        max_val_dim,
+                        padded_view,
                         emb_dtype,
                         initializer,
                         evict_strat,
@@ -1431,7 +1433,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     )
                 # find() was asked for CopyMode.VALUE, so a row here is
                 # embedding ++ optimizer state; keep only the embedding.
-                unique_embs = unique_values[:, :max_emb_dim]
+                unique_embs = unique_values.emb()
 
             device = prefetch_state.unique_keys.device
             out_rows = None  # each key's output row, None: key i's is row i
@@ -1472,8 +1474,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     output_embs, out_rows = alloc
                 if direct:
                     with torch.cuda.nvtx.range("op:load_from_flat"):
-                        load_from_flat_by(
-                            state,
+                        state.buffers.gather_emb_by_entry(
                             prefetch_state.value_row_indices,
                             prefetch_state.unique_table_ids,
                             prefetch_state.reverse_indices,
@@ -1505,8 +1506,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.optimizer = optimizer
             ctx.layout = layout
             ctx.offsets = offsets
-            ctx.max_emb_dim = max_emb_dim
-            ctx.max_val_dim = max_val_dim
+            ctx.padded_view = padded_view
             ctx.emb_dtype = emb_dtype
             ctx.pooling_weights = pooling_weights
             ctx.use_counter = use_counter
@@ -1533,7 +1533,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         grads,
                         ctx.unique_keys.numel(),
                         layout.batch_size,
-                        ctx.max_emb_dim,
+                        ctx.padded_view.max_emb_dim,
                         ctx.offsets,
                         layout.D_offsets,
                         layout.pooling_mode,
@@ -1548,7 +1548,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         grads,
                         ctx.unique_keys.numel(),
                         layout.batch_size,
-                        ctx.max_emb_dim,
+                        ctx.padded_view.max_emb_dim,
                         grad_rows=ctx.out_rows,
                     )
 
@@ -1565,18 +1565,13 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     refresh_slots_after_rehash(state, ctx)
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
                         optimizer.fused_update_for_flat_table(
+                            state.buffers.flat_tables_view(),
                             unique_grads.to(
                                 gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
                             ),
                             # Writes into the value buffer -> rows.
                             ctx.update_value_rows,
-                            state.table_ptrs_dev,
                             unique_table_ids,
-                            state.table_value_dims,
-                            state.table_emb_dims,
-                            state.max_emb_dim,
-                            state.all_dims_vec4,
-                            state.emb_dtype,
                         )
 
                     release_slot_pins(
@@ -1586,34 +1581,22 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     )
 
                 if not ctx.use_counter and ctx.unique_values is not None:
-                    # Per-table embedding dims (on the CUDA device) let the
-                    # padded-buffer kernel place each row's optimizer state at the
-                    # max_emb_dim offset using the row's own width. Provided
-                    # uniformly across storage types via embedding_dims().
-                    table_emb_dims = storage.embedding_dims(on_device=True)
-                    # all_dims_vec4 must reflect per-table dims, not just
-                    # max_emb_dim: a vec4 store on a row whose edim % 4 != 0 would
-                    # run past its m region into v. storage.all_dims_vec4() is the
-                    # per-table-correct flag used by load/store too.
-                    all_dims_vec4 = storage.all_dims_vec4()
+                    unique_values = ctx.unique_values
                     with torch.cuda.nvtx.range("op:optimizer_update_padded"):
                         optimizer.update_for_padded_buffer(
+                            unique_values.view,
                             unique_grads.to(
                                 gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
                             ),
-                            ctx.unique_values,
+                            unique_values.values,
                             unique_table_ids,
-                            table_emb_dims,
-                            ctx.max_emb_dim,
-                            ctx.max_val_dim,
-                            all_dims_vec4,
                         )
                     pui = ctx.persisted_unique_indices
                     assert pui is not None
                     if pui.numel() > 0:
                         keys_c = ctx.unique_keys[pui]
                         tids_c = unique_table_ids[pui]
-                        vals_c = ctx.unique_values[pui]
+                        vals_c = ctx.unique_values.values[pui]
                         with torch.cuda.nvtx.range("op:storage_insert"), table_section(
                             ctx.table_gate
                         ):

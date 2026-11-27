@@ -507,7 +507,8 @@ public:
     CUDA_CHECK(cudaHostUnregister(m_addr_h));
 
     // mremap() may relocate the buffer (MREMAP_MAYMOVE); that is safe because
-    // callers rebuild value-buffer pointers after extend() (get_table_ptrs()).
+    // callers rebuild value-buffer pointers after extend()
+    // (MixedDimBuffers.grow_to refreshes them).
     void *new_addr = mremap(m_addr_h, old_size, new_bytes, MREMAP_MAYMOVE);
     if (new_addr == MAP_FAILED) {
       int saved_errno = errno; // mremap left the old mapping intact.

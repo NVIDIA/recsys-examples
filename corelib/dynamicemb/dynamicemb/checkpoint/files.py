@@ -467,7 +467,7 @@ def save_to_json(data: Dict[str, Any], file_path: str) -> None:
 # Key / embedding / score / optimizer-state files are bare row-major blobs with
 # no header, so the table's meta JSON is the only record of how to read them
 # back. Embeddings and optimizer states are dumped at the table's own precision
-# (``DynamicEmbTableState.emb_dtype``) rather than being upcast to fp32, which
+# (``DynamicEmbTableState.buffers.dtype``) rather than being upcast to fp32, which
 # makes ``embedding_dtype`` and ``embedding_dim`` load-bearing rather than
 # decorative. Checkpoints written before those keys existed are always fp32, and
 # their dim is recoverable from the file size -- see

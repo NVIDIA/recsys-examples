@@ -169,7 +169,7 @@ OptimizerT = TypeVar("OptimizerT")
 
 
 class CopyMode(enum.Enum):
-    """Copy mode for load_from_flat / store_to_flat.
+    """Copy mode for MixedDimBuffers.load_to_padded / store_from_padded.
 
     EMBEDDING -- 1-region copy: copies only the embedding portion per row,
                  padded to max_emb_dim. Output: [N, max_emb_dim].

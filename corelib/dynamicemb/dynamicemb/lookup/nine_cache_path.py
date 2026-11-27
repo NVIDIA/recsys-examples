@@ -24,12 +24,10 @@ from dynamicemb.key_value_table import (
     DynamicEmbCache,
     Storage,
     _select,
-    load_from_flat,
     score_source,
-    store_to_flat,
 )
 from dynamicemb.types import CopyMode, MultiTableAdmitter
-from dynamicemb_extensions import EvictStrategy, flagged_compact
+from dynamicemb_extensions import EvictStrategy, PaddedBufferView, flagged_compact
 
 
 def prefetch_nine_cache_path(
@@ -37,8 +35,7 @@ def prefetch_nine_cache_path(
     storage: Storage,
     unique_keys: torch.Tensor,
     unique_table_ids: torch.Tensor,
-    max_emb_dim: int,
-    max_val_dim: int,
+    padded_view: PaddedBufferView,
     emb_dtype: torch.dtype,
     initializer: MultiTableInitializer,
     evict_strategy: Optional[EvictStrategy],
@@ -159,10 +156,9 @@ def prefetch_nine_cache_path(
                 initializer,
                 adm_keys,
                 adm_tids,
-                max_emb_dim,
-                max_val_dim,
+                padded_view,
                 emb_dtype,
-            )
+            ).values
 
         # 6. The score a key enters the cache with. An LFU key the store has comes
         # with the count the store kept for it (its find has added this batch's).
@@ -207,12 +203,11 @@ def prefetch_nine_cache_path(
         # 8. What it evicted: read before the slots are overwritten, then write
         # back to the store with the scores the cache kept for it
         with torch.cuda.nvtx.range("op:load_from_flat"):
-            evicted_values = load_from_flat(
-                state, evicted_slots, evicted_tids, copy_mode=CopyMode.VALUE
+            evicted_values = state.buffers.load_to_padded(
+                evicted_slots, evicted_tids, copy_mode=CopyMode.VALUE
             )
         with torch.cuda.nvtx.range("op:store_to_flat"):
-            store_to_flat(
-                state,
+            state.buffers.store_from_padded(
                 cache_slots,
                 cache_tids,
                 _select(values, into_cache, num_cache == num_miss),

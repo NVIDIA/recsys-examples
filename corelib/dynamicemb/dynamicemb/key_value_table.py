@@ -112,18 +112,12 @@ from dynamicemb.state.table_state import (  # noqa: F401 (re-exported)
     collect_table_sizes_for_state,
     collect_table_sizes_to_device,
     create_table_state,
-    get_table_ptrs,
     get_uvm_tensor,
 )
 from dynamicemb.state.value_rows import (  # noqa: F401 (re-exported)
     _encode_slot_index,
     _row_differs_from_slot,
     _split_value_row,
-    load_from_flat,
-    load_from_flat_by,
-    load_from_flat_single_table,
-    store_to_flat,
-    store_to_flat_single_table,
 )
 from dynamicemb.types import SCORE_TYPE, Cache, CopyMode, ReplayStats, Storage
 from dynamicemb.utils import (  # noqa: F401 (re-exported)
@@ -252,19 +246,19 @@ class DynamicEmbCache(Cache):
         return self._state.num_tables
 
     def embedding_dtype(self) -> torch.dtype:
-        return self._state.emb_dtype
+        return self._state.buffers.dtype
 
     def embedding_dim(self, table_id: int) -> int:
-        return self._state.table_emb_dims_cpu[table_id]
+        return self._state.buffers.emb_dims_list[table_id]
 
     def value_dim(self, table_id: int) -> int:
-        return self._state.table_value_dims_cpu[table_id]
+        return self._state.buffers.value_dims_list[table_id]
 
     def max_embedding_dim(self) -> int:
-        return self._state.emb_dim
+        return self._state.buffers.max_emb_dim
 
     def max_value_dim(self) -> int:
-        return self._state.value_dim
+        return self._state.buffers.max_value_dim
 
     def init_optimizer_state(self) -> float:
         return self._state.optimizer.get_initial_optimizer_state()
@@ -549,7 +543,9 @@ class DynamicEmbStorage(Storage):
             indices,
         ) = result
         flat_rows = indices
-        values = load_from_flat(self._state, flat_rows, table_ids, copy_mode=copy_mode)
+        values = self._state.buffers.load_to_padded(
+            flat_rows, table_ids, copy_mode=copy_mode
+        )
 
         return (
             h_num_missing,
@@ -758,7 +754,7 @@ class DynamicEmbStorage(Storage):
             )
             scores_batch = named_scores[s.incremental_score_name]
             flat_rows = indices
-            values = load_from_flat_single_table(s, flat_rows, table_id)
+            values = s.buffers.load(table_id, flat_rows)
             value, opt = _split_value_row(s, table_id, values)
             key = keys.to(s.device) if keys.device.type != "cuda" else keys
             slot = _encode_slot_index(s, slots, flat_rows)
@@ -775,13 +771,13 @@ class DynamicEmbStorage(Storage):
             all_opts.append(opt)
             all_scores.append(score_block)
         device_for_gather = state.device
-        emb_dim_t = state.table_emb_dims_cpu[table_id]
+        emb_dim_t = state.buffers.emb_dims_list[table_id]
         # Checkpoint width, matching what _split_value_row emits: an empty
         # batch still has to agree on column count with the non-empty ranks it
         # is all_gathered against.
         opt_dim_t = (
             state.optimizer.get_ckpt_state_dim(emb_dim_t)
-            if state.table_value_dims_cpu[table_id] > emb_dim_t
+            if state.buffers.value_dims_list[table_id] > emb_dim_t
             else 0
         )
         num_scores = state.key_index_map.num_scores_
@@ -796,7 +792,7 @@ class DynamicEmbStorage(Storage):
             dev = device_for_gather if do_multi_rank_gather else "cpu"
             keys_cat = torch.empty(0, dtype=torch.int64, device=dev)
             values_cat = torch.empty(
-                0, emb_dim_t, dtype=checkpoint_dtype(state.emb_dtype), device=dev
+                0, emb_dim_t, dtype=checkpoint_dtype(state.buffers.dtype), device=dev
             )
             slots_cat = torch.empty(
                 (0, 2) if _row_differs_from_slot(state) else (0,),
@@ -808,7 +804,7 @@ class DynamicEmbStorage(Storage):
                 torch.empty(
                     0,
                     opt_dim_t,
-                    dtype=state.optimizer.get_state_dtype(state.emb_dtype),
+                    dtype=state.optimizer.get_state_dtype(state.buffers.dtype),
                     device=dev,
                 )
                 if opt_dim_t > 0
@@ -966,27 +962,29 @@ class DynamicEmbStorage(Storage):
     # -- Property accessors --
 
     def embedding_dtype(self) -> torch.dtype:
-        return self._state.emb_dtype
+        return self._state.buffers.dtype
 
     def embedding_dim(self, table_id: int) -> int:
-        return self._state.table_emb_dims_cpu[table_id]
+        return self._state.buffers.emb_dims_list[table_id]
 
     def value_dim(self, table_id: int) -> int:
-        return self._state.table_value_dims_cpu[table_id]
+        return self._state.buffers.value_dims_list[table_id]
 
     def max_embedding_dim(self) -> int:
-        return self._state.emb_dim
+        return self._state.buffers.max_emb_dim
 
     def max_value_dim(self) -> int:
-        return self._state.value_dim
+        return self._state.buffers.max_value_dim
 
     def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
         return (
-            self._state.table_emb_dims if on_device else self._state.table_emb_dims_host
+            self._state.buffers.emb_dims
+            if on_device
+            else self._state.buffers.emb_dims_host
         )
 
     def all_dims_vec4(self) -> bool:
-        return self._state.all_dims_vec4
+        return self._state.buffers.all_dims_vec4
 
     def init_optimizer_state(self) -> float:
         return self._state.optimizer.get_initial_optimizer_state()
@@ -1082,29 +1080,31 @@ class HybridStorage(Storage):
     # -- Storage property accessors --
 
     def embedding_dtype(self) -> torch.dtype:
-        return self._hbm.emb_dtype
+        return self._hbm.buffers.dtype
 
     def embedding_dim(self, table_id: int) -> int:
-        return self._hbm.table_emb_dims_cpu[table_id]
+        return self._hbm.buffers.emb_dims_list[table_id]
 
     def value_dim(self, table_id: int) -> int:
-        return self._hbm.table_value_dims_cpu[table_id]
+        return self._hbm.buffers.value_dims_list[table_id]
 
     def max_embedding_dim(self) -> int:
-        return self._hbm.emb_dim
+        return self._hbm.buffers.max_emb_dim
 
     def max_value_dim(self) -> int:
-        return self._hbm.value_dim
+        return self._hbm.buffers.max_value_dim
 
     def embedding_dims(self, on_device: bool = False) -> torch.Tensor:
-        # find() builds the value buffer from the HBM tier (load_from_flat(self._hbm)),
+        # find() builds the value buffer from the HBM tier (``self._hbm.buffers.load_to_padded``),
         # and max_*_dim above also report the HBM tier, so its dims are authoritative.
-        return self._hbm.table_emb_dims if on_device else self._hbm.table_emb_dims_host
+        return (
+            self._hbm.buffers.emb_dims if on_device else self._hbm.buffers.emb_dims_host
+        )
 
     def all_dims_vec4(self) -> bool:
         # HBM tier produces the value buffer in find(); its alignment governs
         # whether the vec4 padded-buffer kernels are safe for all rows.
-        return self._hbm.all_dims_vec4
+        return self._hbm.buffers.all_dims_vec4
 
     def init_optimizer_state(self) -> float:
         return self._hbm.optimizer.get_initial_optimizer_state()
@@ -1188,7 +1188,9 @@ class HybridStorage(Storage):
         ) = result_hbm
 
         flat_hbm = indices_hbm
-        values = load_from_flat(self._hbm, flat_hbm, table_ids, copy_mode=copy_mode)
+        values = self._hbm.buffers.load_to_padded(
+            flat_hbm, table_ids, copy_mode=copy_mode
+        )
 
         if h_num_missing_hbm == 0:
             return (
@@ -1220,8 +1222,8 @@ class HybridStorage(Storage):
         ) = result_host
 
         flat_host = indices_host
-        host_vals = load_from_flat(
-            self._host, flat_host, missing_table_ids_hbm, copy_mode=copy_mode
+        host_vals = self._host.buffers.load_to_padded(
+            flat_host, missing_table_ids_hbm, copy_mode=copy_mode
         )
 
         host_found_mask = founds_host
@@ -1287,7 +1289,7 @@ class HybridStorage(Storage):
 
         * ``preserve_existing=True`` (e.g. autograd backward refresh): **no insert**.
           Performs the same two-tier lookup as :meth:`find`, and only
-          ``store_to_flat`` updates rows that already exist in HBM or host. Keys
+          ``buffers.store_from_padded`` updates rows that already exist in HBM or host. Keys
           absent from both tiers are ignored.
         """
         if preserve_existing:
@@ -1305,8 +1307,7 @@ class HybridStorage(Storage):
             ) = _find_keys(self._hbm, unique_keys, table_ids)
             if founds_hbm.any():
                 flat_hbm = indices_hbm
-                store_to_flat(
-                    self._hbm,
+                self._hbm.buffers.store_from_padded(
                     flat_hbm[founds_hbm],
                     table_ids[founds_hbm],
                     unique_values[founds_hbm],
@@ -1330,8 +1331,7 @@ class HybridStorage(Storage):
                 if founds_host.any():
                     orig_rows = missing_indices_hbm[founds_host]
                     flat_host = indices_host
-                    store_to_flat(
-                        self._host,
+                    self._host.buffers.store_from_padded(
                         flat_host[founds_host],
                         missing_table_ids_hbm[founds_host],
                         unique_values[orig_rows],
@@ -1353,11 +1353,11 @@ class HybridStorage(Storage):
             preserve_existing=False,
         )
 
-        evicted_values = load_from_flat(
-            self._hbm, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
+        evicted_values = self._hbm.buffers.load_to_padded(
+            evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
         )
         select_insert_failed_values(evicted_indices, unique_values, evicted_values)
-        store_to_flat(self._hbm, indices, table_ids, unique_values)
+        self._hbm.buffers.store_from_padded(indices, table_ids, unique_values)
 
         if num_evicted != 0:
             _insert_key_values(
@@ -1423,7 +1423,7 @@ class HybridStorage(Storage):
             )
             scores_batch = named_scores[s.incremental_score_name]
             flat_rows = indices
-            values = load_from_flat_single_table(s, flat_rows, table_id)
+            values = s.buffers.load(table_id, flat_rows)
             value, opt = _split_value_row(s, table_id, values)
             key = keys.to(s.device) if keys.device.type != "cuda" else keys
             slot = _encode_slot_index(s, indices, flat_rows, tier=tier)
@@ -1442,12 +1442,12 @@ class HybridStorage(Storage):
             all_opts.append(opt)
             all_scores.append(score_block)
         device_for_gather = states_to_dump[0].device
-        emb_dim_t = states_to_dump[0].table_emb_dims_cpu[table_id]
+        emb_dim_t = states_to_dump[0].buffers.emb_dims_list[table_id]
         # Checkpoint width -- see the note in DynamicEmbStorage.incremental_dump.
         st0 = states_to_dump[0]
         opt_dim_t = (
             st0.optimizer.get_ckpt_state_dim(emb_dim_t)
-            if st0.table_value_dims_cpu[table_id] > emb_dim_t
+            if st0.buffers.value_dims_list[table_id] > emb_dim_t
             else 0
         )
         has_opt = bool(all_opts) and all_opts[0] is not None
@@ -1623,15 +1623,15 @@ class HybridStorage(Storage):
                 "dump is not yet supported for HybridStorage with multi-word "
                 "score layouts (e.g. the (TIMESTAMP, LFU) compound score with caching)."
             )
-        if self._host.emb_dtype != self._hbm.emb_dtype:
+        if self._host.buffers.dtype != self._hbm.buffers.dtype:
             # The HBM tier is appended into the host tier's value files, under a
             # single meta describing one dtype, so two precisions in one file
             # would be unreadable. Both tiers are built from the same table
             # options today, so this is a guard, not a supported configuration.
             raise NotImplementedError(
                 "dump is not supported for HybridStorage whose tiers store "
-                f"different precisions (host {self._host.emb_dtype}, HBM "
-                f"{self._hbm.emb_dtype}); they share one value file."
+                f"different precisions (host {self._host.buffers.dtype}, HBM "
+                f"{self._hbm.buffers.dtype}); they share one value file."
             )
         _dump_table(
             self._host,
@@ -1712,7 +1712,7 @@ class HybridStorage(Storage):
             0,
             params.num_keys
             + self._hbm.estimated_table_sizes[table_id].item()
-            - self._hbm.tables[table_id].tensor().size(0),
+            - self._hbm.buffers.num_rows(table_id),
         )
 
         self.expand_if_need(unique_size_per_table)
@@ -1742,22 +1742,22 @@ class HybridStorage(Storage):
                 opt_states = torch.empty(
                     keys.numel(),
                     params.runtime_optstate_dim,
-                    dtype=self._hbm.emb_dtype,
+                    dtype=self._hbm.buffers.dtype,
                     device=device,
                 )
                 self._hbm.optimizer.reset_optimizer_states(
                     opt_states,
-                    emb_dims=self._hbm.table_emb_dims_cpu[table_id],
+                    emb_dims=self._hbm.buffers.emb_dims_list[table_id],
                 )
             elif opt_states is not None and params.runtime_optstate_dim > 0:
                 opt_states = self._hbm.optimizer.states_from_checkpoint(
                     opt_states,
-                    self._hbm.table_emb_dims_cpu[table_id],
-                    self._hbm.emb_dtype,
+                    self._hbm.buffers.emb_dims_list[table_id],
+                    self._hbm.buffers.dtype,
                     device,
                 )
 
-            vtype = self._hbm.emb_dtype
+            vtype = self._hbm.buffers.dtype
             values = (
                 torch.cat(
                     [encode_table_values(embeddings, vtype), opt_states.to(vtype)],
@@ -1780,14 +1780,13 @@ class HybridStorage(Storage):
                 evicted_scores,
             ) = _insert_and_evict_keys(self._hbm, keys, tids, file_scores)
 
-            evicted_values = load_from_flat(
-                self._hbm,
+            evicted_values = self._hbm.buffers.load_to_padded(
                 evicted_indices,
                 evicted_table_ids,
                 copy_mode=CopyMode.VALUE,
             )
             select_insert_failed_values(evicted_indices, values, evicted_values)
-            store_to_flat_single_table(self._hbm, ins_indices, table_id, values)
+            self._hbm.buffers.store(table_id, ins_indices, values)
 
             if num_evicted != 0:
                 _insert_key_values(
@@ -1938,7 +1937,9 @@ def flush_cache(
             table_id=t,
         ):
             tid = torch.full((keys.numel(),), t, dtype=torch.int64, device=keys.device)
-            values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE)
+            values = state.buffers.load_to_padded(
+                indices, tid, copy_mode=CopyMode.VALUE
+            )
             if cache_owns_scores:
                 storage.insert(keys, tid, values, named_scores[state.score_policy.name])
             else:
@@ -1986,8 +1987,8 @@ def _eval_lookup_cached(
 ) -> torch.Tensor:
     _, founds, cache_indices = cache.lookup(keys, table_ids)
 
-    embs = load_from_flat(
-        cache._state, cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
+    embs = cache._state.buffers.load_to_padded(
+        cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
     )
 
     missing_mask = ~founds

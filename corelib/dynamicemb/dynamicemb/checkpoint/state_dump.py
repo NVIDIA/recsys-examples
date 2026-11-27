@@ -30,7 +30,6 @@ from dynamicemb.checkpoint.files import (
     save_to_json,
 )
 from dynamicemb.score.strategy import score_dump_permutation
-from dynamicemb.state.value_rows import load_from_flat_single_table
 from dynamicemb.types import SCORE_TYPE
 from dynamicemb.utils import checkpoint_dtype, decode_table_values
 from dynamicemb_extensions import EvictStrategy
@@ -49,12 +48,12 @@ def export_keys_values_iter(
     """Export keys, embeddings, opt_states, scores for a logical table.
 
     Embeddings and optimizer states come out at the table's own precision
-    (``state.emb_dtype``), matching what ``incremental_dump`` yields, so a
+    (``state.buffers.dtype``), matching what ``incremental_dump`` yields, so a
     checkpoint stores what the table actually holds instead of an fp32 widening
     of it. Callers that want fp32 cast on their own.
     """
-    emb_dim_t = state.table_emb_dims_cpu[table_id]
-    vdim = state.table_value_dims_cpu[table_id]
+    emb_dim_t = state.buffers.emb_dims_list[table_id]
+    vdim = state.buffers.value_dims_list[table_id]
     optim_state_dim = vdim - emb_dim_t
 
     for (
@@ -72,9 +71,9 @@ def export_keys_values_iter(
     ):
         scores = named_scores[state.score_policy.name]
         flat_rows = indices
-        values = load_from_flat_single_table(state, flat_rows, table_id)
+        values = state.buffers.load(table_id, flat_rows)
         embeddings = decode_table_values(
-            values[:, :emb_dim_t], checkpoint_dtype(state.emb_dtype)
+            values[:, :emb_dim_t], checkpoint_dtype(state.buffers.dtype)
         ).contiguous()
         if optim_state_dim != 0:
             opt_states = values[:, -optim_state_dim:].contiguous().to(device)
@@ -134,13 +133,13 @@ def _dump_table(
         # tier of a hybrid dump): anything a loader needs has to be contributed
         # here, because there is no later pass that merges into the file.
         meta_data[META_EMBEDDING_DTYPE] = dtype_to_meta_name(
-            checkpoint_dtype(state.emb_dtype)
+            checkpoint_dtype(state.buffers.dtype)
         )
-        meta_data[META_EMBEDDING_DIM] = int(state.table_emb_dims_cpu[table_id])
+        meta_data[META_EMBEDDING_DIM] = int(state.buffers.emb_dims_list[table_id])
         # Recorded separately from the embedding dtype because the two can
         # differ: rowwise Adagrad keeps its accumulator in fp32 in any table.
         meta_data[META_OPT_STATE_DTYPE] = dtype_to_meta_name(
-            state.optimizer.get_state_dtype(state.emb_dtype)
+            state.optimizer.get_state_dtype(state.buffers.dtype)
         )
 
         if current_score is not None:
@@ -165,7 +164,7 @@ def _dump_table(
         if fopt_states and opt_states_batch is not None:
             to_write = state.optimizer.states_for_checkpoint(
                 opt_states_batch,
-                state.table_emb_dims_cpu[table_id],
+                state.buffers.emb_dims_list[table_id],
             )
             fopt_states.write(_raw_bytes(to_write))
 

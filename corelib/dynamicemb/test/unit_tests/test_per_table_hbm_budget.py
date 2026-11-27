@@ -32,7 +32,6 @@ from dynamicemb import (
     EmbOptimType,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.state.extendable_buffer import DeviceExtendableBuffer
 from dynamicemb.state.storage_layout import CachePolicy, StorageLayout, StorageTier
 
 DIM = 16
@@ -79,10 +78,9 @@ def hbm_tier(model):
 
 
 def assert_on_device(state):
-    for i, buf in enumerate(state.tables):
-        assert isinstance(
-            buf, DeviceExtendableBuffer
-        ), f"table {i}'s HBM rows were allocated as {type(buf).__name__}"
+    assert (
+        state.buffers.kind == "device"
+    ), f"the HBM rows were allocated as {state.buffers.kind!r}"
 
 
 def train_one_step(model, current_device, bags=2):

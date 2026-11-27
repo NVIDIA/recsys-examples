@@ -121,12 +121,11 @@ def _tier_bytes_from_state(state) -> List[Tuple[int, int, int, int, int, int]]:
     """
     rows = []
     for t in range(state.num_tables):
-        buf = state.tables[t]
         opt = state.options_list[t]
-        value_dim = state.table_value_dims_cpu[t]
-        emb_dim = state.table_emb_dims_cpu[t]
+        value_dim = state.buffers.value_dims_list[t]
+        emb_dim = state.buffers.emb_dims_list[t]
         elem = DTYPE_NUM_BYTES[opt.embedding_dtype]
-        init_total = buf.num_bytes()
+        init_total = state.buffers.num_bytes(t)
         init_emb = init_total * emb_dim // value_dim
         init_opt = init_total - init_emb
         peak_total = opt.max_capacity * value_dim * elem
@@ -2855,7 +2854,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         Note the two meanings of ``tables`` in play: a storage's tiers, each of
         which has its own ``tables`` of value buffers indexed by logical table.
         """
-        return tuple(s.tables[table_id].shape[0] for s in storage.tables)
+        return tuple(s.buffers.num_rows(table_id) for s in storage.tables)
 
     @staticmethod
     def _capacity_of(

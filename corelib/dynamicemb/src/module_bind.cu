@@ -28,6 +28,7 @@ void bind_index_calculation_op(py::module &m);
 void bind_initializer_op(py::module &m);
 void bind_table_operation(py::module &m);
 void bind_vmm_op(py::module &m);
+void bind_mixed_dim_view(py::module &m);
 #ifndef DEMB_NO_HIER_OUTPUT_DIST // defined by setup.py without NCCL >= 2.30.7
 void bind_hier_output_dist(py::module &m);
 #endif
@@ -35,6 +36,8 @@ void bind_hier_output_dist(py::module &m);
 PYBIND11_MODULE(dynamicemb_extensions, m) {
   m.doc() = "DYNAMICEMB"; // Optional
 
+  // The views first: entry points taking them are bound after.
+  bind_mixed_dim_view(m);
   bind_dyn_emb_op(m);
   bind_unique_op(m);
   bind_bucktiz_kernel_op(m);

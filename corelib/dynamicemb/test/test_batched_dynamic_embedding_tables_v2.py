@@ -50,8 +50,6 @@ from dynamicemb.key_value_table import (
     HybridStorage,
     Storage,
     export_keys_values_iter,
-    load_from_flat,
-    load_from_flat_single_table,
 )
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
@@ -457,7 +455,7 @@ def _assert_cache_export_matches_lookup_embeddings(
     *,
     batch_size: int = 65536,
 ) -> None:
-    """Check GPU cache: exported (key, slot) rows match ``lookup`` + ``load_from_flat``.
+    """Check GPU cache: exported (key, slot) rows match ``lookup`` + ``buffers.load_to_padded``.
 
     Uses ``training=False`` on cache state so lookup does not mutate scores.
     No-op when ``bdebt.cache`` is None.
@@ -482,8 +480,8 @@ def _assert_cache_export_matches_lookup_embeddings(
                 assert bool(
                     founds.all()
                 ), f"cache table_id={tid}: every exported key must be found via lookup"
-                emb_slots = load_from_flat(
-                    state, indices, tids, copy_mode=CopyMode.EMBEDDING
+                emb_slots = state.buffers.load_to_padded(
+                    indices, tids, copy_mode=CopyMode.EMBEDDING
                 )
                 torch.testing.assert_close(
                     emb_exp.to(dtype=emb_slots.dtype),
@@ -521,7 +519,7 @@ def _assert_storage_export_matches_find_embeddings(
                 state.options_list[tid].initializer_args.mode
                 == DynamicEmbInitializerMode.DEBUG
             )
-            emb_dim_t = state.table_emb_dims_cpu[tid]
+            emb_dim_t = state.buffers.emb_dims_list[tid]
             for keys, emb_exp, _, _ in storage.export_keys_values(
                 device, batch_size, tid
             ):
@@ -629,12 +627,12 @@ def _kim_scan_keys_embeddings_dict(
     """Scan KIM + value buffer: (table_id, key) -> embedding.
 
     Does not call ``Storage.export_keys_values`` / ``export_keys_values_iter``;
-    uses ``_batched_export_keys_scores`` and :func:`load_from_flat_single_table` only.
+    uses ``_batched_export_keys_scores`` and ``buffers.load`` only.
     """
     out: Dict[Tuple[int, int], torch.Tensor] = {}
     score_name = state.score_policy.name
     for tid in range(state.num_tables):
-        emb_dim_t = state.table_emb_dims_cpu[tid]
+        emb_dim_t = state.buffers.emb_dims_list[tid]
         for (
             keys,
             named_scores,
@@ -650,7 +648,7 @@ def _kim_scan_keys_embeddings_dict(
                 continue
             scores = named_scores[score_name]  # noqa: F841
             flat_rows = indices
-            values = load_from_flat_single_table(state, flat_rows, tid)
+            values = state.buffers.load(tid, flat_rows)
             embeddings = values[:, :emb_dim_t].contiguous().to(device)
             keys_dev = keys.to(device=device)
             for i in range(keys.numel()):
@@ -670,7 +668,7 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
 
     - Fills a dict from backing ``DynamicEmbStorage`` KIM scan, then overlays cache scan
       (cache wins on key collision).
-    - Verifies every merged (table_id, key) matches ``cache.lookup`` + ``load_from_flat``
+    - Verifies every merged (table_id, key) matches ``cache.lookup`` + ``buffers.load_to_padded``
       when present in cache, else ``storage.find`` (embedding column).
     """
     storage = bdebt.tables
@@ -721,8 +719,7 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                 _, founds_c, ix_c = cache.lookup(key_t, tid_t, None)
                 emb_live = torch.empty_like(ref)
                 if bool(founds_c.any()):
-                    emb_live[founds_c] = load_from_flat(
-                        ca,
+                    emb_live[founds_c] = ca.buffers.load_to_padded(
                         ix_c[founds_c],
                         tid_t[founds_c],
                         copy_mode=CopyMode.EMBEDDING,
@@ -3382,13 +3379,13 @@ def test_fp8_table_learns_from_gradients_fp16_would_flush(
     fused = RowWiseAdaGradDynamicEmbeddingOptimizer.fused_update_for_flat_table
     padded = RowWiseAdaGradDynamicEmbeddingOptimizer.update_for_padded_buffer
 
-    def spy_fused(self, grads, *args):
-        seen.append((args[-1], grads.dtype))
-        return fused(self, grads, *args)
+    def spy_fused(self, view, grads, *args):
+        seen.append((view.dtype, grads.dtype))
+        return fused(self, view, grads, *args)
 
-    def spy_padded(self, grads, values, *args):
+    def spy_padded(self, view, grads, values, *args):
         seen.append((values.dtype, grads.dtype))
-        return padded(self, grads, values, *args)
+        return padded(self, view, grads, values, *args)
 
     monkeypatch.setattr(
         RowWiseAdaGradDynamicEmbeddingOptimizer,

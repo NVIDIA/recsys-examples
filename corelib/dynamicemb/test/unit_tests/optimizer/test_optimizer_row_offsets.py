@@ -46,8 +46,6 @@ cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA d
 
 dynamicemb_extensions = pytest.importorskip("dynamicemb_extensions")
 
-from dynamicemb.utils import torch_to_dyn_emb  # noqa: E402
-
 # 2**20 rows of 4096 elements is exactly 2**32 elements; go past it.
 ROWS = (1 << 20) + 16
 PATTERN = 7  # row r's gradient is r % PATTERN + 1, and 2**20 % 7 != 0
@@ -67,28 +65,28 @@ def _update(path, grads, values, emb_dim, all_dims_vec4):
     table_ids = torch.zeros(ROWS, dtype=torch.int64, device=device)
     table_emb_dims = torch.tensor([emb_dim], dtype=torch.int64, device=device)
     if path == "flat":
-        dynamicemb_extensions.sgd_update_for_flat_table(
-            grads,
-            torch.arange(ROWS, dtype=torch.int64, device=device),
+        view = dynamicemb_extensions.FlatTablesView(
             torch.tensor([values.data_ptr()], dtype=torch.int64, device=device),
-            table_ids,
             torch.tensor([values.size(1)], dtype=torch.int64, device=device),
-            table_emb_dims,
-            grads.size(1),
-            all_dims_vec4,
-            LR,
-            torch_to_dyn_emb(values.dtype).value,
-        )
-    else:
-        dynamicemb_extensions.sgd_update_for_padded_buffer(
-            grads,
-            values,
-            table_ids,
             table_emb_dims,
             emb_dim,
             values.size(1),
             all_dims_vec4,
+            values.dtype,
+        )
+        dynamicemb_extensions.sgd_update_for_flat_table(
+            view,
+            grads,
+            torch.arange(ROWS, dtype=torch.int64, device=device),
+            table_ids,
             LR,
+        )
+    else:
+        view = dynamicemb_extensions.PaddedBufferView(
+            table_emb_dims, emb_dim, values.size(1), all_dims_vec4
+        )
+        dynamicemb_extensions.sgd_update_for_padded_buffer(
+            view, grads, values, table_ids, LR
         )
 
 

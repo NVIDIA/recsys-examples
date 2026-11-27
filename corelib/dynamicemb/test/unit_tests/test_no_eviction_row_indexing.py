@@ -178,7 +178,7 @@ def test_resident_keys_reread_correctly(current_device):
 
     Regression: the HBM-direct prefetch returned the *hash slot* for keys that hit
     in the table (``h_num_missing == 0`` early return), and the forward fed that
-    straight into ``load_from_flat``. For NO_EVICTION the key map is twice the
+    straight into ``buffers.load_to_padded``. For NO_EVICTION the key map is twice the
     value buffer, so roughly half those slots addressed rows past the end of the
     buffer -- an illegal memory access.
     """
@@ -548,7 +548,7 @@ def test_key_map_stays_twice_the_value_buffer_through_expansion(current_device):
     state = model._storage._state
 
     def ratio() -> float:
-        return state.key_index_map.capacity(0) / state.tables[0].shape[0]
+        return state.key_index_map.capacity(0) / state.buffers.num_rows(0)
 
     assert ratio() == 2.0
 
@@ -579,7 +579,7 @@ def test_unaligned_init_capacity_leaves_a_row_for_every_slot_to_fill(current_dev
     model = build_model(current_device, max_capacity=65536 * 2, init_capacity=100)
     state = model._storage._state
     assert state.key_index_map.capacity(0) == 256
-    assert state.tables[0].shape[0] == 128
+    assert state.buffers.num_rows(0) == 128
 
     # Half the key map: fills the buffer. A single batch, since a later forward
     # counts every key in it as possibly new, resident or not, and would expand.
@@ -596,7 +596,7 @@ def test_rows_handed_out_grow_the_value_buffer_not_the_key_map(current_device):
     model = build_model(current_device, max_capacity=65536 * 2, init_capacity=4096)
     state = model._storage._state
     km = state.key_index_map
-    assert (km.capacity(0), state.tables[0].shape[0]) == (8192, 4096)
+    assert (km.capacity(0), state.buffers.num_rows(0)) == (8192, 4096)
 
     km.reserve_rows(0, 3000)  # three thousand rows out, no live key at all
     assert collect_table_sizes_to_device(state).cpu().tolist() == [0]
@@ -610,12 +610,12 @@ def test_rows_handed_out_grow_the_value_buffer_not_the_key_map(current_device):
     assert flags == [False]  # 1500 keys in 8192 slots: the key map has room
 
     model._storage.expand_if_need(torch.tensor([500]))
-    assert state.tables[0].shape[0] == 4096  # 3500 rows fit
+    assert state.buffers.num_rows(0) == 4096  # 3500 rows fit
 
     model._storage.expand_if_need(torch.tensor([1500]))  # 4500 rows do not
     km = state.key_index_map
     assert km.capacity(0) == 8192, "the key map grew for rows, not keys"
-    assert state.tables[0].shape[0] == 8192  # doubled, and no more slots to fill
+    assert state.buffers.num_rows(0) == 8192  # doubled, and no more slots to fill
     assert km.num_rows(0) == 3000
 
 
@@ -688,7 +688,7 @@ def test_erase_and_reinsert_never_outgrows_the_value_buffer(current_device):
         live += new
         assert_debug_values(train_step(model, new, device), new)
         km = state.key_index_map  # an expansion swaps it: read it again
-        assert km.num_rows(0) <= state.tables[0].shape[0] <= km.capacity(0)
+        assert km.num_rows(0) <= state.buffers.num_rows(0) <= km.capacity(0)
         assert int(km.size(0)) == len(live), "a live key was lost"
     assert_debug_values(train_step(model, live, device), live)
 
@@ -727,7 +727,7 @@ def test_replacing_the_whole_live_set_does_not_grow_the_key_map(current_device):
         km = state.key_index_map  # an expansion swaps it: read it again
         assert int(km.size(0)) == window, f"round {r}: a key was lost or not stored"
         assert km.capacity(0) == capacity, f"round {r}: the key map grew"
-        assert km.num_rows(0) <= state.tables[0].shape[0] <= capacity
+        assert km.num_rows(0) <= state.buffers.num_rows(0) <= capacity
 
     # They were stored, not just initialised on the way out: read them back.
     assert_debug_values(train_step(model, live, device), live)
@@ -797,7 +797,7 @@ def test_load_expands_for_every_key_in_the_checkpoint(
 
         target = build_model(current_device, max_capacity=65536 * 2, init_capacity=1024)
         state = target._storage._state
-        assert (state.key_index_map.capacity(0), state.tables[0].shape[0]) == (
+        assert (state.key_index_map.capacity(0), state.buffers.num_rows(0)) == (
             2048,
             1024,
         )
@@ -805,9 +805,9 @@ def test_load_expands_for_every_key_in_the_checkpoint(
         torch.cuda.synchronize()
 
     assert (state.key_index_map.capacity(0) > 2048) == expect_expansion
-    assert state.key_index_map.capacity(0) == 2 * state.tables[0].shape[0]
+    assert state.key_index_map.capacity(0) == 2 * state.buffers.num_rows(0)
     assert next_row_counter(target) == num_keys
-    assert next_row_counter(target) <= state.tables[0].shape[0]
+    assert next_row_counter(target) <= state.buffers.num_rows(0)
     assert_debug_values(lookup(target, keys, device), keys)
 
 
@@ -843,7 +843,7 @@ def test_load_reserves_room_only_for_the_keys_this_rank_keeps(current_device):
             dist_type="roundrobin",
         )
         state = target._storage._state
-        assert (state.key_index_map.capacity(0), state.tables[0].shape[0]) == (
+        assert (state.key_index_map.capacity(0), state.buffers.num_rows(0)) == (
             2048,
             1024,
         )
@@ -864,5 +864,5 @@ def test_load_reserves_room_only_for_the_keys_this_rank_keeps(current_device):
 
     assert next_row_counter(target) == len(mine)
     assert state.key_index_map.capacity(0) == 2048, "grew for keys it does not keep"
-    assert state.tables[0].shape[0] == 1024
+    assert state.buffers.num_rows(0) == 1024
     assert_debug_values(lookup(target, mine, device), mine)
