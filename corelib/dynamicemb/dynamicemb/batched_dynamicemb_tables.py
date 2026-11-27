@@ -17,6 +17,7 @@ import json
 import os
 import warnings
 from collections import deque
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import accumulate
@@ -37,8 +38,8 @@ from dynamicemb.batched_dynamicemb_function import (
     PrefetchState,
     dynamicemb_eval_forward,
     dynamicemb_prefetch,
-    refresh_slots_after_rehash,
-    release_slot_pins,
+    dynamicemb_resolve_eval,
+    place_lookup_output,
 )
 from dynamicemb.checkpoint.files import (  # noqa: F401 - preserve checkpoint helper exports
     encode_checkpoint_file_path,
@@ -94,13 +95,16 @@ from dynamicemb.optimizer import (
     SGDDynamicEmbeddingOptimizer,
     get_optimizer_state_dim,
 )
+from dynamicemb.resolved_storage import ActiveStorageRows
 from dynamicemb.state.storage_layout import CachePolicy, StorageLayout, StorageTier
+from dynamicemb.torchrec_lookup import TorchRecLookup
 from dynamicemb.types import ReplayStats
 from dynamicemb.utils import (
     DTYPE_NUM_BYTES,
     FP8_MAX_VALUE,
     FP8_STORAGE_DTYPE,
     checkpoint_dtype,
+    decode_table_values,
 )
 from dynamicemb_extensions import device_timestamp
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
@@ -660,10 +664,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             option.takes_score_per_key for option in self._dynamicemb_options
         )
         self._prefetch_states: Deque[PrefetchState] = deque()
-        # Hook of the hierarchical dist (shard/hier_output_dist.py, set by
-        # HierGroupedEmbeddingsLookup): where to put the sequence lookup
-        # output, in training and in eval (OutputAlloc).
         self.output_alloc: Optional[OutputAlloc] = None
+        self._active_rows = ActiveStorageRows()
+        self._native_lookup = TorchRecLookup(
+            self.dims,
+            self.feature_table_map,
+            self.pooling_mode,
+            torch.device("cuda", self.device_id),
+        )
 
         # TODO:1->10
         self._empty_tensor = nn.Parameter(
@@ -1226,8 +1234,24 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         total_unique_indices: Optional[int] = None,
         scores: Optional[Tensor] = None,
+        prefetch_state: Optional[PrefetchState] = None,
     ) -> List[Tensor]:
-        self._check_scores(scores, indices)
+        if prefetch_state is not None and (
+            prefetch_state.used or (prefetch_state.is_eval and self.training)
+        ):
+            # Reusing a distributed batch is a new lookup, as in TorchRec.
+            # Its prior reservation/snapshot belongs to the earlier graph.
+            previous = prefetch_state
+            prefetch_state = self.resolve_input(
+                previous.unique_keys[previous.reverse_indices],
+                offsets,
+                frequency_counters=previous.input_frequencies,
+                scores=previous.unique_scores[previous.reverse_indices]
+                if self.training and previous.unique_scores is not None
+                else None,
+            )
+        if prefetch_state is None:
+            self._check_scores(scores, indices)
         if indices.dtype != self.index_type:
             indices = indices.to(self.index_type)
 
@@ -1299,79 +1323,80 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
 
         if not self.training:
-            # Evaluation reads the cache and the one storage below it. A PS that
-            # is that storage (NINE, or EXTERNAL only) is read; a PS behind our
-            # own storage (HBM|DDR|EXTERNAL) is not, so a key spilled to it
-            # would be treated as missing.
-            tiers = self._storage_layout.tiers
-            if StorageTier.EXTERNAL in tiers and StorageTier.DDR in tiers:
-                raise RuntimeError(
-                    "Evaluation does not read external_storage: a key spilled to "
-                    "it would be treated as missing. Train with external_storage "
-                    "unset, or do not call eval() on this module."
+            self._check_eval_storage()
+            if prefetch_state is None:
+                self._set_eval_scores()
+                return dynamicemb_eval_forward(
+                    indices,
+                    offsets,
+                    self._cache,
+                    self._storage,
+                    self.feature_offsets,
+                    self.output_dtype,
+                    self._eval_initializer,
+                    layout,
+                    self._evict_strategy,
+                    self._counters_for_group(frequency_counters),
+                    pooling_weights,
+                    self.output_alloc,
                 )
-            frequency_counters = self._counters_for_group(frequency_counters)
-            table_scores = [self._scores[name] for name in self._table_names]
-            fused_score = self._reduce_table_scores(table_scores)
-            if isinstance(self._cache, DynamicEmbCache):
-                self._cache.training = False
-                self._cache.set_score(fused_score)
-            if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
-                self._storage.training = False
-                self._storage.set_score(fused_score)
-            return dynamicemb_eval_forward(
-                indices,
-                offsets,
-                self._cache,
-                self._storage,
-                self.feature_offsets,
-                self.output_dtype,
-                self._eval_initializer,
-                layout,
-                self._evict_strategy,
-                frequency_counters,
-                pooling_weights,
-                self.output_alloc,
-            )
+            if prefetch_state.is_eval:
+                prefetch_state.record_stream(torch.cuda.current_stream(self.device_id))
+                with torch.no_grad():
+                    values = prefetch_state.unique_values
+                    output = self._native_lookup(
+                        decode_table_values(values, self.output_dtype)
+                        if self.embedding_dtype == FP8_STORAGE_DTYPE
+                        else values,
+                        prefetch_state,
+                        offsets,
+                        self.output_dtype,
+                        pooling_weights,
+                    )
+                    if not layout.is_pooling:
+                        output, _ = place_lookup_output(output, self.output_alloc)
+                    prefetch_state.used = True
+                    return output
 
-        if any([not o.training for o in self._dynamicemb_options]):
-            raise RuntimeError(
-                "BatchedDynamicEmbeddingTables does not support training when some tables are in eval mode."
-            )
+        if self.training:
+            self._check_training_mode()
 
-        if not self._prefetch_states:
-            self.prefetch(
-                indices, offsets, frequency_counters=frequency_counters, scores=scores
-            )
-        prefetch_state = self._prefetch_states.popleft()
-        prefetch_state.record_stream(torch.cuda.current_stream())
+        if prefetch_state is None:
+            if not self._prefetch_states:
+                self.prefetch(
+                    indices,
+                    offsets,
+                    frequency_counters=frequency_counters,
+                    scores=scores,
+                )
+            prefetch_state = self._prefetch_states.popleft()
 
-        res = DynamicEmbeddingFunction.apply(
-            prefetch_state,
-            offsets,
-            self._cache,
-            self._storage,
-            self.output_dtype,
-            self._initializer,
-            self._optimizer,
-            layout,
-            self._admitter,
-            self._evict_strategy,
-            pooling_weights,
-            self._empty_tensor,
-            self.output_alloc,
-        )
-        # Grad-mode forwards keep their slot pins until backward. Without an
-        # autograd graph, release on this stream after the gather consumed them.
-        if not res.requires_grad and prefetch_state.slot_indices is not None:
-            owner = prefetch_state.slot_owner
-            # A later batch's prefetch may have rehashed the table since this one's.
-            refresh_slots_after_rehash(owner._state, prefetch_state)
-            release_slot_pins(
-                owner,
-                prefetch_state.slot_indices,
-                prefetch_state.unique_table_ids,
-            )
+        prefetch_state.record_stream(torch.cuda.current_stream(self.device_id))
+
+        prefetch_state.used = True
+        try:
+            with torch.set_grad_enabled(self.training and torch.is_grad_enabled()):
+                res = DynamicEmbeddingFunction.apply(
+                    prefetch_state,
+                    offsets,
+                    self._cache,
+                    self._storage,
+                    self.output_dtype,
+                    self._initializer,
+                    self._optimizer,
+                    layout,
+                    self._admitter,
+                    self._evict_strategy,
+                    pooling_weights,
+                    self._native_lookup if prefetch_state.prepared_for_lookup else None,
+                    self._empty_tensor,
+                    self.output_alloc,
+                )
+        except BaseException:
+            prefetch_state.release()
+            raise
+        if not res.requires_grad:
+            prefetch_state.release()
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.training = False
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
@@ -1419,6 +1444,32 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         """Return ``frequency_counters`` only if this group consumes them."""
         return frequency_counters if self._consumes_frequency_counters else None
 
+    def _check_training_mode(self) -> None:
+        if any(not option.training for option in self._dynamicemb_options):
+            raise RuntimeError(
+                "BatchedDynamicEmbeddingTables does not support training when some tables are in eval mode."
+            )
+
+    def _check_eval_storage(self) -> None:
+        tiers = self._storage_layout.tiers
+        if StorageTier.EXTERNAL in tiers and StorageTier.DDR in tiers:
+            raise RuntimeError(
+                "Evaluation does not read external_storage: a key spilled to "
+                "it would be treated as missing. Train with external_storage "
+                "unset, or do not call eval() on this module."
+            )
+
+    def _set_eval_scores(self) -> None:
+        fused_score = self._reduce_table_scores(
+            [self._scores[name] for name in self._table_names]
+        )
+        if isinstance(self._cache, DynamicEmbCache):
+            self._cache.training = False
+            self._cache.set_score(fused_score)
+        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
+            self._storage.training = False
+            self._storage.set_score(fused_score)
+
     def prefetch(
         self,
         indices: Tensor,
@@ -1428,9 +1479,60 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         frequency_counters: Optional[Tensor] = None,
         scores: Optional[Tensor] = None,
     ) -> None:
-        self._check_scores(scores, indices)
         if not self.training:
             return
+        state = self.resolve_input(
+            indices,
+            offsets,
+            forward_stream=forward_stream,
+            batch_size_per_feature_per_rank=batch_size_per_feature_per_rank,
+            frequency_counters=frequency_counters,
+            scores=scores,
+        )
+        state.prepared_for_lookup = False
+        self._prefetch_states.append(state)
+
+    def resolve_input(
+        self,
+        indices: Tensor,
+        offsets: Tensor,
+        forward_stream: Optional[torch.cuda.Stream] = None,
+        batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
+        frequency_counters: Optional[Tensor] = None,
+        scores: Optional[Tensor] = None,
+    ) -> PrefetchState:
+        """Prepare a batch without putting it in the legacy prefetch FIFO.
+
+        The caller owns the returned state and passes it explicitly to forward.
+        HBM/cache states pin stable value rows. Other stores resolve into live
+        batch-local rows shared with overlapping in-flight batches. Evaluation
+        resolves read-only rows. Explicit states use TorchRec lookup; raw/FIFO
+        calls retain the existing CUDA gather.
+        Input distribution requests occurrence rows when it will construct a
+        resolved KJT; raw/FIFO callers need not retain that extra array.
+        """
+        self._check_scores(scores, indices)
+        if indices.dtype != self.index_type:
+            indices = indices.to(self.index_type)
+        if not self.training:
+            self._check_eval_storage()
+            self._set_eval_scores()
+            state = dynamicemb_resolve_eval(
+                indices,
+                offsets,
+                self._cache,
+                self._storage,
+                self.feature_offsets,
+                self._eval_initializer,
+                self._storage_layout,
+                self._table_gate,
+            )
+            state.input_frequencies = frequency_counters
+            state.prepared_for_lookup = True
+            return state
+        # These checks used to precede prefetch in forward. Keep them before
+        # input_dist can initialize rows or take pins as well.
+        self._check_training_mode()
         if self.prefetch_stream is None and forward_stream is not None:
             self.prefetch_stream = torch.cuda.current_stream()
             assert (
@@ -1458,25 +1560,28 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._storage.training = True
             self._storage.set_score(fused_score)
 
-        self._prefetch_states.append(
-            dynamicemb_prefetch(
-                indices,
-                offsets,
-                self._cache,
-                self._storage,
-                self._storage_layout,
-                self.feature_offsets,
-                self._initializer,
-                forward_stream,
-                self._evict_strategy,
-                frequency_counters,
-                self._admitter,
-                external_storage=self._external_storage,
-                scores=scores,
-                table_gate=self._table_gate,
-            )
+        state = dynamicemb_prefetch(
+            indices,
+            offsets,
+            self._cache,
+            self._storage,
+            self._storage_layout,
+            self.feature_offsets,
+            self._initializer,
+            forward_stream,
+            self._evict_strategy,
+            frequency_counters,
+            self._admitter,
+            external_storage=self._external_storage,
+            scores=scores,
+            table_gate=self._table_gate,
+            active_rows=self._active_rows,
+            optimizer=self._optimizer,
         )
         self._update_score()
+        state.input_frequencies = frequency_counters
+        state.prepared_for_lookup = True
+        return state
 
     def set_score(
         self,
@@ -1669,6 +1774,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
         score_word = self.erase_score_word(score_strategy, table_ids)
         storage, gate = self._storage, self._table_gate
+
+        @contextmanager
+        def host_erase_section():
+            with gate():
+                self._active_rows.begin_erase_chunk(table_ids)
+                yield
+
         return self._eraser.submit(
             lambda counts: storage.erase_by_score(
                 threshold,
@@ -1676,7 +1788,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 counts,
                 score_word=score_word,
                 chunk_slots=chunk_slots,
-                chunk_guard=gate,
+                chunk_guard=(
+                    host_erase_section
+                    if self._storage_layout.tiers == StorageTier.DDR
+                    else gate
+                ),
                 max_in_flight=max_in_flight,
             ),
             stream,

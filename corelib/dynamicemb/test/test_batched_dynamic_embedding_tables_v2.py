@@ -4470,3 +4470,127 @@ def test_caching_ps_rejects_no_eviction():
             use_index_dedup=True,
             learning_rate=0.1,
         )
+
+
+def test_nine_cache_pins_follow_retained_and_abandoned_backward():
+    import gc
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    opts = DynamicEmbTableOptions(
+        dim=8,
+        max_capacity=4096,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=device.index,
+        score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+        caching=True,
+        local_hbm_for_values=32768,
+        external_storage=PyDictStorage,
+        initializer_args=DynamicEmbInitializerArgs(
+            mode=DynamicEmbInitializerMode.CONSTANT, value=2.0
+        ),
+    )
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_names=["t0"],
+        table_options=[opts],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=EmbOptimType.SGD,
+        learning_rate=0.25,
+    )
+    assert model._storage_layout.cache_policy == CachePolicy.NINE
+    keys = torch.arange(32, device=device)
+    offsets = torch.tensor([0, keys.numel()], device=device)
+    counter = model._cache._state.key_index_map._ref_counter
+
+    output = model(keys, offsets)
+    output.sum().backward(retain_graph=True)
+    assert counter.sum().item() == keys.numel()
+    output.sum().backward()
+    assert counter.sum().item() == 0
+
+    output = model(keys, offsets)
+    output.sum().backward(retain_graph=True)
+    assert counter.sum().item() == keys.numel()
+    del output
+    gc.collect()
+    assert counter.sum().item() == 0
+    with torch.no_grad():
+        recovered = model(keys, offsets)
+    torch.testing.assert_close(recovered, torch.full_like(recovered, 1.25))
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_nine_cache_partial_refusal_preserves_rows_scores_and_pins(held):
+    from dynamicemb.key_value_table import load_from_flat
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    opts = DynamicEmbTableOptions(
+        dim=8,
+        max_capacity=1 << 16,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=device.index,
+        score_strategy=DynamicEmbScoreStrategy.LFU,
+        caching=True,
+        local_hbm_for_values=1024 * 8 * 4,
+        external_storage=PyDictStorage,
+        initializer_args=DynamicEmbInitializerArgs(
+            mode=DynamicEmbInitializerMode.CONSTANT, value=2.0
+        ),
+    )
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_names=["t0"],
+        table_options=[opts],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=EmbOptimType.ADAM,
+        learning_rate=0.25,
+    )
+    assert model._storage_layout.cache_policy == CachePolicy.NINE
+    cache, ps = model._cache, model._storage
+    counter = cache._state.key_index_map._ref_counter
+
+    def offsets(keys):
+        return torch.tensor([0, keys.numel()], dtype=torch.int64, device=device)
+
+    old = torch.arange(512, device=device)
+    model(old, offsets(old)).sum().backward()
+    tids = torch.zeros_like(old)
+    _, _, slots = cache.lookup(old, tids)
+    expected = load_from_flat(cache._state, slots, tids, copy_mode=CopyMode.VALUE)
+    assert torch.count_nonzero(expected[:, 8:]) > 0
+    assert not ps.dict
+    hits = old[:32]
+    if held:
+        model.prefetch(hits, offsets(hits))
+
+    new = torch.arange(10000, 10000 + cache._state.capacity + 512, device=device)
+    request = torch.cat([hits, new.repeat_interleave(2)])
+    with pytest.raises(RuntimeError, match="cache could not place"):
+        model.prefetch(request, offsets(request))
+
+    assert counter.sum().item() == (hits.numel() if held else 0)
+    assert ps.dict, "the rejected request did not evict any real victims"
+    for (tid, key), value in ps.dict.items():
+        assert tid == 0 and key in range(hits.numel(), old.numel())
+        torch.testing.assert_close(value, expected[key], rtol=0, atol=0)
+        assert ps.scores[(tid, key)] == 1
+
+    _, found, slots = cache.lookup(new, torch.zeros_like(new))
+    assert bool(found.any()) and not bool(found.all())
+    accepted = load_from_flat(
+        cache._state,
+        slots[found],
+        torch.zeros_like(slots[found]),
+        copy_mode=CopyMode.VALUE,
+    )
+    torch.testing.assert_close(accepted[:, :8], torch.full_like(accepted[:, :8], 2.0))
+    torch.testing.assert_close(accepted[:, 8:], torch.zeros_like(accepted[:, 8:]))
+    with torch.no_grad():
+        if held:
+            model(hits, offsets(hits))
+        model.eval()
+        actual = model(old, offsets(old))
+    torch.testing.assert_close(actual, expected[:, :8], rtol=0, atol=0)
+    assert counter.sum().item() == 0

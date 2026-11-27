@@ -196,6 +196,28 @@ def prefetch_nine_cache_path(
                 cache_keys, cache_tids, insert_scores, report_refused=True
             )
         if num_refused > 0:
+            # The cache map already contains accepted keys. Recover real
+            # victims before overwriting those rows, keeping their cache scores.
+            try:
+                n_valid, _, (keys, slots, tids, scores) = flagged_compact(
+                    evicted_slots >= 0,
+                    [evicted_keys, evicted_slots, evicted_tids, evicted_scores],
+                )
+                if n_valid:
+                    victim_values = load_from_flat(
+                        state, slots, tids, copy_mode=CopyMode.VALUE
+                    )
+                store_to_flat(
+                    state,
+                    cache_slots,
+                    cache_tids,
+                    _select(values, into_cache, num_cache == num_miss),
+                )
+                if n_valid:
+                    storage.insert(keys, tids, victim_values, scores)
+            finally:
+                # Only the original hits were pinned by this failed request.
+                cache.decrement_counter(cache_indices, unique_table_ids)
             raise RuntimeError(
                 f"The cache could not place {num_refused} keys of this batch: their "
                 "buckets and their tables' overflow areas held only keys it may not "
