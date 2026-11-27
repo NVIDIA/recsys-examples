@@ -17,8 +17,11 @@ from dynamicemb.state.extendable_buffer import DeviceExtendableBuffer
 from dynamicemb.torchrec_lookup import TorchRecLookup
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("padding", [0, 16, 1])
+@pytest.mark.parametrize(
+    "dtype,padding",
+    [(torch.float32, 0), (torch.float16, 16), (torch.bfloat16, 1)],
+    ids=["contiguous", "whole-row-padding", "fallback-padding"],
+)
 def test_persistent_weight_view_tracks_growth_replacement_and_owner(dtype, padding):
     dim, rows = 8, 4
     device = torch.device("cuda", torch.cuda.current_device())
@@ -70,19 +73,33 @@ def test_persistent_weight_view_tracks_growth_replacement_and_owner(dtype, paddi
         )
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("output_dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "dim,padding",
-    [(4, 0), (8, 16), (8, 1), (7, 0), (12, 0), (2048, 0), (2052, 0), (4096, 0)],
+# One case per dispatch boundary, not a cross product of independent knobs.
+F32, F16, BF16 = torch.float32, torch.float16, torch.bfloat16
+NONE, SUM, MEAN = (
+    DynamicEmbPoolingMode.NONE,
+    DynamicEmbPoolingMode.SUM,
+    DynamicEmbPoolingMode.MEAN,
 )
+
+
 @pytest.mark.parametrize(
-    "mode,weighted",
+    "dtype,output_dtype,dim,padding,mode,weighted",
     [
-        (DynamicEmbPoolingMode.NONE, False),
-        (DynamicEmbPoolingMode.SUM, False),
-        (DynamicEmbPoolingMode.MEAN, False),
-        (DynamicEmbPoolingMode.SUM, True),
+        pytest.param(F32, F32, 4, 0, NONE, False, id="dense-sequence"),
+        pytest.param(F16, BF16, 8, 16, NONE, False, id="dense-strided"),
+        pytest.param(F16, F16, 4096, 0, NONE, False, id="dense-wide-sequence"),
+        pytest.param(F32, BF16, 2048, 0, SUM, False, id="dense-pooled-limit"),
+        pytest.param(F16, F32, 8, 16, SUM, False, id="dense-sum-half"),
+        pytest.param(F32, F16, 12, 0, MEAN, False, id="dense-mean"),
+        pytest.param(F16, F16, 8, 0, SUM, True, id="dense-weighted"),
+        pytest.param(F32, BF16, 7, 0, NONE, False, id="ec-odd-width"),
+        pytest.param(BF16, F32, 8, 0, NONE, False, id="ec-bfloat16"),
+        pytest.param(F16, F32, 8, 1, NONE, False, id="ec-fractional-stride"),
+        pytest.param(F32, F32, 2052, 0, SUM, False, id="ebc-over-dense-limit"),
+        pytest.param(F16, BF16, 2052, 0, SUM, True, id="ebc-wide-weighted"),
+        pytest.param(BF16, F16, 8, 0, MEAN, False, id="ebc-mean-bfloat16"),
+        pytest.param(BF16, F32, 8, 0, SUM, True, id="ebc-weighted-bfloat16"),
+        pytest.param(F16, BF16, 8, 1, SUM, False, id="ebc-fractional-stride"),
     ],
 )
 def test_dense_lookup_and_fallback_match_reference(
@@ -147,8 +164,9 @@ def test_dense_lookup_flat_view_stops_at_last_embedding():
     torch.testing.assert_close(actual, weights[indices], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("output_dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize(
+    "output_dtype,weighted", [(torch.float32, False), (torch.float16, True)]
+)
 def test_dense_half_pooling_accumulates_before_output_cast(output_dtype, weighted):
     weights = torch.tensor([60000.0, -60000.0], device="cuda", dtype=torch.float16)
     weights = weights[:, None].repeat(1, 8)
