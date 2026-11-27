@@ -220,3 +220,86 @@ def test_dense_lookup_metadata_survives_drop_after_repeated_stream_use():
     torch.testing.assert_close(first, weights[indices], rtol=0, atol=0)
     torch.testing.assert_close(second, weights[indices], rtol=0, atol=0)
     assert len(reuse) == 32
+
+
+def test_concurrent_fallback_calls_use_their_own_rows():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, current_thread
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    adapter = TorchRecLookup([8], [0], DynamicEmbPoolingMode.NONE, device)
+    rows = [
+        torch.full((2, 8), value, device=device, dtype=torch.bfloat16)
+        for value in (11, 22)
+    ]
+    batch = SimpleNamespace(reverse_indices=torch.tensor([1, 0], device=device))
+    offsets = torch.tensor([0, 2], device=device)
+    expected = [adapter(w, batch, offsets, torch.float32).cpu() for w in rows]
+    module = adapter._module(False)
+    a_entered, a_done, b_started, b_enqueued = (Event() for _ in range(4))
+
+    def before_lookup(_module, _args):
+        if current_thread().name.startswith("request-a"):
+            a_entered.set()
+            assert b_started.wait(10)
+            # On the old implementation B binds its rows and reaches its
+            # post-hook while A is paused. With serialization B cannot enter.
+            b_enqueued.wait(1)
+
+    def after_lookup(_module, _args, _out):
+        if current_thread().name.startswith("request-b"):
+            b_enqueued.set()
+            assert a_done.wait(10)
+
+    def lookup(i):
+        with torch.cuda.device(device):
+            if i == 1:
+                b_started.set()
+            try:
+                return adapter(rows[i], batch, offsets, torch.float32).cpu()
+            finally:
+                if i == 0:
+                    a_done.set()
+
+    with (
+        module.register_forward_pre_hook(before_lookup),
+        module.register_forward_hook(after_lookup),
+        ThreadPoolExecutor(1, thread_name_prefix="request-a") as a_pool,
+        ThreadPoolExecutor(1, thread_name_prefix="request-b") as b_pool,
+    ):
+        a = a_pool.submit(lookup, 0)
+        assert a_entered.wait(10)
+        b = b_pool.submit(lookup, 1)
+        actual = [a.result(15), b.result(15)]
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference)
+
+
+def test_fallback_restores_weights_when_offsets_fail_validation():
+    device = torch.device("cuda", torch.cuda.current_device())
+    adapter = TorchRecLookup([8], [0], DynamicEmbPoolingMode.SUM, device)
+    table = adapter._module(False).embedding_bags["table_0"]
+    original = table.weight.data, table.num_embeddings
+    rows = torch.ones((2, 8), device=device)
+    batch = SimpleNamespace(reverse_indices=torch.tensor([0, 1], device=device))
+    bad_offsets = torch.tensor([0, 2], device=device, dtype=torch.float32)
+    # BF16 routes to EBC. Promoted rows must not escape even if input validation fails.
+    with pytest.raises(AssertionError, match="offsets must be of integer type"):
+        adapter(rows.bfloat16(), batch, bad_offsets, torch.float32)
+    assert table.weight.data_ptr() == original[0].data_ptr()
+    assert table.num_embeddings == original[1]
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_dense_declines_a_misaligned_view(dtype):
+    device = torch.device("cuda", torch.cuda.current_device())
+    adapter = TorchRecLookup([8], [0], DynamicEmbPoolingMode.NONE, device)
+    matrix = torch.arange(64, device=device, dtype=dtype).view(4, 16)
+    indices = torch.tensor([3, 1, 0, 2], device=device)
+    batch = SimpleNamespace(reverse_indices=indices)
+    offsets = torch.tensor([0, 4], device=device)
+    # Identical shapes and strides; only the starting column differs.
+    for start in (0, 1):
+        rows = matrix[:, start : start + 8]
+        actual = adapter(rows, batch, offsets, dtype)
+        torch.testing.assert_close(actual, rows[indices])

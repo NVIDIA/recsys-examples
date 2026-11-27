@@ -12,6 +12,7 @@ external optimizers.
 """
 
 from itertools import accumulate
+from threading import RLock
 from weakref import ref
 
 import torch
@@ -47,6 +48,19 @@ class TorchRecLookup:
         self._modules = {}
         self._dense_modules = {}
         self._persistent = None
+        self._fallback_lock = RLock()
+
+    def __getstate__(self):
+        with self._fallback_lock:
+            return {
+                name: value
+                for name, value in vars(self).items()
+                if name != "_fallback_lock"
+            }
+
+    def __setstate__(self, state):
+        vars(self).update(state)
+        self._fallback_lock = RLock()
 
     def persistent_weights(self, buffer):
         """Borrow one stable value matrix without rebuilding its Tensor wrapper.
@@ -140,6 +154,9 @@ class TorchRecLookup:
             and unique_embs.dtype in (torch.float32, torch.float16)
             and output_dtype in OUTPUT_TYPES
             and unique_embs.stride(1) == 1
+            # A column slice can retain aligned strides but start partway
+            # through the four-element vector loaded by the Dense kernels.
+            and unique_embs.data_ptr() % (4 * unique_embs.element_size()) == 0
             and unique_embs.stride(0) % self._dims[0] == 0
         ):
             # TorchRec's dense forward kernels support aligned FP32/FP16
@@ -157,6 +174,18 @@ class TorchRecLookup:
                     .reshape(batch_size, self._feature_num * self._dims[0])
                 )
             return values
+        # EC/EBC receive rows via borrowed parameters. Keep the binding
+        # private to this call, including on exceptions, without serializing
+        # the Dense path or waiting for CUDA work to complete.
+        with self._fallback_lock:
+            return self._fallback(
+                unique_embs, batch, indices, offsets, output_dtype, pooling_weights
+            )
+
+    def _fallback(
+        self, unique_embs, batch, indices, offsets, output_dtype, pooling_weights
+    ):
+        pooled = self._pooling_mode != DynamicEmbPoolingMode.NONE
         module = self._module(pooling_weights is not None)
         # DynamicEmb accumulates pooling in fp32, independently of the stored
         # embedding and output dtypes. Native EmbeddingBag returns its weight
@@ -170,19 +199,6 @@ class TorchRecLookup:
             if self._uniform
             else [0] + list(accumulate(batch.unique_sizes))
         )
-        placeholders = [
-            (embedding.weight.data, embedding.num_embeddings)
-            for embedding in embeddings.values()
-        ]
-        for t, (embedding, dim) in enumerate(zip(embeddings.values(), self._dims)):
-            # Native embedding/embedding_bag accept strided weights. In mixed-D
-            # groups each row occupies max_D elements, with padding after dim.
-            weight = unique_embs[table_offsets[t] : table_offsets[t + 1], :dim]
-            # The cached parameters are frozen and outside the model tree.
-            # Rebind their data rather than allocating/registering a Parameter
-            # for every batch; DynamicEmb's custom backward owns all updates.
-            embedding.weight.data = weight
-            embedding.num_embeddings = weight.size(0)
         if self._uniform:
             count = indices.numel()
             lengths = offsets[1:] - offsets[:-1] if pooled else offsets[-1:]
@@ -220,7 +236,20 @@ class TorchRecLookup:
                 offsets=offsets,
                 weights=pooling_weights,
             )
+        placeholders = [
+            (embedding.weight.data, embedding.num_embeddings)
+            for embedding in embeddings.values()
+        ]
         try:
+            for t, (embedding, dim) in enumerate(zip(embeddings.values(), self._dims)):
+                # Native embedding/embedding_bag accept strided weights. In mixed-D
+                # groups each row occupies max_D elements, with padding after dim.
+                weight = unique_embs[table_offsets[t] : table_offsets[t + 1], :dim]
+                # The cached parameters are frozen and outside the model tree.
+                # Rebind their data rather than allocating/registering a Parameter
+                # for every batch; DynamicEmb's custom backward owns all updates.
+                embedding.weight.data = weight
+                embedding.num_embeddings = weight.size(0)
             result = module(features)
             if pooled:
                 values = result.values()
