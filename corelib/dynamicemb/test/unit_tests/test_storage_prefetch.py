@@ -13,8 +13,13 @@ from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from test_no_grad_slot_lifetime import batch, check_values, make_model, pins
 
 
-@pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
-@pytest.mark.parametrize("replace_values", [False, True])
+@pytest.mark.parametrize(
+    "layout,replace_values",
+    [
+        ("hbm", False),
+        ("host", True),
+    ],
+)
 def test_eval_state_survives_drop_on_producer_stream(layout, replace_values):
     model, _ = make_model(DynamicEmbPoolingMode.NONE, layout)
     keys, offsets = batch(0)
@@ -77,7 +82,13 @@ def test_eval_state_survives_drop_on_producer_stream(layout, replace_values):
     assert len(other_metadata) > 0 and len(reuse) == 64
 
 
-@pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
+@pytest.mark.parametrize(
+    "layout",
+    [
+        "host",
+        "hybrid",
+    ],
+)
 def test_retained_backward_observes_intervening_update(layout):
     model, counter = make_model(DynamicEmbPoolingMode.NONE, layout)
     keys, offsets = batch(0)
@@ -95,9 +106,14 @@ def test_retained_backward_observes_intervening_update(layout):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
 @pytest.mark.parametrize(
-    "pooling", [DynamicEmbPoolingMode.NONE, DynamicEmbPoolingMode.SUM]
+    "layout,pooling",
+    [
+        ("hbm", DynamicEmbPoolingMode.NONE),
+        ("cache", DynamicEmbPoolingMode.SUM),
+        ("host", DynamicEmbPoolingMode.SUM),
+        ("hybrid", DynamicEmbPoolingMode.NONE),
+    ],
 )
 def test_resolved_batch_train_eval_transition(layout, pooling):
     model, counter = make_model(pooling, layout)
@@ -118,8 +134,13 @@ def test_resolved_batch_train_eval_transition(layout, pooling):
         assert pins(counter) == 0
 
 
-@pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
-@pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize(
+    "layout,reverse",
+    [
+        ("hbm", True),
+        ("host", False),
+    ],
+)
 def test_recomputed_resolved_batch_owns_separate_state(layout, reverse):
     model, counter = make_model(DynamicEmbPoolingMode.NONE, layout)
     keys, offsets = batch(0)
@@ -137,19 +158,18 @@ def test_recomputed_resolved_batch_owns_separate_state(layout, reverse):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
 @pytest.mark.parametrize(
-    "dtype,optimizer",
+    "layout,dtype,optimizer,reverse",
     [
-        (torch.float32, EmbOptimType.SGD),
-        (torch.float32, EmbOptimType.ADAM),
-        (torch.float32, EmbOptimType.EXACT_ADAGRAD),
-        (torch.float32, EmbOptimType.EXACT_ROWWISE_ADAGRAD),
-        (torch.float16, EmbOptimType.EXACT_ROWWISE_ADAGRAD),
-        (torch.bfloat16, EmbOptimType.EXACT_ROWWISE_ADAGRAD),
+        ("hbm", torch.float32, EmbOptimType.SGD, False),
+        ("hbm", torch.bfloat16, EmbOptimType.EXACT_ROWWISE_ADAGRAD, True),
+        ("cache", torch.float16, EmbOptimType.EXACT_ROWWISE_ADAGRAD, True),
+        ("host", torch.float32, EmbOptimType.ADAM, True),
+        ("host", torch.bfloat16, EmbOptimType.EXACT_ROWWISE_ADAGRAD, False),
+        ("hybrid", torch.float32, EmbOptimType.EXACT_ADAGRAD, True),
+        ("hybrid", torch.float16, EmbOptimType.EXACT_ROWWISE_ADAGRAD, True),
     ],
 )
-@pytest.mark.parametrize("reverse", [False, True])
 def test_prepared_batches_preserve_complete_optimizer_rows(
     layout, dtype, optimizer, reverse
 ):

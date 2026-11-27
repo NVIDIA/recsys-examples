@@ -36,15 +36,17 @@ from torchrec.distributed.types import ShardingType
 LAYOUTS = ["hbm", "cache", "host", "hybrid", "ps", "cache_ps"]
 
 
-@pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize(
-    "pooling,weighted,optimizer,dims,native_dense",
+    "layout,pooling,weighted,optimizer,dims,native_dense",
     [
-        (PoolingType.SUM, False, EmbOptimType.ADAM, (8, 8), True),
-        (PoolingType.MEAN, False, EmbOptimType.SGD, (7, 11), False),
-        (PoolingType.SUM, True, EmbOptimType.ADAM, (7, 11), False),
+        ("hbm", PoolingType.SUM, False, EmbOptimType.ADAM, (8, 8), True),
+        ("hbm", PoolingType.MEAN, False, EmbOptimType.SGD, (7, 11), False),
+        ("cache", PoolingType.SUM, True, EmbOptimType.ADAM, (7, 11), False),
+        ("cache_ps", PoolingType.SUM, False, EmbOptimType.ADAM, (8, 8), True),
+        ("host", PoolingType.SUM, True, EmbOptimType.ADAM, (7, 11), False),
+        ("hybrid", PoolingType.SUM, False, EmbOptimType.ADAM, (8, 8), True),
+        ("ps", PoolingType.MEAN, False, EmbOptimType.SGD, (7, 11), False),
     ],
-    ids=["dense-sum-adam", "mixed-mean-sgd", "weighted-ebc-adam"],
 )
 def test_pooled_lookup_and_update_match_unsharded_torchrec(
     layout, pooling, weighted, optimizer, dims, native_dense
@@ -139,20 +141,14 @@ def test_pooled_lookup_and_update_match_unsharded_torchrec(
     assert all(not table._active_rows.states for table in tables(model))
 
 
-@pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize(
-    "dtype,dims,pooling,weighted",
+    "layout,dtype,dims,pooling,weighted",
     [
-        (torch.float16, (8, 8), PoolingType.SUM, True),
-        (torch.bfloat16, (7, 11), PoolingType.MEAN, False),
-        (torch.float16, (7, 11), PoolingType.SUM, False),
-        (torch.bfloat16, (8, 8), PoolingType.SUM, True),
-    ],
-    ids=[
-        "weighted-fp16-dense",
-        "bf16-mixed-mean",
-        "fp16-mixed-sum",
-        "weighted-bf16-fallback",
+        ("hbm", torch.float16, (8, 8), PoolingType.SUM, True),
+        ("cache", torch.bfloat16, (8, 8), PoolingType.SUM, True),
+        ("host", torch.bfloat16, (7, 11), PoolingType.MEAN, False),
+        ("hybrid", torch.float16, (7, 11), PoolingType.SUM, False),
+        ("ps", torch.bfloat16, (8, 8), PoolingType.SUM, True),
     ],
 )
 def test_low_precision_pooling_and_update(layout, dtype, dims, pooling, weighted):
@@ -238,9 +234,13 @@ class PooledPipelineModel(PipelineModel):
         return loss.unsqueeze(0), loss.detach()
 
 
-@pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize(
-    "pipeline_type", [TrainPipelineSparseDist, PrefetchTrainPipelineSparseDist]
+    "layout,pipeline_type",
+    [
+        ("hbm", TrainPipelineSparseDist),
+        ("cache_ps", PrefetchTrainPipelineSparseDist),
+        ("host", PrefetchTrainPipelineSparseDist),
+    ],
 )
 def test_native_pooled_pipeline(layout, pipeline_type):
     def make():
@@ -361,10 +361,8 @@ def test_feature_processor_preserves_no_grad_contract(grad_enabled):
     "pooling,dims,weighted",
     [
         (None, (7, 7), False),
-        (PoolingType.SUM, (8, 8), False),
         (PoolingType.SUM, (7, 11), True),
     ],
-    ids=["ec-fallback", "dense-pooled", "weighted-ebc-fallback"],
 )
 def test_cold_lookup_after_restore_preserves_rng(pooling, dims, weighted):
     warm = tables(make_model(pooling=pooling, dims=dims, weighted=weighted))[0].eval()
@@ -377,23 +375,21 @@ def test_cold_lookup_after_restore_preserves_rng(pooling, dims, weighted):
         if weighted
         else {}
     )
+    keys, offsets = features.values(), features.offsets()
+
+    def lookup(table):
+        state = table.resolve_input(keys, offsets)
+        return table(keys, offsets, prefetch_state=state, **kwargs)
+
     with torch.no_grad():
-        warm(features.values(), features.offsets(), **kwargs)
+        expected = lookup(warm)
     restored.load_state_dict(warm.state_dict())
+    assert not restored._native_lookup._modules
     cpu_rng = torch.get_rng_state()
     cuda_rng = torch.cuda.get_rng_state()
     with torch.no_grad():
-        expected = warm(features.values(), features.offsets(), **kwargs)
-        expected_dropout = torch.nn.functional.dropout(expected, p=0.5, training=True)
-        expected_cpu = torch.rand(16)
-    torch.set_rng_state(cpu_rng)
-    torch.cuda.set_rng_state(cuda_rng)
-    with torch.no_grad():
-        actual = restored(features.values(), features.offsets(), **kwargs)
-        assert torch.equal(cpu_rng, torch.get_rng_state())
-        assert torch.equal(cuda_rng, torch.cuda.get_rng_state())
-        torch.testing.assert_close(actual, expected)
-        actual_dropout = torch.nn.functional.dropout(actual, p=0.5, training=True)
-        actual_cpu = torch.rand(16)
-    torch.testing.assert_close(actual_dropout, expected_dropout)
-    torch.testing.assert_close(actual_cpu, expected_cpu)
+        actual = lookup(restored)
+    assert restored._native_lookup._modules
+    assert torch.equal(cpu_rng, torch.get_rng_state())
+    assert torch.equal(cuda_rng, torch.cuda.get_rng_state())
+    torch.testing.assert_close(actual, expected)

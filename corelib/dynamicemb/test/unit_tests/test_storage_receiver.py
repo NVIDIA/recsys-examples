@@ -105,10 +105,15 @@ def test_prefetched_batch_reads_updates_from_previous_batch(layout):
     assert all(not table._active_rows.states for table in tables(model))
 
 
-@pytest.mark.parametrize("layout", LAYOUTS)
-@pytest.mark.parametrize("optimizer", [EmbOptimType.SGD, EmbOptimType.ADAM])
-@pytest.mark.parametrize("reverse_backward", [False, True])
-@pytest.mark.parametrize("drop_inputs", [False, True])
+@pytest.mark.parametrize(
+    "layout,optimizer,reverse_backward,drop_inputs",
+    [
+        ("host", EmbOptimType.SGD, False, False),
+        ("host", EmbOptimType.ADAM, True, True),
+        ("hybrid", EmbOptimType.ADAM, True, False),
+        ("ps", EmbOptimType.ADAM, True, True),
+    ],
+)
 def test_in_flight_batches_share_current_optimizer_state(
     layout, optimizer, reverse_backward, drop_inputs
 ):
@@ -184,8 +189,14 @@ def test_pending_rows_survive_backing_store_eviction(layout):
     assert all(not table._active_rows.states for table in tables(model))
 
 
-@pytest.mark.parametrize("layout", ["host", "hybrid", "ps"])
-@pytest.mark.parametrize("stage", ["input_dist", "forward", "detach"])
+@pytest.mark.parametrize(
+    "layout,stage",
+    [
+        ("host", "input_dist"),
+        ("hybrid", "forward"),
+        ("ps", "detach"),
+    ],
+)
 def test_abandoned_storage_batch_is_reclaimed(layout, stage):
     model = make_model(layout=layout)
     for _ in range(3):

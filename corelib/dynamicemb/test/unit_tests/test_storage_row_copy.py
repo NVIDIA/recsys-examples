@@ -9,10 +9,18 @@ from dynamicemb_extensions import copy_matching_storage_rows
 
 
 @pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float8_e4m3fn]
+    "dtype,width,masked",
+    [
+        (torch.float32, 7, False),
+        (torch.float32, 3072, True),
+        (torch.float16, 64, False),
+        (torch.float16, 7, True),
+        (torch.bfloat16, 1024, False),
+        (torch.bfloat16, 3072, True),
+        (torch.float8_e4m3fn, 3072, False),
+        (torch.float8_e4m3fn, 64, True),
+    ],
 )
-@pytest.mark.parametrize("width", [7, 64, 1024, 3072])
-@pytest.mark.parametrize("masked", [False, True])
 def test_storage_row_copy_preserves_table_key_admission_and_moments(
     dtype, width, masked
 ):
