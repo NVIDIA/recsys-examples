@@ -359,12 +359,13 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 attn_q, attn_k, attn_v = q, k, v
                 q_descale = k_descale = v_descale = None
                 if ctx.attention_quant_mode == 5:
-                    (attn_q, q_descale), (attn_k, k_descale), (attn_v, v_descale) = (
-                        hstu.quantize_for_head_batch_tensor(
-                            tensor, seq_offsets_q, quant_mode=ctx.attention_quant_mode
+                    with nvtx.annotate("fp8 attention prepare operands fwd"):
+                        (attn_q, q_descale), (attn_k, k_descale), (attn_v, v_descale) = (
+                            hstu.quantize_for_head_batch_tensor(
+                                tensor, seq_offsets_q, quant_mode=ctx.attention_quant_mode
+                            )
+                            for tensor in (q, k, v)
                         )
-                        for tensor in (q, k, v)
-                    )
                 jagged_attn_output, _ = torch.ops.fbgemm.hstu_varlen_fwd_90(
                     attn_q,
                     attn_k,
@@ -740,17 +741,18 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 output_dtype = 0 if dout.dtype == torch.bfloat16 else 1
                 q_descale = k_descale = v_descale = do_descale = None
                 if ctx.attention_quant_mode == 5:
-                    (
-                        (q, q_descale),
-                        (k, k_descale),
-                        (v, v_descale),
-                        (dout, do_descale),
-                    ) = (
-                        hstu.quantize_for_head_batch_tensor(
-                            tensor, seq_offsets_q, quant_mode=ctx.attention_quant_mode
+                    with nvtx.annotate("fp8 attention prepare operands bwd"):
+                        (
+                            (q, q_descale),
+                            (k, k_descale),
+                            (v, v_descale),
+                            (dout, do_descale),
+                        ) = (
+                            hstu.quantize_for_head_batch_tensor(
+                                tensor, seq_offsets_q, quant_mode=ctx.attention_quant_mode
+                            )
+                            for tensor in (q, k, v, dout)
                         )
-                        for tensor in (q, k, v, dout)
-                    )
                 dq, dk, dv, _ = torch.ops.fbgemm.hstu_varlen_bwd_90(
                     dout,
                     None,  # dout_t

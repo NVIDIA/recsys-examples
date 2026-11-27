@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import nvtx
 import torch
 import torch.nn.functional as F
 
@@ -11,13 +12,18 @@ def _quantize(
     columnwise: bool,
     gradient: bool = False,
 ) -> torch.Tensor:
-    from transformer_engine.pytorch import DType, Float8CurrentScalingQuantizer
+    with nvtx.annotate("fp8 projection quantizer setup"):
+        from transformer_engine.pytorch import DType, Float8CurrentScalingQuantizer
 
-    dtype = DType.kFloat8E5M2 if gradient else DType.kFloat8E4M3
-    # TE current scaling needs rowwise storage even for columnwise GEMM operands.
-    return Float8CurrentScalingQuantizer(
-        dtype, tensor.device, rowwise=True, columnwise=columnwise
-    )(tensor.contiguous())
+        dtype = DType.kFloat8E5M2 if gradient else DType.kFloat8E4M3
+        # TE current scaling needs rowwise storage even for columnwise GEMM operands.
+        quantizer = Float8CurrentScalingQuantizer(
+            dtype, tensor.device, rowwise=True, columnwise=columnwise
+        )
+    with nvtx.annotate("fp8 projection contiguous operand"):
+        contiguous = tensor.contiguous()
+    with nvtx.annotate("fp8 projection quantize operand"):
+        return quantizer(contiguous)
 
 
 def te_fp8_addmm_silu_fwd(
@@ -33,16 +39,24 @@ def te_fp8_addmm_silu_fwd(
 
     # Pad within the projection so neither attention offsets nor loss rows change.
     padding = (-rows) % 16
-    x_fp8 = _quantize(
-        F.pad(x, (0, 0, 0, padding)) if padding else x,
-        columnwise=False,
-    )
+    if padding:
+        with nvtx.annotate("fp8 projection pad forward input"):
+            padded_x = F.pad(x, (0, 0, 0, padding))
+        x_fp8 = _quantize(padded_x, columnwise=False)
+        del padded_x
+    else:
+        x_fp8 = _quantize(x, columnwise=False)
     w_fp8 = _quantize(w, columnwise=True)
     # TE uses column-major GEMM ordering: NN computes x @ w for [in, out] weights.
     if y.ndim == 1:
         z, *_ = general_gemm(w_fp8, x_fp8, layout="NN", out_dtype=x.dtype, bias=y)
     else:
-        residual = F.pad(y, (0, 0, 0, padding)) if padding else y.contiguous().clone()
+        if padding:
+            with nvtx.annotate("fp8 projection pad residual"):
+                residual = F.pad(y, (0, 0, 0, padding))
+        else:
+            with nvtx.annotate("fp8 projection clone residual"):
+                residual = y.contiguous().clone()
         z, *_ = general_gemm(
             w_fp8, x_fp8, layout="NN", out_dtype=x.dtype, out=residual, accumulate=True
         )
@@ -62,8 +76,9 @@ def te_fp8_linear_bwd(
 
     padding = (-rows) % 16
     if padding:
-        x = F.pad(x, (0, 0, 0, padding))
-        dz = F.pad(dz, (0, 0, 0, padding))
+        with nvtx.annotate("fp8 projection pad backward operands"):
+            x = F.pad(x, (0, 0, 0, padding))
+            dz = F.pad(dz, (0, 0, 0, padding))
     x_fp8 = _quantize(x, columnwise=True)
     w_fp8 = _quantize(w, columnwise=False)
     dz_fp8 = _quantize(dz, columnwise=True, gradient=True)
