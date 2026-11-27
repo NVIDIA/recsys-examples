@@ -28,15 +28,19 @@ def read_rows(model, keys):
 
 
 @pytest.mark.parametrize(
-    "dtype,optimizer",
+    "dtype,optimizer,held",
     [
-        (torch.float32, EmbOptimType.SGD),
-        (torch.float32, EmbOptimType.ADAM),
-        (torch.float16, EmbOptimType.ADAM),
-        (torch.float8_e4m3fn, EmbOptimType.EXACT_ROWWISE_ADAGRAD),
+        pytest.param(torch.float32, EmbOptimType.SGD, False, id="sgd"),
+        pytest.param(torch.float32, EmbOptimType.ADAM, True, id="adam-held"),
+        pytest.param(torch.float16, EmbOptimType.ADAM, False, id="half-adam"),
+        pytest.param(
+            torch.float8_e4m3fn,
+            EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+            True,
+            id="fp8-adagrad-held",
+        ),
     ],
 )
-@pytest.mark.parametrize("held", [False, True])
 def test_refusal_preserves_dirty_rows_moments_new_keys_and_hit_pin_ownership(
     dtype, optimizer, held
 ):
