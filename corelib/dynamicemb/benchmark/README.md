@@ -881,7 +881,7 @@ commits after it.
 | `--max_seq_len`, `--seq_len_dist` | 32, `uniform` | keys per sample: `uniform` in [1, max] or `fixed` at max |
 | `--key_dist`, `--alpha` | `uniform`, 1.05 | `uniform` or `pow-law` (a power law: a few keys are very common; `--alpha` is its exponent) |
 | `--key_range` | `--num_embeddings` | uniform keys are drawn from [0, key_range), pow-law ones from [1, key_range) |
-| `--dist_type` | `roundrobin` | which rank owns a key: `roundrobin` (key mod ranks) or `hash_roundrobin` (hashed key mod ranks) |
+| `--dist_type` | `roundrobin` | which rank owns a key: `roundrobin` (key mod ranks), `hash_roundrobin` (hashed key mod ranks) or `hash_bucket` (the rank that holds the key's global hash bucket, so the owner follows from `--num_embeddings`; see `docs/global_bucket_layout_design.md`) |
 | `--emb_dtype`, `--output_dtype` | `fp32` | `fp32`, `bf16` or `fp16` |
 | `--use_index_dedup` | off | TorchRec's index dedup: each rank removes its own repeated keys before the input dist. A call on the hierarchical dist (`hierarchical`, `auto`, `--check`) does so without it too |
 | `--optimizer`, `--learning_rate` | `sgd`, 0.01 | `sgd`, `adam`, `exact_adagrad` or `rowwise_adagrad` |

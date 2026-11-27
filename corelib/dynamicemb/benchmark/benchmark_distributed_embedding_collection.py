@@ -69,9 +69,11 @@ from dynamicemb import (
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
     EmbOptimType,
+    get_global_table_capacity,
     get_table_value_bytes,
 )
-from dynamicemb.key_ownership import owning_shard
+from dynamicemb.dynamicemb_config import DEFAULT_BUCKET_CAPACITY
+from dynamicemb.key_ownership import OwnershipRule
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
@@ -388,6 +390,26 @@ def build_model(
     )
 
 
+def owner_rule(cfg: BenchConfig, world_size: int) -> OwnershipRule:
+    """The key -> rank rule of the models' tables (:func:`build_model`). Under
+    ``hash_bucket`` it takes the capacity of the whole table, which the planner
+    derives from ``num_embeddings`` and the default bucket capacity."""
+    if cfg.dist_type != "hash_bucket":
+        return OwnershipRule(cfg.dist_type, world_size)
+    table = torchrec.EmbeddingConfig(
+        name=table_name(0),
+        embedding_dim=cfg.embedding_dim,
+        num_embeddings=cfg.num_embeddings,
+        feature_names=[feature_name(0)],
+    )
+    return OwnershipRule(
+        "hash_bucket",
+        world_size,
+        global_capacity=get_global_table_capacity(table, DEFAULT_BUCKET_CAPACITY),
+        bucket_capacity=DEFAULT_BUCKET_CAPACITY,
+    )
+
+
 def resolve_capacity(
     cfg: BenchConfig,
     batches: List[torchrec.KeyedJaggedTensor],
@@ -415,10 +437,11 @@ def resolve_capacity(
     # for a group's all-to-alls until the group goes, and the models use none
     # of the default group's.
     group = dist.new_group(list(range(world_size)))
+    rule = owner_rule(cfg, world_size)
     needs = hier_needs(
         batches,
         tables,
-        lambda keys, feature: owning_shard(keys, world_size, cfg.dist_type),
+        lambda keys, feature: rule.owner(keys),
         node_size,
         group=group,
     )
@@ -2675,7 +2698,7 @@ def parse_args(argv: List[str]) -> BenchConfig:
     )
     parser.add_argument(
         "--dist_type",
-        choices=["roundrobin", "hash_roundrobin"],
+        choices=["roundrobin", "hash_roundrobin", "hash_bucket"],
         default=defaults.dist_type,
     )
     parser.add_argument(

@@ -61,30 +61,61 @@ void check_capacity(const char *name, int64_t value) {
 }
 
 // The rule of each feature (dist_types, DistType codes, src/utils.h). The
-// bucketize places keys by roundrobin (kCyclic) and hash_roundrobin
-// (kHashedCyclic), which keep the key, and a table's features share one rule,
-// so a key's owner follows from its table and the key. "continuous" (kBlock)
-// stores a key as its offset in its owner's block, so equal stored keys of two
-// owners are different keys: the op refuses it.
+// bucketize places keys by roundrobin (kCyclic), hash_roundrobin (kHashedCyclic)
+// and hash_bucket (kHashedBucket), which keep the key, and a table's features
+// share one rule, so a key's owner follows from its table and the key.
+// hash_bucket also takes the capacities of the feature's table: the rows of the
+// whole table and of one shard, positive, with no more shards than ranks (else
+// the rule names a rank that does not exist), the same for a table's features.
+// "continuous" (kBlock) stores a key as its offset in its owner's block, so
+// equal stored keys of two owners are different keys: the op refuses it.
 void check_rules(const Config &config) {
   const int64_t features = config.num_features();
   const std::vector<int> &code = config.dist_types;
   if ((int64_t)code.size() != features)
     refuse("it takes a dist_type per feature, got ", code.size(), " for ", features, " features");
+  for (const auto *capacities : {&config.global_capacities, &config.shard_capacities})
+    if (!capacities->empty() && (int64_t)capacities->size() != features)
+      refuse("it takes a global and a shard capacity per feature, got ", capacities->size(),
+             " for ", features, " features");
+  auto capacity_of = [&](const std::vector<int64_t> &capacities, int64_t f) {
+    return capacities.empty() ? int64_t{0} : capacities[f];
+  };
   std::unordered_map<int, int64_t> first_of_table;  // a table's first feature
   for (int64_t f = 0; f < features; ++f) {
-    if (code[f] != (int)DistType::kCyclic && code[f] != (int)DistType::kHashedCyclic) {
+    if (code[f] != (int)DistType::kCyclic && code[f] != (int)DistType::kHashedCyclic &&
+        code[f] != (int)DistType::kHashedBucket) {
       const std::string rule = code[f] == (int)DistType::kBlock
                                    ? "\"continuous\" (set its table's dist_type to one of those, "
                                      "or output_dist to \"torchrec\")"
                                    : c10::str("dist_type code ", code[f]);
-      refuse("it places keys by dist_type \"roundrobin\" or \"hash_roundrobin\" only, and ",
-             "the sharding's feature ", f, " has ", rule);
+      refuse("it places keys by dist_type \"roundrobin\", \"hash_roundrobin\" or \"hash_bucket\" "
+             "only, and the sharding's feature ",
+             f, " has ", rule);
+    }
+    if (code[f] == (int)DistType::kHashedBucket) {
+      const int64_t global = capacity_of(config.global_capacities, f),
+                    shard = capacity_of(config.shard_capacities, f);
+      if (global < 1 || shard < 1)
+        refuse("the sharding's feature ", f,
+               " has dist_type \"hash_bucket\", which needs a positive global and shard "
+               "capacity, got ",
+               global, " and ", shard);
+      const int64_t shards = global / shard + (global % shard != 0);  // ceil, without overflow
+      if (shards > config.world_size)
+        refuse("the sharding's feature ", f, " has dist_type \"hash_bucket\" with a global capacity ",
+               global, " over a shard capacity ", shard, ", which needs ", shards,
+               " ranks, but the sharding has ", config.world_size);
     }
     const int64_t first = first_of_table.emplace(config.feature_tables[f], f).first->second;
     if (code[first] != code[f])
       refuse("the sharding's features ", first, " and ", f,
              " share a table but not its dist_type (", code[first], " and ", code[f], ")");
+    if (code[f] == (int)DistType::kHashedBucket &&
+        (capacity_of(config.global_capacities, first) != capacity_of(config.global_capacities, f) ||
+         capacity_of(config.shard_capacities, first) != capacity_of(config.shard_capacities, f)))
+      refuse("the sharding's features ", first, " and ", f,
+             " share a table but not its hash_bucket capacities");
   }
 }
 
@@ -159,13 +190,16 @@ Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
                  const std::vector<int64_t> &lookup_groups, int64_t dim, at::ScalarType dtype,
                  bool weighted, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
                  int64_t proxy_bytes, double timeout_s, int64_t out_ctas, int64_t reduce_ctas,
-                 int64_t payload_kb) {
+                 int64_t payload_kb, const std::vector<int64_t> &global_capacities,
+                 const std::vector<int64_t> &shard_capacities) {
   Config config;
   config.rank = (int)rank;
   config.world_size = (int)world_size;
   config.local_size = (int)local_size;
   config.feature_tables.assign(feature_tables.begin(), feature_tables.end());
   config.dist_types.assign(dist_types.begin(), dist_types.end());
+  config.global_capacities = global_capacities;
+  config.shard_capacities = shard_capacities;
   for (const int64_t group : lookup_groups)  // a group past int's range is refused as empty
     config.lookup_groups.push_back(group > 0 && group <= INT32_MAX ? (int)group : 0);
   config.dim = dim;

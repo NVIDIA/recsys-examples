@@ -236,7 +236,7 @@ DynamicEmbeddingCollectionSharder(...)  # use_index_dedup=True with gradient cli
 ```
 
 It serves `ROW_WISE` sequence shardings (`EmbeddingCollection`) of
-`"roundrobin"` and `"hash_roundrobin"` tables (`dist_type`). With a
+`"roundrobin"`, `"hash_roundrobin"` and `"hash_bucket"` tables (`dist_type`). With a
 `"continuous"` table, `"hierarchical"` raises `ValueError` at the first
 `input_dist()` and `"auto"` takes TorchRec's dists (section 6). A call on
 the op deduplicates the sharding's keys (index dedup), whatever the
@@ -352,9 +352,9 @@ every rank before you drop a model (section 4.6).
   a call once, so a key has at most `local_size` occurrences at its proxy
   (section 9). Tables that clip gradients need the sharder's
   `use_index_dedup=True` (section 6).
-* Tables of `dist_type` `"roundrobin"` (the default) or `"hash_roundrobin"`.
-  The tables of a sharding can have different rules. The op refuses
-  `"continuous"` (sections 6 and 10.1).
+* Tables of `dist_type` `"roundrobin"` (the default), `"hash_roundrobin"` or
+  `"hash_bucket"`. The tables of a sharding can have different rules. The op
+  refuses `"continuous"` (sections 6 and 10.1).
 * Keys `int32` or `int64`. The sharding gives the op `int32` keys as
   `int64` (section 10.1). TorchRec's dists need one key dtype on every rank.
 * Capacities (`output_dist_capacity`) that fit the calls (section 5).
@@ -651,14 +651,15 @@ these conditions: a call on the op deduplicates the sharding's keys itself,
 and without the flag the sharding warns so once, when its first
 `input_dist()` builds the op (section 7.4).
 
-The op places keys by `roundrobin` and `hash_roundrobin` only
+The op places keys by `roundrobin`, `hash_roundrobin` and `hash_bucket` only
 (section 10.1). One op serves all tables of a sharding, so one
 `continuous` table refuses the whole sharding. Under `"hierarchical"` the
 error names the first such feature, in the sharding's feature order
 (`feature_names()`):
-`output_dist="hierarchical": it places keys by dist_type "roundrobin" or
-"hash_roundrobin" only, and the sharding's feature 2 has "continuous" (set
-its table's dist_type to one of those, or output_dist to "torchrec")`.
+`output_dist="hierarchical": it places keys by dist_type "roundrobin",
+"hash_roundrobin" or "hash_bucket" only, and the sharding's feature 2 has
+"continuous" (set its table's dist_type to one of those, or output_dist to
+"torchrec")`.
 Under `"auto"` the warning starts with `output_dist="auto":`, has the same
 words, and ends with `; using TorchRec's dists`.
 
@@ -698,7 +699,9 @@ class HierOutputDist {  // one per sharding
                  const std::vector<int64_t> &dist_types, int64_t dim, at::ScalarType dtype,
                  bool weighted, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
                  int64_t proxy_bytes, double timeout_s, int64_t out_ctas, int64_t reduce_ctas,
-                 int64_t payload_kb, const std::vector<int64_t> &lookup_groups);
+                 int64_t payload_kb, const std::vector<int64_t> &lookup_groups,
+                 const std::vector<int64_t> &global_capacities,
+                 const std::vector<int64_t> &shard_capacities);
   ~HierOutputDist();  // local (section 4.6)
 
   // The whole input dist of a call, with no host sync: (values, weights,
@@ -725,30 +728,44 @@ table and the bucketize's rule of each feature, the rows and their weights,
 `node_dedup`, the capacities (with the proxy cap in bytes), the knobs of
 section 4.4, and last the lookup groups (`lookup_groups`: the number of
 features of each group, in feature order, each group's features after the
-previous group's; empty, the default, is one group of every feature).
-`hier_output_dist_invalid()` takes the same fields, the lookup groups last
-too. A rule is a `DistType` code (`src/utils.h`) on the host:
-1 (`roundrobin`) or 2 (`hash_roundrobin`), one for all features of a table.
-The constructor and `hier_output_dist_invalid()` refuse any other code, a
-table whose features have different codes, and a list without a code per
-feature. They also refuse lookup groups that are not runs of the features:
+previous group's; empty, the default, is one group of every feature), then
+`hash_bucket`'s two parameters of each feature: the rows of its table
+(`global_capacities`) and of one of its shards (`shard_capacities`), a number
+per feature, or empty when no feature takes that rule (the entries of the other
+features are not read).
+`hier_output_dist_invalid()` takes the same fields, the lookup groups and the
+capacities last too. A rule is a `DistType` code (`src/utils.h`) on the host:
+1 (`roundrobin`), 2 (`hash_roundrobin`) or 3 (`hash_bucket`), one for all
+features of a table. The constructor and `hier_output_dist_invalid()` refuse any
+other code, a table whose features have different codes, and a list without a
+code per feature. For a `hash_bucket` feature they also refuse a capacity that is
+not positive, capacities that name more ranks than the sharding has
+(`ceil(global / shard) > world_size`), and a table whose features have different
+capacities. They also refuse lookup groups that are not runs of the features:
 a group of no feature, or groups whose features are not the sharding's
 features in all (`Config::validate`). Their messages:
 
-* `it places keys by dist_type "roundrobin" or "hash_roundrobin" only, and
-  the sharding's feature 2 has "continuous" (set its table's dist_type to
-  one of those, or output_dist to "torchrec")`; for an unknown code, `...
-  has dist_type code 7`;
+* `it places keys by dist_type "roundrobin", "hash_roundrobin" or "hash_bucket"
+  only, and the sharding's feature 2 has "continuous" (set its table's
+  dist_type to one of those, or output_dist to "torchrec")`; for an unknown
+  code, `... has dist_type code 7`;
+* `the sharding's feature 2 has dist_type "hash_bucket", which needs a positive
+  global and shard capacity, got 0 and 0`; and `... with a global capacity 1000064
+  over a shard capacity 31250, which needs 32 ranks, but the sharding has 8`;
 * `the sharding's features 0 and 1 share a table but not its dist_type (1
-  and 2)`;
+  and 2)`, or `... but not its hash_bucket capacities`;
 * `it takes a dist_type per feature, got 2 for 3 features`;
 * `every lookup group takes features, got a group of 0 features`;
 * `the lookup groups take 3 features, and the sharding has 4`.
 
 Python gives each table's `dist_type` to all its features, and the number
 of features of each of the sharding's grouped configs as its lookup groups.
+For a `hash_bucket` table it gives the capacities the planner derived for the
+table (`DynamicEmbTableOptions.global_capacity`, and the shard's, which the
+input distributor checks against the table's `max_capacity`:
+`routing_param_lists`), the same for all its features.
 `DynamicEmbTableOptions` takes no `dist_type` but `"continuous"`,
-`"roundrobin"` and `"hash_roundrobin"`. So from Python only the
+`"roundrobin"`, `"hash_roundrobin"` and `"hash_bucket"`. So from Python only the
 `"continuous"` refusal can come (section 6).
 
 `input_dist()` takes the requester's KJT, index-deduplicated
@@ -1025,8 +1042,8 @@ goes once its kernel is queued, and autograd keeps the backward's
   the sharder has use_index_dedup=False, so the training calls of this
   sharding deduplicate its keys themselves` (`output_dist="auto":` under
   `"auto"`).
-* **Owner rules.** The op takes `roundrobin` and `hash_roundrobin` tables
-  only (`Config::validate`): a sharding with a `continuous` table takes
+* **Owner rules.** The op takes `roundrobin`, `hash_roundrobin` and
+  `hash_bucket` tables (`Config::validate`): a sharding with a `continuous` table takes
   TorchRec's dists under `"auto"`, and raises `ValueError` under
   `"hierarchical"`, at its first input dist (section 6).
 * **The lookup.** For the owner's KJT of a call on the op, the sharding
@@ -1381,9 +1398,9 @@ bucketize (`bucketize_rows`, `bucketize.cu`), named after TorchRec's
    TorchRec's path in DynamicEmb (an eval forward). The op gets them as
    `int64` (see below).
 2. **The keys by owner.** Each key's feature comes from the KJT's offsets, and
-   its owner from its feature's rule (`dist_type`: `roundrobin` or
-   `hash_roundrobin`), in the arithmetic of the keys' width: 64 bits (see
-   below). The kernels read the rule of each key's feature at run time, so
+   its owner from its feature's rule (`dist_type`: `roundrobin`,
+   `hash_roundrobin` or `hash_bucket`), in the arithmetic of the keys' width:
+   64 bits (see below). The kernels read the rule of each key's feature at run time, so
    the tables of a sharding can have different rules. The keys' rows go in
    `[owner][feature][sample][position]` order: `inv` holds each one's row in
    the KJT, and the keys past the valid ones (index dedup) go last. A KJT's
@@ -1474,13 +1491,18 @@ bucketizes the KJT as the caller gave it, and the bucketize reads an
 `int32` key as the `int64` key of its value, the key a table stores:
 `roundrobin` sends a key to `key mod world_size` and `hash_roundrobin` to
 `murmur3_fmix64(key) mod world_size`, the key read as an unsigned 64-bit
-number. Checkpoint loading and delta replay (`dynamicemb/key_ownership.py`)
-place each key by the same rule. `bucketize_rows` computes in the keys' own
-type, an `int32` key in 32 bits, so the sharding gives the op `int32` keys
-as `int64` (`hier_forward`). So on both paths a key goes to the same owner,
-which is where a checkpoint load or a delta replay puts it.
+number; `hash_bucket` to the shard that holds the key's global bucket,
+`(h mod global_capacity) div shard_capacity` with `h = murmur3_fmix64(key) &
+INT64_MAX`, the key read as the `int64` it is (an `int32` key widens with its
+sign), and the two capacities those of the key's table (`hashed_bucket_owner`;
+`Config::global_capacities` and `shard_capacities`). Checkpoint loading and delta
+replay (`dynamicemb/key_ownership.py`) place each key by the same rule.
+`bucketize_rows` computes the first two in the keys' own type, an `int32` key in
+32 bits, so the sharding gives the op `int32` keys as `int64` (`hier_forward`).
+So on both paths a key goes to the same owner, which is where a checkpoint load or
+a delta replay puts it.
 
-Both rules keep the key, and the owner gets the 64-bit key DynamicEmb's
+All three rules keep the key, and the owner gets the 64-bit key DynamicEmb's
 lookup makes of an `int32` key on TorchRec's path. So a model may take
 either path call by call (eval forwards, calls that do not fit) and finds
 its rows.
@@ -3356,7 +3378,7 @@ on 1 and 3 CTAs, and the calls of the design's reference ports.
   barriers, have work that grows with `local_size`. The planner's hook
   tests take nodes of 72 GPUs (section 18); nothing has run on a node of
   more than 16 GPUs yet (4 trays of a GB300 NVL72 rack, section 4.2).
-* **Owner rules**: `roundrobin` and `hash_roundrobin` only. A sharding with
+* **Owner rules**: `roundrobin`, `hash_roundrobin` and `hash_bucket`. A sharding with
   a `continuous` table takes TorchRec's dists under `"auto"`, and raises
   `ValueError` under `"hierarchical"` (section 6).
 * **No score per key**: tables of `score_strategy` `PRECISE_CUSTOMIZED` take

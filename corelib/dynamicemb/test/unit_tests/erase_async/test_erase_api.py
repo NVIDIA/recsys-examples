@@ -21,14 +21,15 @@ the feature is for: a table that never evicts is filled, the old keys are erased
 their score, and new keys take the room.
 """
 
+import re
 import warnings
 
 import pytest
 import torch
 from dynamicemb import DynamicEmbScoreStrategy, erase_by_score_async
 from dynamicemb.async_erase import EraseHandle, EraseHandleGroup
-from dynamicemb.batched_dynamicemb_tables import StorageLayout
 from dynamicemb.key_value_table import ERASE_CHUNK_SLOTS, ERASE_MAX_CHUNKS_IN_FLIGHT
+from dynamicemb.state.storage_layout import CachePolicy, StorageLayout, StorageTier
 from helpers import DIM, build_de_table, size, train_step
 from torch import nn
 
@@ -148,23 +149,38 @@ def test_the_chunk_and_the_limit_in_flight_given_are_the_ones_the_scan_gets(devi
 @pytest.mark.parametrize(
     "layout, build_kwargs, stand_in",
     [
-        ("HOST_ONLY", dict(local_hbm_for_values=0), False),
-        ("HYBRID", dict(local_hbm_for_values=(1 << 20) * DIM * 4 // 2), False),
-        ("CACHING_PS", {}, True),
-        ("HOST_PS", {}, True),
+        (
+            StorageLayout(StorageTier.HBM | StorageTier.DDR),
+            dict(local_hbm_for_values=(1 << 20) * DIM * 4 // 2),
+            False,
+        ),
+        (
+            StorageLayout(
+                StorageTier.HBM | StorageTier.DDR | StorageTier.EXTERNAL,
+                CachePolicy.INCLUSIVE,
+            ),
+            {},
+            True,
+        ),
+        (
+            StorageLayout(StorageTier.HBM | StorageTier.EXTERNAL, CachePolicy.NINE),
+            {},
+            True,
+        ),
+        (StorageLayout(StorageTier.EXTERNAL), {}, True),
     ],
 )
 def test_a_layout_that_cannot_be_scanned_is_refused_only_where_a_table_is_picked(
     device, layout, build_kwargs, stand_in
 ):
-    """The first two are real layouts. The two with an external store are stand-ins -- a
+    """The first is a real layout. The two with an external store are stand-ins -- a
     module that says it has one, since the store the tests of tables with a PS use is
     not available here -- so what is tested is that the refusal goes by the layout."""
     module = build_de_table(device.index, S.CUSTOMIZED, **build_kwargs)
     if stand_in:
-        module._storage_layout = StorageLayout[layout]
+        module._storage_layout = layout
     stream = torch.cuda.Stream()
-    with pytest.raises(NotImplementedError, match=layout):
+    with pytest.raises(NotImplementedError, match=re.escape(str(layout))):
         module.erase_by_score_async(S.CUSTOMIZED, 10, stream)
     # No table asked for: nothing to scan, so nothing to refuse.
     handle = module.erase_by_score_async(S.LFU, 10, stream)
@@ -252,11 +268,13 @@ def test_nothing_is_started_when_any_module_is_refused(device):
     """The first module could be erased; the second cannot be scanned. All the checks
     come before any start, so the first one's worker was never made."""
     scannable = build_de_table(device.index, S.CUSTOMIZED)
-    host_only = build_de_table(device.index, S.CUSTOMIZED, local_hbm_for_values=0)
+    hybrid = build_de_table(
+        device.index, S.CUSTOMIZED, local_hbm_for_values=(1 << 20) * DIM * 4 // 2
+    )
     train_step(scannable, list(range(1, 501)), device, score=5)
-    with pytest.raises(NotImplementedError, match="GPU hash table"):
+    with pytest.raises(NotImplementedError, match=re.escape(str(StorageLayout(StorageTier.HBM | StorageTier.DDR)))):
         erase_by_score_async(
-            nn.ModuleList([scannable, host_only]),
+            nn.ModuleList([scannable, hybrid]),
             S.CUSTOMIZED,
             100,
             torch.cuda.Stream(),

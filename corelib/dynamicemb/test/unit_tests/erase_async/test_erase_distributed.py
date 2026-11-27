@@ -30,7 +30,7 @@ every rank, and looks at what the tables hold, gathered over the ranks:
 * with the keys scored per table (``CUSTOMIZED``), per key (``PRECISE_CUSTOMIZED``), and
   per key in tables that never evict -- the use the feature is for;
 * with and without ``use_index_dedup``;
-* a layout that cannot be scanned is refused, and nothing is erased.
+* the same beside training on host-only tables (no HBM for values).
 """
 
 import os
@@ -197,10 +197,13 @@ def check_erase(case: str, use_index_dedup: bool) -> None:
     hier_switch.release()
 
 
-def check_erase_beside_training(case: str) -> None:
+def check_erase_beside_training(case: str, hbm_scale: float = 1.0) -> None:
     strategy, asked, per_key = CASES[case]
-    model, feature_names, table_names = _model(strategy)
-    label = f"{case}, beside training"
+    model, feature_names, table_names = _model(strategy, hbm_scale=hbm_scale)
+    label = f"{case}, beside training, hbm_scale={hbm_scale}"
+    if hbm_scale == 0.0:
+        layouts = {str(m._storage_layout) for m in get_dynamic_emb_module(model)}
+        assert layouts == {"DDR"}, layouts
 
     _train(model, feature_names, OLD_KEYS, per_key, OLD_SCORE)
     _train(model, feature_names, NEW_KEYS, per_key, NEW_SCORE)
@@ -218,21 +221,6 @@ def check_erase_beside_training(case: str) -> None:
     hier_switch.release()
 
 
-def check_host_only_is_refused() -> None:
-    """No HBM for values: the tables are on the host, with no key map to scan on the GPU.
-    The call says so on every rank, and nothing was erased."""
-    model, feature_names, table_names = _model(S.CUSTOMIZED, hbm_scale=0.0)
-    _train(model, feature_names, OLD_KEYS, False, OLD_SCORE)
-    try:
-        erase_by_score_async(model, S.CUSTOMIZED, THRESHOLD)
-    except NotImplementedError as error:
-        assert "HOST_ONLY" in str(error), str(error)
-    else:
-        raise AssertionError("an erase of a host-only table was not refused")
-    _expect(model, table_names, OLD_KEYS, "host only")
-    hier_switch.release()
-
-
 if __name__ == "__main__":
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
     dist.init_process_group(backend="nccl")
@@ -240,7 +228,7 @@ if __name__ == "__main__":
         check_erase(case, use_index_dedup=False)
         check_erase(case, use_index_dedup=True)
         check_erase_beside_training(case)
-    check_host_only_is_refused()
+        check_erase_beside_training(case, hbm_scale=0.0)
     dist.barrier()
     if dist.get_rank() == 0:
         print("test_erase_distributed: all cases passed", flush=True)

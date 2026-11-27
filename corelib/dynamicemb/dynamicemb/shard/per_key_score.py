@@ -19,7 +19,7 @@ from torchrec.distributed.embedding_types import ShardingType
 from torchrec.distributed.types import ParameterSharding
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-from ..scored_kjt import ScoredKeyedJaggedTensor
+from ..score.kjt import ScoredKeyedJaggedTensor
 
 
 def collect_per_key_score(params: Dict[str, ParameterSharding]) -> bool:

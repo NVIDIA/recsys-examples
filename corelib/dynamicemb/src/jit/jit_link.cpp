@@ -76,20 +76,32 @@ EvictModule load_from_image(const void *image, const char *ctx) {
   EvictModule m;
   cu_check(cuModuleLoadData(&m.module, image), ctx);
   // If any entry is missing (e.g. a stale/mismatched image), unload the module
-  // we just loaded before propagating -- otherwise it leaks.
+  // we just loaded before propagating -- otherwise it leaks. The entry points
+  // are named for the EvictParams ABI they were built against
+  // (DYN_EMB_EVICT_NAME), so an image from another layout is missing them all.
   try {
-    cu_check(cuModuleGetFunction(&m.ovf, m.module, "dyn_emb_evict_entry_ovf"),
+    cu_check(cuModuleGetFunction(&m.ovf, m.module,
+                                 DYN_EMB_EVICT_NAME("dyn_emb_evict_entry_ovf")),
              "cuModuleGetFunction(ovf)");
-    cu_check(cuModuleGetFunction(&m.noovf, m.module, "dyn_emb_evict_entry_noovf"),
+    cu_check(cuModuleGetFunction(
+                 &m.noovf, m.module,
+                 DYN_EMB_EVICT_NAME("dyn_emb_evict_entry_noovf")),
              "cuModuleGetFunction(noovf)");
-    cu_check(cuModuleGetFunction(&m.insert, m.module, "dyn_emb_insert_entry"),
+    cu_check(cuModuleGetFunction(&m.insert, m.module,
+                                 DYN_EMB_EVICT_NAME("dyn_emb_insert_entry")),
              "cuModuleGetFunction(insert)");
-    cu_check(cuModuleGetFunction(&m.insert_collect, m.module,
-                                 "dyn_emb_insert_collect_entry"),
+    cu_check(cuModuleGetFunction(
+                 &m.insert_collect, m.module,
+                 DYN_EMB_EVICT_NAME("dyn_emb_insert_collect_entry")),
              "cuModuleGetFunction(insert_collect)");
-  } catch (...) {
+  } catch (const std::exception &e) {
     cuModuleUnload(m.module);
-    throw;
+    throw std::runtime_error(
+        std::string(e.what()) +
+        " -- the evict image does not export the entry points of EvictParams "
+        "ABI " DYN_EMB_STR(DYN_EMB_EVICT_ABI)
+        ": the extension and its evict fatbins were built from different "
+        "sources. Rebuild both together (python setup.py install).");
   }
   return m;
 }

@@ -55,7 +55,7 @@ from ..dynamicemb_config import (
     DynamicEmbScoreStrategy,
     get_eviction_score_strategy,
 )
-from ..scored_kjt import ScoredKeyedJaggedTensor, without_scores
+from ..score.kjt import ScoredKeyedJaggedTensor, without_scores
 from .hier_output_dist import DynamicEmbSequenceShardingContext
 from .per_key_score import collect_per_key_score, require_scores
 from .rw_sharding import RwSequenceDynamicEmbeddingSharding

@@ -25,7 +25,7 @@ import torch.distributed as dist
 import torchrec
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-from dynamicemb.key_ownership import owned_key_mask
+from dynamicemb.key_ownership import OwnershipRule
 from dynamicemb.key_value_table import Storage
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
@@ -239,7 +239,7 @@ class ConstructTwinModule:
         assert not is_weighted or is_pooled, "is_weighted requires a pooled collection"
         self._is_weighted = is_weighted
         self._rank = rank
-        # The owner rank of the keys this rank seeds (``owned_key_mask``).
+        # The owner rank of the keys this rank seeds (``OwnershipRule``).
         # ``rank`` is the device; on one node the two are the same.
         self._global_rank = rank if global_rank is None else global_rank
         self._world_size = world_size
@@ -477,15 +477,22 @@ class ConstructTwinModule:
         # Seeding a row's optimizer state is the optimizer's call, not the
         # storage's, so keep a handle on it alongside the storage.
         table_name_map_optimizer = {}
+        # The options the planner gave each table, after sharding. Which rank
+        # owns a key is the table's rule with the table's own parameters
+        # (hash_bucket needs its global_capacity and bucket_capacity), so read
+        # them from the table rather than re-deriving them here.
+        table_name_map_options = {}
         for dynamic_emb_module in tmp_dynamic_emb_module_list:
             tmp_table_names = dynamic_emb_module.table_names
             tmp_storage = dynamic_emb_module.tables
             tmp_optimizer = dynamic_emb_module.optimizer
+            tmp_options = dynamic_emb_module.dynamicemb_options
 
             for i, tmp_table_name in enumerate(tmp_table_names):
                 table_name_map_hkv_table[tmp_table_name] = tmp_storage
                 table_name_map_table_id[tmp_table_name] = i
                 table_name_map_optimizer[tmp_table_name] = tmp_optimizer
+                table_name_map_options[tmp_table_name] = tmp_options[i]
 
         # Perform all lookup iterations
         for iter_idx in range(total_iterations):
@@ -544,8 +551,10 @@ class ConstructTwinModule:
             indices = result["indices"]
             values = result["values"]
 
-            mask = owned_key_mask(
-                indices, self._global_rank, self._world_size, self._dist_type
+            tmp_table_name = feature.replace("f_", "t_")
+            option = table_name_map_options[tmp_table_name]
+            mask = OwnershipRule.of(option, self._world_size).mask(
+                indices, self._global_rank
             )
             if mask is None:
                 mask = torch.ones_like(indices, dtype=torch.bool)
@@ -577,7 +586,6 @@ class ConstructTwinModule:
             unique_indices = uniq_key
             unique_values = chosen_value
 
-            tmp_table_name = feature.replace("f_", "t_")
             cur_hkv_table: Storage = table_name_map_hkv_table[tmp_table_name]
             table_id = table_name_map_table_id[tmp_table_name]
             max_emb_dim = cur_hkv_table.max_embedding_dim()

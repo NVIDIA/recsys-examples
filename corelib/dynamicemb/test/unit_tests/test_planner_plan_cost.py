@@ -739,6 +739,58 @@ class TestGroupedTiers:
             [(o, None)]
         ) == get_local_value_bytes_by_tier(o, None)
 
+    def test_a_caching_group_with_a_ps_costs_the_host_what_its_ddr_budget_buys(self):
+        """Under caching a PS takes the backing tier off this box, except the
+        DynamicEmbStorage the ddr budget buys between the cache and the PS --
+        none of it without a budget (the NINE layout)."""
+        rows_bytes = ROWS * DIM * 4
+        ps = object()  # only whether there is one matters to the cost
+
+        def caching(ddr_budget):
+            o = _options(hbm_budget=rows_bytes // 4)
+            o.caching = True
+            o.external_storage = ps
+            o.local_ddr_for_values = ddr_budget
+            return o
+
+        # NINE: cache + PS, nothing of ours on the host.
+        assert get_group_value_bytes_by_tier([(caching(0), None)]) == (
+            rows_bytes // 4,
+            0,
+        )
+        # Inclusive with a PS: the storage holds what the budget buys...
+        assert get_group_value_bytes_by_tier([(caching(rows_bytes // 2), None)]) == (
+            rows_bytes // 4,
+            rows_bytes // 2,
+        )
+        # ...up to the whole table.
+        assert get_group_value_bytes_by_tier([(caching(10 * rows_bytes), None)]) == (
+            rows_bytes // 4,
+            rows_bytes,
+        )
+        # Without a PS the storage holds the whole table whatever the budget.
+        o = caching(rows_bytes // 2)
+        o.external_storage = None
+        assert get_group_value_bytes_by_tier([(o, None)]) == (
+            rows_bytes // 4,
+            rows_bytes,
+        )
+
+    def test_a_ddr_budget_below_one_bucket_costs_the_whole_bucket(self):
+        """The storage rounds its share to whole buckets and keeps one at
+        least, so a budget smaller than a bucket still takes the bucket: with
+        one bucket spanning the shard (MAX_BUCKET_CAPACITY) that is the table."""
+        rows_bytes = ROWS * DIM * 4
+        o = _options(hbm_budget=rows_bytes // 4)
+        o.caching = True
+        o.external_storage = object()
+        o.bucket_capacity = o.max_capacity  # one bucket spans the shard
+        o.local_ddr_for_values = rows_bytes // 16
+        assert get_group_value_bytes_by_tier([(o, None)]) == (
+            rows_bytes // 4,
+            rows_bytes,
+        )
+
     def test_an_unsized_table_reports_its_budget(self):
         """No dim or capacity means nothing to size from, so it fills its own
         budget rather than counting as free."""

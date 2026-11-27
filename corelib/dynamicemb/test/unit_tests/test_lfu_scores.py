@@ -271,7 +271,7 @@ def validate_lfu_scores(
     default=1.0,
     help=(
         "Scale DynamicEmb HBM byte budget vs full table. Values < 1.0 force "
-        "HybridStorage and prefetch StorageMode DEFAULT (_generic_forward_path)."
+        "HybridStorage and prefetch the generic prefetch path (_generic_forward_path)."
     ),
 )
 @click.option(
@@ -326,7 +326,7 @@ def test_lfu_score_validation(
 
     This test supports:
     - Storage-only (default): HBM-only storage when budget fits (HBM_DIRECT path)
-    - StorageMode DEFAULT: --global-hbm-budget-scale < 1 → HybridStorage
+    - the generic prefetch path: --global-hbm-budget-scale < 1 → HybridStorage
     - Cache + Storage (--caching): LFU through cache to storage
     """
 
@@ -372,7 +372,7 @@ def test_lfu_score_validation(
     print(f"  - compound (TIMESTAMP, LFU) score: {lru_lfu} (LruLfu 2-word score)")
     print(f"  - Mixed score strategies: {mixed_score_strategies}")
     if not caching and global_hbm_budget_scale < 1.0:
-        print(f"  - Storage path: expect HybridStorage (StorageMode DEFAULT)")
+        print(f"  - Storage path: expect HybridStorage (the generic prefetch path)")
 
     # Create model. When --lru-lfu is set, use the compound (TIMESTAMP, LFU) score
     # strategy so LFU tables also carry a timestamp column; eviction is still driven
