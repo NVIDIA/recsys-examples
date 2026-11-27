@@ -203,3 +203,51 @@ def test_with_a_cache_only_the_storage_behind_it_is_erased(device):
     assert bool(found(module, new, device).all())
     assert bool((found(module, everything, device, cache=True) == in_cache).all())
     train_step(module, everything[:500], device, score=300)  # and it still reads right
+
+
+def test_host_only_storage_is_erased_while_training_goes_on(device):
+    """No HBM for values and no cache: the values are on the host and the training takes
+    the generic path, which finds and inserts its keys in forward and writes them back in
+    backward. The erase runs beside it; the old keys go, every other key reads right."""
+    module = build_de_table(device.index, S.CUSTOMIZED, local_hbm_for_values=0)
+    assert module._storage_layout == StorageLayout(StorageTier.DDR)
+    old, new = key_range(1, 2000), key_range(2001, 2000)
+    for keys, score in ((old, 10), (new, 200)):
+        for start in range(0, len(keys), 500):
+            train_step(module, keys[start : start + 500], device, score=score)
+
+    handle = module.erase_by_score_async(S.CUSTOMIZED, 100)
+    later = key_range(10_001, 4000)
+    for start in range(0, len(later), 500):
+        train_step(module, later[start : start + 500], device, score=300)
+
+    assert handle.result() == (len(old), 0)
+    assert not bool(found(module, old, device).any())
+    assert bool(found(module, new + later, device).all())
+    assert size(module) == len(new) + len(later)
+    train_step(module, new[:500], device, score=300)
+
+
+def test_on_host_only_a_key_erased_between_forward_and_backward_is_not_written_back(
+    device,
+):
+    """Host-only storage pins nothing, so a key a batch is using is erased like any
+    other (never spared). Its backward then drops that key's update: the key does not
+    come back, and takes no room from the keys that are there."""
+    module = build_de_table(device.index, S.CUSTOMIZED, local_hbm_for_values=0)
+    keys, others = key_range(1, 800), key_range(1001, 800)
+    train_step(module, others, device, score=200)
+    module.set_score({"t_0": 5})
+    indices = torch.tensor(keys, dtype=torch.int64, device=device)
+    offsets = torch.arange(0, len(keys) + 1, dtype=torch.int64, device=device)
+    out = module(indices, offsets)  # finds and inserts the keys, with score 5
+    torch.cuda.synchronize()
+
+    assert module.erase_by_score_async(S.CUSTOMIZED, 100).result() == (len(keys), 0)
+    out.sum().backward()
+    torch.cuda.synchronize()
+
+    assert not bool(found(module, keys, device).any())
+    assert bool(found(module, others, device).all())
+    assert size(module) == len(others)
+    train_step(module, keys, device, score=300)  # they come back new, and read right

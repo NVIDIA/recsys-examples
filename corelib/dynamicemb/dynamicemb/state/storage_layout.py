@@ -80,12 +80,13 @@ class StorageLayout:
     def erasable(self) -> bool:
         """Whether an erase by score can scan this layout's keys.
 
-        Only a single-tier GPU storage and the backing storage of a cache keep a
-        key map the erase can scan; the others keep their keys where it cannot
-        (host values read by the generic path, two tiers, an external store).
+        A single-tier storage (HBM or host: a ``DynamicEmbStorage`` whose key map is
+        on the GPU) and the backing storage of a cache keep a key map the erase can
+        scan; the others keep their keys where it cannot (two tiers, an external
+        store).
         """
         if self.cache_policy is None:
-            return self.tiers == StorageTier.HBM
+            return self.tiers in (StorageTier.HBM, StorageTier.DDR)
         return (
             self.cache_policy == CachePolicy.INCLUSIVE
             and StorageTier.EXTERNAL not in self.tiers

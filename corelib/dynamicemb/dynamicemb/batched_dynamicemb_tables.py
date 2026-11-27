@@ -1549,8 +1549,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 table_ids.append(table_id)
         if table_ids and not self._storage_layout.erasable:
             raise NotImplementedError(
-                "erase by score needs the keys in a GPU hash table: HBM-only storage, "
-                "or a cache over host storage with no external storage. This module "
+                "erase by score needs a single-tier storage (HBM-only or host-only) "
+                "or a cache over host storage, with no external storage. This module "
                 f"is {self._storage_layout}."
             )
         return table_ids
@@ -1632,7 +1632,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         Best effort: a key a prefetched batch is still using is spared, not erased.
         With a cache only the storage behind it is erased, and the cache is neither
-        read nor changed.
+        read nor changed. Host-only storage pins no key: one a batch is using is erased
+        if its score is below ``threshold``, and that batch's update to it is dropped.
 
         The scan can overlap training -- forward, backward and prefetch -- and nothing
         else: before a dump, load, incremental dump, replay or ``pop_*``, wait for

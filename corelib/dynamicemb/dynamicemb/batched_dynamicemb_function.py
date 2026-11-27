@@ -32,6 +32,7 @@ from dynamicemb.key_value_table import (
     _select,
     _write_back_evicted,
     eval_lookup,
+    get_find_score_arg,
     get_insert_score_arg,
     load_from_flat,
     load_from_flat_by,
@@ -221,6 +222,7 @@ class PrefetchState:
     # The key_map_generation (rehash count) of the table state the slots were found in: a later
     # prefetch may expand it before this batch's backward runs.
     key_map_generation: int = 0
+    table_gate: Optional[Callable[[], ContextManager]] = None
 
     def record_stream(self, stream: torch.cuda.Stream) -> None:
         """Marks the per-batch tensors used on ``stream``: a prefetch pipeline
@@ -915,7 +917,9 @@ def dynamicemb_prefetch(
     ``table_gate`` is what an erase running beside the training takes too (see
     ``async_erase.TableAccessGate``). Prefetch holds it while it reads or changes the
     tables -- from the expansion through the find and the counter increment -- so
-    that a key it found is pinned before an erase can look at it.
+    that a key it found is pinned before an erase can look at it. The generic
+    (DEFAULT) path finds and inserts its keys in forward and writes them back in
+    backward instead, so the gate goes with the returned state and those take it too.
     """
     with torch.cuda.nvtx.range("dynamicemb_prefetch"):
         table_num = feature_offsets.numel() - 1
@@ -1048,6 +1052,7 @@ def dynamicemb_prefetch(
             unique_scores=unique_scores,
             value_row_indices=value_row_indices,
             key_map_generation=key_map_generation,
+            table_gate=table_gate,
         )
 
 
@@ -1298,6 +1303,38 @@ def release_slot_pins(
     slot_owner.decrement_counter(slot_indices, unique_table_ids)
 
 
+def write_back_generic(
+    storage: Storage,
+    keys: torch.Tensor,
+    table_ids: torch.Tensor,
+    values: torch.Tensor,
+) -> None:
+    """Backward's write-back on the generic path: the updated rows of the keys forward
+    found or inserted, scores left as they are.
+
+    A ``DynamicEmbStorage`` pins no slot here, so between forward and backward an erase
+    may have taken a key: its update is dropped rather than inserted again, since a
+    ``CONST`` insert would give it a score of 0 and evict a live key to make room.
+    Other storages keep their own ``insert(preserve_existing=True)``.
+
+    No host sync: a missing key's row is set to -1, which the store skips."""
+    if not isinstance(storage, DynamicEmbStorage):
+        storage.insert(keys, table_ids, values, preserve_existing=True)
+        return
+    if keys.numel() == 0:
+        return
+    state = storage._state
+    km = state.key_index_map
+    if keys.dtype != km.key_type:
+        keys = keys.to(km.key_type)
+    score_arg = get_find_score_arg(state, keys.numel(), keys.device, const_lookup=True)
+    if getattr(km, "enable_overflow_", False):
+        _, founds, rows = km.lookup_with_overflow(keys, table_ids, score_arg)
+    else:
+        _, founds, rows = km.lookup(keys, table_ids, score_arg)
+    store_to_flat(state, torch.where(founds, rows, -1), table_ids, values)
+
+
 class DynamicEmbeddingFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1377,20 +1414,21 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 evict_strat = (
                     EvictStrategy(evict_strategy.value) if evict_strategy else None
                 )
-                unique_values, persisted_unique_indices = _generic_forward_path(
-                    storage,
-                    optimizer,
-                    prefetch_state.unique_keys,
-                    prefetch_state.unique_table_ids,
-                    max_emb_dim,
-                    max_val_dim,
-                    emb_dtype,
-                    initializer,
-                    evict_strat,
-                    prefetch_state.lfu_accumulated_frequency,
-                    admitter,
-                    key_scores=prefetch_state.unique_scores,
-                )
+                with table_section(prefetch_state.table_gate):
+                    unique_values, persisted_unique_indices = _generic_forward_path(
+                        storage,
+                        optimizer,
+                        prefetch_state.unique_keys,
+                        prefetch_state.unique_table_ids,
+                        max_emb_dim,
+                        max_val_dim,
+                        emb_dtype,
+                        initializer,
+                        evict_strat,
+                        prefetch_state.lfu_accumulated_frequency,
+                        admitter,
+                        key_scores=prefetch_state.unique_scores,
+                    )
                 # find() was asked for CopyMode.VALUE, so a row here is
                 # embedding ++ optimizer state; keep only the embedding.
                 unique_embs = unique_values[:, :max_emb_dim]
@@ -1463,6 +1501,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.update_value_rows = prefetch_state.value_row_indices
             ctx.key_map_generation = prefetch_state.key_map_generation
             ctx.slot_owner = prefetch_state.slot_owner
+            ctx.table_gate = prefetch_state.table_gate
             ctx.optimizer = optimizer
             ctx.layout = layout
             ctx.offsets = offsets
@@ -1575,16 +1614,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         keys_c = ctx.unique_keys[pui]
                         tids_c = unique_table_ids[pui]
                         vals_c = ctx.unique_values[pui]
-                        # preserve_existing=True → CONST score policy on insert:
-                        # refresh embedding/optimizer buffers only; do not overwrite
-                        # table scores (LFU / timestamp / etc.). For HybridStorage,
-                        # the HBM tier uses this on backward; existing scores stay.
-                        with torch.cuda.nvtx.range("op:storage_insert"):
-                            storage.insert(
-                                keys_c,
-                                tids_c,
-                                vals_c,
-                                preserve_existing=True,
-                            )
+                        with torch.cuda.nvtx.range("op:storage_insert"), table_section(
+                            ctx.table_gate
+                        ):
+                            write_back_generic(storage, keys_c, tids_c, vals_c)
 
             return (None,) * 18
