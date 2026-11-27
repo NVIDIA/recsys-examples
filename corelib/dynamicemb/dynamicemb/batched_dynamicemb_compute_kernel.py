@@ -130,12 +130,16 @@ def get_state_dict(
             # ranks while pg is still the world.
             num_shards = len(local_metadatas)
             shard_ranks = [_placement_rank(md.placement) for md in local_metadatas]
-            if pg.rank() not in shard_ranks:
+            # Placements are global ranks, as ShardedTensor reads them, while pg
+            # can be a subgroup: TorchRec 2D (DMPCollection) shards over one, and
+            # outside the first replica pg.rank() is not this rank's placement.
+            global_rank = dist.get_rank()
+            if global_rank not in shard_ranks:
                 raise RuntimeError(
-                    f"Rank {pg.rank()} holds no shard of table {embedding_table.name} "
+                    f"Rank {global_rank} holds no shard of table {embedding_table.name} "
                     f"(shards on ranks {shard_ranks}) but was asked for its state."
                 )
-            my_shard = shard_ranks.index(pg.rank())
+            my_shard = shard_ranks.index(global_rank)
             for i, local_metadata in enumerate(local_metadatas):
                 local_metadata.shard_offsets = [i, 0]
                 local_metadata.shard_sizes = [1, 1]

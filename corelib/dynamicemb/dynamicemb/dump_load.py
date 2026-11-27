@@ -25,7 +25,7 @@ from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from torch import nn
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
-from torchrec.distributed.model_parallel import get_unwrapped_module
+from torchrec.distributed.model_parallel import DMPCollection, get_unwrapped_module
 
 
 def find_sharded_modules(
@@ -140,10 +140,31 @@ def DynamicEmbDump(
     pg : Optional[dist.ProcessGroup], optional
         The process group used to control the communication scope in the dump. Defaults to None.
 
+    Under TorchRec 2D sparse parallelism -- ``model`` is a ``DMPCollection`` -- every
+    replica names its files by its own shard, so the replicas would write the same
+    files. The first replica writes them and the others wait for it at ``pg``. Run
+    ``DMPCollection.sync`` and ``DynamicEmbReplicaSync.sync`` right before, so that
+    the first replica's rows are the model's.
+
     Returns
     -------
     None
     """
+
+    if isinstance(model, DMPCollection):
+        mesh = model.device_mesh
+        if dist.get_rank(mesh.get_group("replicate")) == 0:
+            DynamicEmbDump(
+                path,
+                get_unwrapped_module(model),
+                table_names=table_names,
+                optim=optim,
+                counter=counter,
+                pg=mesh.get_group("shard"),
+                allow_overwrite=allow_overwrite,
+            )
+        dist.barrier(group=pg, device_ids=[torch.cuda.current_device()])
+        return
 
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -251,6 +272,10 @@ def DynamicEmbLoad(
         Whether to load the embedding admission counter table. Defaults to False.
     pg : Optional[dist.ProcessGroup], optional
         The process group used to control the communication scope in the load. Defaults to None.
+
+    Under TorchRec 2D sparse parallelism every replica loads the files of its own
+    shard, so all replicas hold the same rows afterwards; tell a
+    ``DynamicEmbReplicaSync`` with ``mark_synced`` that they agree.
 
     Returns
     -------
