@@ -13,11 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+import sys
+import warnings
+from contextlib import nullcontext
+from dataclasses import dataclass, field
+from threading import RLock
 from typing import Callable, ContextManager, Optional, Tuple, Union
 
 import torch
-from dynamicemb.async_erase import table_section
+from dynamicemb.async_erase import defer_table_cleanup, table_section
 from dynamicemb.dynamicemb_config import EvictedItemMode
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_value_table import (
@@ -194,6 +198,85 @@ def largest_score_per_unique_key(
     )
 
 
+class _PinnedRowLease:
+    """One pin reservation, returned on final backward or abandoned ownership.
+
+    Keep backend/metadata alive independently of PrefetchState (no cycle). An
+    event orders cancellation on a different stream after the last queued use.
+    """
+
+    def __init__(self, batch):
+        self.owner = batch.slot_owner
+        self.unique_keys, self.unique_table_ids = (
+            batch.unique_keys,
+            batch.unique_table_ids,
+        )
+        self.slot_indices = batch.slot_indices
+        self.key_map_generation = batch.key_map_generation
+        self.table_gate = batch.table_gate
+        self.released = False
+        self._lock = RLock()
+        self._device_index = self.unique_keys.device.index
+        # The prefetch gate already orders creation. Only a caller without a
+        # gate needs an additional creation event for abandoned input cleanup.
+        self._last_use = None
+        if self.table_gate is None:
+            self.record_use()
+
+    def record_use(self):
+        with self._lock:
+            if self._last_use is None:
+                self._last_use = torch.cuda.Event()
+            self._last_use.record(torch.cuda.current_stream(self._device_index))
+
+    def release(self, *, after_use=False):
+        with self._lock:
+            if self.released:
+                return
+            owner = self.owner
+            # Fixed hash slots cannot move while pinned. As in the existing
+            # backward contract, the atomic decrement follows this stream's
+            # final use; async erase sees the pin until that decrement. Rehash
+            # and cancellation still need the gate, as do CPU reservations.
+            fixed_slots = not owner._state.key_index_map.use_rows_
+            gate = None if after_use and fixed_slots else self.table_gate
+            # Autograd runs final backward on the forward's device/use stream.
+            # Abandoned ownership can be released from any device or thread.
+            device_guard = (
+                nullcontext() if after_use else torch.cuda.device(self._device_index)
+            )
+            with device_guard, table_section(gate):
+                stream = torch.cuda.current_stream(self._device_index)
+                # A completed backward enqueues the release on its own use
+                # stream. Cancellation still has to join the last use event.
+                if not after_use and self._last_use is not None:
+                    stream.wait_event(self._last_use)
+                if not after_use:
+                    for tensor in (
+                        self.unique_keys,
+                        self.unique_table_ids,
+                        self.slot_indices,
+                    ):
+                        tensor.record_stream(stream)
+                refresh_slots_after_rehash(owner._state, self)
+                release_slot_pins(owner, self.slot_indices, self.unique_table_ids)
+                self.released = True
+
+    def __del__(self):
+        if self.released or sys.is_finalizing():
+            return
+        if not defer_table_cleanup(self._release_safely):
+            self._release_safely()
+
+    def _release_safely(self):
+        try:
+            self.release()
+        except Exception as error:
+            warnings.warn(
+                f"Could not release abandoned embedding rows: {error}", ResourceWarning
+            )
+
+
 @dataclass
 class PrefetchState:
     unique_keys: torch.Tensor
@@ -241,6 +324,16 @@ class PrefetchState:
         ):
             if tensor is not None:
                 tensor.record_stream(stream)
+
+    pin_lease: Optional[_PinnedRowLease] = field(default=None, repr=False)
+    released: bool = False
+
+    def release(self, *, after_use=False):
+        if self.released:
+            return
+        if self.pin_lease is not None:
+            self.pin_lease.release(after_use=after_use)
+        self.released = True
 
 
 def refresh_slots_after_rehash(state: DynamicEmbTableState, batch) -> None:
@@ -1038,7 +1131,7 @@ def dynamicemb_prefetch(
                 )
                 key_map_generation = storage._state.key_map_generation
 
-        return PrefetchState(
+        result = PrefetchState(
             unique_keys=unique_keys,
             reverse_indices=reverse_indices,
             unique_table_ids=unique_table_ids,
@@ -1054,6 +1147,9 @@ def dynamicemb_prefetch(
             key_map_generation=key_map_generation,
             table_gate=table_gate,
         )
+        if result.slot_indices is not None:
+            result.pin_lease = _PinnedRowLease(result)
+        return result
 
 
 def dynamicemb_eval_forward(
@@ -1495,11 +1591,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.out_rows = out_rows
             ctx.unique_table_ids = prefetch_state.unique_table_ids
             ctx.storage = storage
-            ctx.slot_indices = prefetch_state.slot_indices
             # Same split as the forward: the fused optimizer writes into the
             # value buffer (rows), the ref counter is indexed by hash slot.
             ctx.update_value_rows = prefetch_state.value_row_indices
-            ctx.key_map_generation = prefetch_state.key_map_generation
             ctx.slot_owner = prefetch_state.slot_owner
             ctx.table_gate = prefetch_state.table_gate
             ctx.optimizer = optimizer
@@ -1513,11 +1607,20 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.unique_values = unique_values
             ctx.persisted_unique_indices = persisted_unique_indices
 
+            ctx.prefetch_state = prefetch_state
+            ctx.input_count = len(ctx.needs_input_grad)
+            if prefetch_state.pin_lease is not None:
+                prefetch_state.pin_lease.record_use()
+
             return output_embs
 
     @staticmethod
     def backward(ctx, grads):
         with torch.cuda.nvtx.range("DynamicEmbeddingFunction.backward"):
+            if ctx.prefetch_state.released:
+                raise RuntimeError(
+                    "This embedding graph was already consumed; use retain_graph=True for another backward"
+                )
             storage = ctx.storage
             optimizer = ctx.optimizer
             grads = grads.contiguous()
@@ -1559,31 +1662,25 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             with torch.cuda.nvtx.range("DynamicEmbeddingFunction.update"):
                 if ctx.use_counter:
                     state = ctx.slot_owner._state
-                    # A later batch's prefetch may have rehashed the table
-                    # since this one's prefetch (prefetch pipelines, several
-                    # forwards before their backwards).
-                    refresh_slots_after_rehash(state, ctx)
-                    with torch.cuda.nvtx.range("op:optimizer_update_fused"):
-                        optimizer.fused_update_for_flat_table(
-                            unique_grads.to(
-                                gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
-                            ),
-                            # Writes into the value buffer -> rows.
-                            ctx.update_value_rows,
-                            state.table_ptrs_dev,
-                            unique_table_ids,
-                            state.table_value_dims,
-                            state.table_emb_dims,
-                            state.max_emb_dim,
-                            state.all_dims_vec4,
-                            state.emb_dtype,
-                        )
-
-                    release_slot_pins(
-                        ctx.slot_owner,
-                        ctx.slot_indices,
-                        ctx.unique_table_ids,
-                    )
+                    try:
+                        with torch.cuda.nvtx.range("op:optimizer_update_fused"):
+                            optimizer.fused_update_for_flat_table(
+                                unique_grads.to(
+                                    gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
+                                ),
+                                # Writes into the value buffer -> rows.
+                                ctx.update_value_rows,
+                                state.table_ptrs_dev,
+                                unique_table_ids,
+                                state.table_value_dims,
+                                state.table_emb_dims,
+                                state.max_emb_dim,
+                                state.all_dims_vec4,
+                                state.emb_dtype,
+                            )
+                    except BaseException:
+                        ctx.prefetch_state.pin_lease.record_use()
+                        raise
 
                 if not ctx.use_counter and ctx.unique_values is not None:
                     # Per-table embedding dims (on the CUDA device) let the
@@ -1619,4 +1716,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         ):
                             write_back_generic(storage, keys_c, tids_c, vals_c)
 
-            return (None,) * 18
+            if torch._C._autograd._get_current_graph_task_keep_graph():
+                if ctx.prefetch_state.pin_lease is not None:
+                    ctx.prefetch_state.pin_lease.record_use()
+            else:
+                ctx.prefetch_state.release(after_use=True)
+            return (None,) * ctx.input_count

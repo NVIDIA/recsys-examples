@@ -37,8 +37,6 @@ from dynamicemb.batched_dynamicemb_function import (
     PrefetchState,
     dynamicemb_eval_forward,
     dynamicemb_prefetch,
-    refresh_slots_after_rehash,
-    release_slot_pins,
 )
 from dynamicemb.checkpoint.files import (  # noqa: F401 - preserve checkpoint helper exports
     encode_checkpoint_file_path,
@@ -1344,34 +1342,29 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 indices, offsets, frequency_counters=frequency_counters, scores=scores
             )
         prefetch_state = self._prefetch_states.popleft()
-        prefetch_state.record_stream(torch.cuda.current_stream())
+        prefetch_state.record_stream(torch.cuda.current_stream(self.device_id))
 
-        res = DynamicEmbeddingFunction.apply(
-            prefetch_state,
-            offsets,
-            self._cache,
-            self._storage,
-            self.output_dtype,
-            self._initializer,
-            self._optimizer,
-            layout,
-            self._admitter,
-            self._evict_strategy,
-            pooling_weights,
-            self._empty_tensor,
-            self.output_alloc,
-        )
-        # Grad-mode forwards keep their slot pins until backward. Without an
-        # autograd graph, release on this stream after the gather consumed them.
-        if not res.requires_grad and prefetch_state.slot_indices is not None:
-            owner = prefetch_state.slot_owner
-            # A later batch's prefetch may have rehashed the table since this one's.
-            refresh_slots_after_rehash(owner._state, prefetch_state)
-            release_slot_pins(
-                owner,
-                prefetch_state.slot_indices,
-                prefetch_state.unique_table_ids,
+        try:
+            res = DynamicEmbeddingFunction.apply(
+                prefetch_state,
+                offsets,
+                self._cache,
+                self._storage,
+                self.output_dtype,
+                self._initializer,
+                self._optimizer,
+                layout,
+                self._admitter,
+                self._evict_strategy,
+                pooling_weights,
+                self._empty_tensor,
+                self.output_alloc,
             )
+        except BaseException:
+            prefetch_state.release()
+            raise
+        if not res.requires_grad:
+            prefetch_state.release()
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.training = False
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):

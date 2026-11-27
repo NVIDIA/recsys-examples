@@ -4470,3 +4470,51 @@ def test_caching_ps_rejects_no_eviction():
             use_index_dedup=True,
             learning_rate=0.1,
         )
+
+
+def test_nine_cache_pins_follow_retained_and_abandoned_backward():
+    import gc
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    opts = DynamicEmbTableOptions(
+        dim=8,
+        max_capacity=4096,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=device.index,
+        score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+        caching=True,
+        local_hbm_for_values=32768,
+        external_storage=PyDictStorage,
+        initializer_args=DynamicEmbInitializerArgs(
+            mode=DynamicEmbInitializerMode.CONSTANT, value=2.0
+        ),
+    )
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_names=["t0"],
+        table_options=[opts],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=EmbOptimType.SGD,
+        learning_rate=0.25,
+    )
+    assert model._storage_layout.cache_policy == CachePolicy.NINE
+    keys = torch.arange(32, device=device)
+    offsets = torch.tensor([0, keys.numel()], device=device)
+    counter = model._cache._state.key_index_map._ref_counter
+
+    output = model(keys, offsets)
+    output.sum().backward(retain_graph=True)
+    assert counter.sum().item() == keys.numel()
+    output.sum().backward()
+    assert counter.sum().item() == 0
+
+    output = model(keys, offsets)
+    output.sum().backward(retain_graph=True)
+    assert counter.sum().item() == keys.numel()
+    del output
+    gc.collect()
+    assert counter.sum().item() == 0
+    with torch.no_grad():
+        recovered = model(keys, offsets)
+    torch.testing.assert_close(recovered, torch.full_like(recovered, 1.25))
