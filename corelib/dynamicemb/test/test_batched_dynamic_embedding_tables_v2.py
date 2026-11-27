@@ -3379,13 +3379,13 @@ def test_fp8_table_learns_from_gradients_fp16_would_flush(
     fused = RowWiseAdaGradDynamicEmbeddingOptimizer.fused_update_for_flat_table
     padded = RowWiseAdaGradDynamicEmbeddingOptimizer.update_for_padded_buffer
 
-    def spy_fused(self, grads, *args):
-        seen.append((args[-1], grads.dtype))
-        return fused(self, grads, *args)
+    def spy_fused(self, view, grads, *args):
+        seen.append((view.dtype, grads.dtype))
+        return fused(self, view, grads, *args)
 
-    def spy_padded(self, grads, values, *args):
+    def spy_padded(self, view, grads, values, *args):
         seen.append((values.dtype, grads.dtype))
-        return padded(self, grads, values, *args)
+        return padded(self, view, grads, values, *args)
 
     monkeypatch.setattr(
         RowWiseAdaGradDynamicEmbeddingOptimizer,

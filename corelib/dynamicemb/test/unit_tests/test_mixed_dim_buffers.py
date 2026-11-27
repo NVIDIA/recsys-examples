@@ -13,7 +13,7 @@ from typing import Sequence
 
 import pytest
 import torch
-from dynamicemb.state.mixed_dim_buffers import MixedDimBuffers, BuffersView
+from dynamicemb.state.mixed_dim_buffers import MixedDimBuffers
 from dynamicemb.types import CopyMode
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -49,12 +49,14 @@ def test_dimensions_and_view():
     assert b.all_dims_vec4  # every dimension is a multiple of 4
     assert not make(emb_dims=(3, 8), value_dims=(5, 8)).all_dims_vec4
 
-    view = b.view
-    assert isinstance(view, BuffersView)
+    view = b.flat_tables_view()
     assert view.dtype == torch.float32
-    assert view.max_emb_dim == 8 and view.max_value_dim == 12
+    assert view.max_emb_dim == 8 and view.max_value_dim == 12 and view.all_dims_vec4
     assert view.value_dims.tolist() == [12, 8] and view.emb_dims.tolist() == [4, 8]
     assert view.ptrs.tolist() == [b.tensor(t).data_ptr() for t in range(2)]
+    padded = b.padded_buffer_view()
+    assert padded.max_emb_dim == 8 and padded.max_value_dim == 12
+    assert padded.emb_dims.tolist() == [4, 8] and padded.all_dims_vec4
     assert tuple(b.tensor(0).shape) == (32, 12) and tuple(b.tensor(1).shape) == (48, 8)
 
 
@@ -163,11 +165,14 @@ def test_an_extendable_buffer_grows_and_keeps_its_rows(kind):
     other = torch.randn(2, 12, device="cuda")
     b.store(0, other_rows, other)
 
+    before = b.flat_tables_view()  # taken before the growth
     assert not b.grow_to(1, 10)  # it has 48 already
     assert b.grow_to(1, 100)
     assert b.num_rows(1) >= 100
-    # the pointers the kernels use follow the buffers
+    # the pointers the kernels use follow the buffers, in a view taken earlier too
     assert b.ptrs.tolist() == [b.tensor(t).data_ptr() for t in range(2)]
+    assert before.ptrs.tolist() == b.ptrs.tolist()
+    assert b.flat_tables_view().ptrs.tolist() == b.ptrs.tolist()
     torch.testing.assert_close(b.load(1, rows), vals)
     torch.testing.assert_close(b.load(0, other_rows), other)
     assert b.num_rows(0) == 32

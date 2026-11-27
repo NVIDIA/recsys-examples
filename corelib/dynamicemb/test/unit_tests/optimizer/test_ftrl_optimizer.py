@@ -167,19 +167,27 @@ def test_ftrl_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4, group_las
     table_value_dims = torch.tensor([row_width], dtype=torch.int64, device=device)
 
     optimizer.update_for_padded_buffer(
-        grads, padded, table_ids, table_emb_dims, emb_dim, row_width, all_dims_vec4
+        dynamicemb_extensions.PaddedBufferView(
+            table_emb_dims, emb_dim, row_width, all_dims_vec4
+        ),
+        grads,
+        padded,
+        table_ids,
     )
 
     optimizer.fused_update_for_flat_table(
+        dynamicemb_extensions.FlatTablesView(
+            torch.tensor([flat.data_ptr()], dtype=torch.int64, device=device),
+            table_value_dims,
+            table_emb_dims,
+            emb_dim,
+            row_width,
+            all_dims_vec4,
+            torch.float32,
+        ),
         grads,
         torch.arange(num_rows, dtype=torch.int64, device=device),
-        torch.tensor([flat.data_ptr()], dtype=torch.int64, device=device),
         table_ids,
-        table_value_dims,
-        table_emb_dims,
-        emb_dim,
-        all_dims_vec4,
-        torch.float32,
     )
 
     torch.testing.assert_close(flat, padded, rtol=0, atol=0)
@@ -200,15 +208,18 @@ def test_ftrl_skipped_rows_are_untouched():
     grads = torch.ones(8, emb_dim, dtype=torch.float32, device=device)
 
     optimizer.fused_update_for_flat_table(
+        dynamicemb_extensions.FlatTablesView(
+            torch.tensor([values.data_ptr()], dtype=torch.int64, device=device),
+            torch.tensor([row_width], dtype=torch.int64, device=device),
+            torch.tensor([emb_dim], dtype=torch.int64, device=device),
+            emb_dim,
+            row_width,
+            True,
+            torch.float32,
+        ),
         grads,
         indices,
-        torch.tensor([values.data_ptr()], dtype=torch.int64, device=device),
         torch.zeros(8, dtype=torch.int64, device=device),
-        torch.tensor([row_width], dtype=torch.int64, device=device),
-        torch.tensor([emb_dim], dtype=torch.int64, device=device),
-        emb_dim,
-        True,
-        torch.float32,
     )
 
     untouched = [r for r in range(8) if r != 3]
@@ -350,13 +361,15 @@ def _run_group_step(optimizer, values, grads, emb_dim, all_dims_vec4):
     num_rows, row_width = values.shape
     device = values.device
     optimizer.update_for_padded_buffer(
+        dynamicemb_extensions.PaddedBufferView(
+            torch.tensor([emb_dim], dtype=torch.int64, device=device),
+            emb_dim,
+            row_width,
+            all_dims_vec4,
+        ),
         grads,
         values,
         torch.zeros(num_rows, dtype=torch.int64, device=device),
-        torch.tensor([emb_dim], dtype=torch.int64, device=device),
-        emb_dim,
-        row_width,
-        all_dims_vec4,
     )
 
 
@@ -523,13 +536,15 @@ def test_ftrl_group_padded_buffer_dtype_and_mixed_dims(dims, dtype):
     values = values.to(device)
 
     optimizer.update_for_padded_buffer(
+        dynamicemb_extensions.PaddedBufferView(
+            torch.tensor(dims, dtype=torch.int64, device=device),
+            max_dim,
+            3 * max_dim,
+            all(d % 4 == 0 for d in dims),
+        ),
         grads.to(device),
         values,
         table_of_row.to(device),
-        torch.tensor(dims, dtype=torch.int64, device=device),
-        max_dim,
-        3 * max_dim,
-        all(d % 4 == 0 for d in dims),
     )
     out = values.cpu()
 

@@ -74,13 +74,12 @@ def _train_padded_buffer(
     table_emb_dims = torch.tensor([emb_dim], dtype=torch.int64, device=device)
     for grad in grads:
         optimizer.update_for_padded_buffer(
+            dynamicemb_extensions.PaddedBufferView(
+                table_emb_dims, emb_dim, value_dim, all_dims_vec4
+            ),
             grad,
             values,
             table_ids,
-            table_emb_dims,
-            emb_dim,
-            value_dim,
-            all_dims_vec4,
         )
     torch.cuda.synchronize()
 

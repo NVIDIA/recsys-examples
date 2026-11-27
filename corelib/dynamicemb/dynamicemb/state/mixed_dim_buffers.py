@@ -22,12 +22,14 @@ set at once: the base pointers of the buffers, the dimensions of every table, th
 of them. :class:`MixedDimBuffers` keeps those together, so nothing outside has to keep
 them in step -- when a buffer grows its pointer is refreshed here.
 
-What an optimizer needs to know about the rows -- where each table's rows are, how wide the
-embedding and the whole row are -- is :class:`BuffersView`, taken from :attr:`MixedDimBuffers.view`.
-The optimizer works on rows through it; the buffers themselves know nothing of optimizers.
+What an optimizer or a kernel needs to know about the rows is a view made from them, on
+demand, so it is never out of date: :meth:`MixedDimBuffers.flat_tables_view` for kernels that
+read and write the tables' own buffers (where each table's rows are, how wide the embedding and
+the whole row are, the element type), and :meth:`MixedDimBuffers.padded_buffer_view` for kernels
+that work on a padded buffer (the output of ``load_to_padded``), which needs only the dimensions.
+The buffers themselves know nothing of optimizers.
 """
 
-from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import torch
@@ -39,31 +41,12 @@ from dynamicemb.state.extendable_buffer import (
 )
 from dynamicemb.types import CopyMode
 from dynamicemb.utils import encode_table_values
+from dynamicemb_extensions import FlatTablesView, PaddedBufferView
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
 from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
 from dynamicemb_extensions import load_from_flat_table_value as _load_value
 from dynamicemb_extensions import store_to_flat_table_contiguous as _store_contiguous
 from dynamicemb_extensions import store_to_flat_table_value as _store_value
-
-
-@dataclass(frozen=True)
-class BuffersView:
-    """A non-owning view of the buffers of :class:`MixedDimBuffers`, for the optimizer
-    (the base pointers go stale when a buffer grows).
-
-    A row is the embedding (``emb_dims[t]`` wide for table ``t``) followed by the optimizer
-    state, ``value_dims[t]`` wide in all. In a padded buffer (the output of ``load_to_padded``) the
-    state of every row starts at ``max_emb_dim``, whatever the table. ``ptrs`` are the base
-    pointers of the buffers, valid until one of them grows.
-    """
-
-    ptrs: torch.Tensor
-    dtype: torch.dtype
-    value_dims: torch.Tensor
-    emb_dims: torch.Tensor
-    max_emb_dim: int
-    max_value_dim: int
-    all_dims_vec4: bool
 
 
 class MixedDimBuffers:
@@ -120,18 +103,29 @@ class MixedDimBuffers:
         ]
         self.ptrs = self._base_pointers()
 
-    # -- view ---------------------------------------------------------------
+    # -- views --------------------------------------------------------------
 
-    @property
-    def view(self) -> BuffersView:
-        return BuffersView(
+    def flat_tables_view(self) -> FlatTablesView:
+        """The tables' own buffers as the kernels take them. A row is the embedding
+        (``emb_dims[t]`` wide for table ``t``) followed by the optimizer state, ``value_dims[t]``
+        wide in all. Made on demand from the current pointers; ``ptrs`` is refreshed in place
+        when a buffer grows, so a view taken earlier sees the new pointers too."""
+        return FlatTablesView(
             self.ptrs,
-            self.dtype,
             self.value_dims,
             self.emb_dims,
             self.max_emb_dim,
             self.max_value_dim,
             self.all_dims_vec4,
+            self.dtype,
+        )
+
+    def padded_buffer_view(self) -> PaddedBufferView:
+        """A padded buffer of these tables -- ``[n, max_value_dim]`` rows, each the embedding
+        padded to ``max_emb_dim`` and followed by the optimizer state, as ``load_to_padded``
+        returns -- seen by the dimensions alone."""
+        return PaddedBufferView(
+            self.emb_dims, self.max_emb_dim, self.max_value_dim, self.all_dims_vec4
         )
 
     def _base_pointers(self) -> torch.Tensor:
@@ -196,16 +190,7 @@ class MixedDimBuffers:
         rows = self._on_device_rows(rows)
         out = torch.empty(rows.numel(), width, dtype=self.dtype, device=self.device)
         if rows.numel() > 0:
-            kernel(
-                self.ptrs,
-                rows,
-                table_ids,
-                out,
-                self.value_dims,
-                self.emb_dims,
-                self.max_emb_dim,
-                self.all_dims_vec4,
-            )
+            kernel(self.flat_tables_view(), rows, table_ids, out)
         return out
 
     def store_from_padded(
@@ -217,14 +202,10 @@ class MixedDimBuffers:
         if values.dim() == 1:
             values = values.unsqueeze(1)
         _store_value(
-            self.ptrs,
+            self.flat_tables_view(),
             self._on_device_rows(rows),
             table_ids,
             encode_table_values(values, self.dtype),
-            self.value_dims,
-            self.emb_dims,
-            self.max_emb_dim,
-            self.all_dims_vec4,
         )
 
     def load(self, table: int, rows: torch.Tensor) -> torch.Tensor:
@@ -237,16 +218,7 @@ class MixedDimBuffers:
             device=self.device,
         )
         if rows.numel() > 0:
-            _load_contiguous(
-                self.ptrs,
-                rows,
-                table,
-                out,
-                self.value_dims,
-                self.emb_dims,
-                self.max_emb_dim,
-                self.all_dims_vec4,
-            )
+            _load_contiguous(self.flat_tables_view(), rows, table, out)
         return out
 
     def store(self, table: int, rows: torch.Tensor, values: torch.Tensor) -> None:
@@ -256,14 +228,10 @@ class MixedDimBuffers:
         if values.dim() == 1:
             values = values.unsqueeze(1)
         _store_contiguous(
-            self.ptrs,
+            self.flat_tables_view(),
             self._on_device_rows(rows),
             table,
             encode_table_values(values, self.dtype),
-            self.value_dims,
-            self.emb_dims,
-            self.max_emb_dim,
-            self.all_dims_vec4,
         )
 
     def gather_emb_by_entry(
@@ -281,15 +249,4 @@ class MixedDimBuffers:
 
         This is ``load_to_padded`` (embedding only) followed by ``gather_embedding``
         over ``entry_of_row``, in one kernel and without the intermediate buffer."""
-        _load_emb(
-            self.ptrs,
-            rows,
-            table_ids,
-            out,
-            self.value_dims,
-            self.emb_dims,
-            self.max_emb_dim,
-            self.all_dims_vec4,
-            entry_of_row,
-            out_rows,
-        )
+        _load_emb(self.flat_tables_view(), rows, table_ids, out, entry_of_row, out_rows)

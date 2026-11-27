@@ -43,6 +43,7 @@ from dynamicemb.types import CopyMode, MultiTableAdmitter
 from dynamicemb.utils import decode_table_values, gradient_dtype
 from dynamicemb_extensions import (
     EvictStrategy,
+    PaddedBufferView,
     expand_table_ids_cuda,
     flagged_compact,
     gather_embedding,
@@ -1558,18 +1559,13 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     refresh_slots_after_rehash(state, ctx)
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
                         optimizer.fused_update_for_flat_table(
+                            state.buffers.flat_tables_view(),
                             unique_grads.to(
                                 gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
                             ),
                             # Writes into the value buffer -> rows.
                             ctx.update_value_rows,
-                            state.buffers.ptrs,
                             unique_table_ids,
-                            state.buffers.value_dims,
-                            state.buffers.emb_dims,
-                            state.buffers.max_emb_dim,
-                            state.buffers.all_dims_vec4,
-                            state.buffers.dtype,
                         )
 
                     release_slot_pins(
@@ -1583,23 +1579,24 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     # padded-buffer kernel place each row's optimizer state at the
                     # max_emb_dim offset using the row's own width. Provided
                     # uniformly across storage types via embedding_dims().
-                    table_emb_dims = storage.embedding_dims(on_device=True)
                     # all_dims_vec4 must reflect per-table dims, not just
                     # max_emb_dim: a vec4 store on a row whose edim % 4 != 0 would
                     # run past its m region into v. storage.all_dims_vec4() is the
                     # per-table-correct flag used by load/store too.
-                    all_dims_vec4 = storage.all_dims_vec4()
+                    padded_view = PaddedBufferView(
+                        storage.embedding_dims(on_device=True),
+                        ctx.max_emb_dim,
+                        ctx.max_val_dim,
+                        storage.all_dims_vec4(),
+                    )
                     with torch.cuda.nvtx.range("op:optimizer_update_padded"):
                         optimizer.update_for_padded_buffer(
+                            padded_view,
                             unique_grads.to(
                                 gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
                             ),
                             ctx.unique_values,
                             unique_table_ids,
-                            table_emb_dims,
-                            ctx.max_emb_dim,
-                            ctx.max_val_dim,
-                            all_dims_vec4,
                         )
                     pui = ctx.persisted_unique_indices
                     assert pui is not None
