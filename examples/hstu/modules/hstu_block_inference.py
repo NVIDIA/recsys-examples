@@ -372,9 +372,6 @@ class HSTUBlockInference(torch.nn.Module):
         print("  Length per sequence", seqlen_list)
 
         if self._hstu_graph is None:
-            self._hstu_graph = dict()
-            self._hstu_graph[max_batch_size] = dict()
-
             graph_max = self.capture_graph(
                 max_batch_size,
                 max_num_tokens,
@@ -385,7 +382,7 @@ class HSTUBlockInference(torch.nn.Module):
             )
             if shared_graph_mempool is None:
                 shared_graph_mempool = graph_max[0].pool()
-            self._hstu_graph[max_batch_size][max_num_tokens] = graph_max
+            self._hstu_graph = {max_batch_size: {max_num_tokens: graph_max}}
 
             for batch_size in bs_list:
                 if batch_size not in self._hstu_graph:
@@ -414,6 +411,18 @@ class HSTUBlockInference(torch.nn.Module):
         static_kvcache_metadata,
         memory_pool=None,
     ):
+        if self.config.attention_quant_mode != -1:
+            raise ValueError(
+                "FP8 HSTU attention requires inference without CUDA graphs"
+            )
+        if self.config.linear_fp8_scaling == "per-tensor" and (
+            self.config.up_projection_fp8 or self.config.down_projection_fp8
+        ):
+            # Replay can round up the token count. Padding may change a tensor-wide amax.
+            raise ValueError(
+                "CUDA graphs with FP8 HSTU projections require rowwise scaling"
+            )
+
         # Create CUDA stream
         graph_capture_warmup_stream = torch.cuda.Stream()
         graph_capture_warmup_stream.wait_stream(torch.cuda.current_stream())

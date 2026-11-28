@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import sys
+from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -162,3 +164,112 @@ def test_hstu_process_inference(backbone):
     # Missing or unexpected dense keys fail even with strict=False.
     with pytest.raises(RuntimeError, match=f"Checkpoint does not match {backbone}"):
         dense.load_state_dict({"_hstu_block.unknown": torch.zeros(1)}, strict=False)
+
+
+@pytest.mark.parametrize(
+    "precision,error",
+    [
+        ({"up_projection_fp8": True}, "require rowwise scaling"),
+        ({"attention_quant_mode": 5}, "without CUDA graphs"),
+    ],
+)
+def test_hstu_rejects_unsupported_fp8_cuda_graphs(precision, error):
+    from modules.hstu_block_inference import HSTUBlockInference
+
+    options = dict(
+        up_projection_fp8=False,
+        down_projection_fp8=False,
+        linear_fp8_scaling="per-tensor",
+        attention_quant_mode=-1,
+    )
+    options.update(precision)
+    block = SimpleNamespace(config=SimpleNamespace(**options), _hstu_graph=None)
+    block.capture_graph = partial(HSTUBlockInference.capture_graph, block)
+
+    with pytest.raises(ValueError, match=error):
+        HSTUBlockInference.set_cudagraph(block, 1, 32, None, None, None)
+    assert block._hstu_graph is None
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="FP8 HSTU inference requires Hopper",
+)
+@pytest.mark.parametrize(
+    "fp8_projections, attention_quant_mode",
+    [(True, -1), (False, 4)],
+    ids=["rowwise-projections", "fp8-attention"],
+)
+@torch.inference_mode()
+def test_hstu_fp8_inference(monkeypatch, fp8_projections, attention_quant_mode):
+    from configs import get_inference_hstu_config
+    from modules.hstu_block_inference import HSTUBlockInference
+    from modules.jagged_data import JaggedData
+
+    device = torch.cuda.current_device()
+    dtype = torch.bfloat16
+    hidden = 128
+    config_args = dict(
+        hidden_size=hidden,
+        num_layers=1,
+        num_attention_heads=2,
+        head_dim=64,
+        max_batch_size=2,
+        max_seq_len=64,
+        dtype=dtype,
+        residual=False,
+        export_mode=False,
+    )
+    with torch.random.fork_rng(devices=[device]):
+        torch.manual_seed(1234)
+        baseline = HSTUBlockInference(get_inference_hstu_config(**config_args))
+        torch.manual_seed(1234)
+        block = HSTUBlockInference(
+            get_inference_hstu_config(
+                **config_args,
+                up_projection_fp8=fp8_projections,
+                down_projection_fp8=fp8_projections,
+                linear_fp8_scaling="rowwise",
+                attention_quant_mode=attention_quant_mode,
+            )
+        )
+        jd = JaggedData.random(
+            torch.tensor([23, 42], dtype=torch.int32, device=device),
+            hidden,
+            num_candidates=torch.tensor([1, 2], dtype=torch.int32, device=device),
+            device=device,
+            dtype=dtype,
+        )
+
+    expected = baseline.predict(2, jd.values.size(0), jd.values, jd, None)
+    projection_widths = []
+    scaled_mm = F.scaled_mm
+
+    def capture_projection(a, b, *args, **kwargs):
+        assert a.dtype == b.dtype == torch.float8_e4m3fn
+        projection_widths.append(b.size(1))
+        return scaled_mm(a, b, *args, **kwargs)
+
+    monkeypatch.setattr(F, "scaled_mm", capture_projection)
+    attention_modes = []
+    attention = torch.ops.fbgemm.hstu_varlen_fwd_90
+
+    def capture_attention(*args, **kwargs):
+        mode = args[18] if len(args) > 18 else kwargs["quant_mode"]
+        if mode >= 0:
+            assert args[0].dtype == torch.float8_e4m3fn
+            attention_modes.append(mode)
+        return attention(*args, **kwargs)
+
+    monkeypatch.setattr(torch.ops.fbgemm, "hstu_varlen_fwd_90", capture_attention)
+    actual = block.predict(2, jd.values.size(0), jd.values, jd, None)
+    assert projection_widths == ([4 * hidden, hidden] if fp8_projections else [])
+    assert attention_modes == (
+        [attention_quant_mode] if attention_quant_mode >= 0 else []
+    )
+    assert actual.shape == expected.shape and actual.dtype == expected.dtype == dtype
+    assert torch.isfinite(actual).all()
+    relative_error = (
+        actual.float() - expected.float()
+    ).norm() / expected.float().norm()
+    assert relative_error < 0.18

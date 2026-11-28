@@ -124,6 +124,7 @@ class FusedHSTULayer(MegatronModule):
 
     @output_nvtx_hook(nvtx_tag="FusedHSTULayer")
     def forward(self, jd: JaggedData) -> JaggedData:
+        """Apply the fused HSTU layer to packed jagged values."""
         input = jd.values
         output = fused_hstu_op(
             input=input,
@@ -160,5 +161,10 @@ class FusedHSTULayer(MegatronModule):
             wgrad_event=self._wgrad_event,
             recompute_input_layernorm=self._recompute_input_layernorm,
             recompute_input_silu=self._recompute_input_silu,
+            attention_quant_mode=self.config.attention_quant_mode,
+            up_projection_fp8=self.config.up_projection_fp8,
+            down_projection_fp8=self.config.down_projection_fp8,
+            linear_fp8_scaling=self.config.linear_fp8_scaling,
+            linear_fp8_backward=self.config.linear_fp8_backward,
         )
         return jd.copy_others_but_set_values(values=output)

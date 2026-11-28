@@ -105,6 +105,11 @@ class HSTUConfig(TransformerConfig):
       async_wgrad_event (torch.cuda.Event): Event for async wgrad. Defaults to None.
       recompute_input_layernorm (bool): Flag to enable recompute input layernorm. Defaults to False.
       recompute_input_silu (bool): Flag to enable recompute input silu. Defaults to False.
+      attention_quant_mode (int): Native Hopper FBGEMM mode, or -1 for unquantized attention.
+      up_projection_fp8 (bool): Enable FP8 for the UVQK projection.
+      down_projection_fp8 (bool): Enable FP8 for the output projection.
+      linear_fp8_scaling (str): Scaling for FP8 projections, "per-tensor" or "rowwise".
+      linear_fp8_backward (bool): Use FP8 gradients for enabled per-tensor FP8 projections.
     """
 
     hstu_preprocessing_config: Optional[HSTUPreprocessingConfig] = None
@@ -133,9 +138,20 @@ class HSTUConfig(TransformerConfig):
     fuse_norm_mul_dropout: bool = True
     scaling_seqlen: int = -1
     disable_contextual_mask: bool = False
+    attention_quant_mode: int = -1
+    up_projection_fp8: bool = False
+    down_projection_fp8: bool = False
+    linear_fp8_scaling: str = "per-tensor"
+    linear_fp8_backward: bool = False
 
     def __post_init__(self):
         super().__post_init__()
+        if (
+            self.up_projection_fp8
+            or self.down_projection_fp8
+            or self.attention_quant_mode != -1
+        ) and (self.hstu_layer_type != HSTULayerType.FUSED or not self.bf16):
+            raise ValueError("HSTU FP8 requires the BF16 fused layer (TP=1)")
 
 
 def get_hstu_config(
@@ -164,6 +180,11 @@ def get_hstu_config(
     fuse_norm_mul_dropout: bool = True,
     scaling_seqlen: int = -1,
     disable_contextual_mask: bool = False,
+    attention_quant_mode: int = -1,
+    up_projection_fp8: bool = False,
+    down_projection_fp8: bool = False,
+    linear_fp8_scaling: str = "per-tensor",
+    linear_fp8_backward: bool = False,
 ) -> HSTUConfig:
     """
     Create the HSTU configuration.
@@ -188,6 +209,11 @@ def get_hstu_config(
         recompute_input_layernorm (bool, optional): Whether to recompute input layernorm. Defaults to False.
         recompute_input_silu (bool, optional): Whether to recompute input silu. Defaults to False.
         is_inference (bool, optional): Whether is the inference mode
+        attention_quant_mode (int, optional): Native Hopper FBGEMM mode, or -1 for unquantized attention.
+        up_projection_fp8 (bool, optional): Enable FP8 for the UVQK projection.
+        down_projection_fp8 (bool, optional): Enable FP8 for the output projection.
+        linear_fp8_scaling (str, optional): Scaling for FP8 projections, "per-tensor" or "rowwise".
+        linear_fp8_backward (bool, optional): Use FP8 gradients for enabled per-tensor FP8 projections.
     Returns:
         HSTUConfig: The HSTU configuration object.
     """
@@ -241,4 +267,9 @@ def get_hstu_config(
         fuse_norm_mul_dropout=fuse_norm_mul_dropout,
         scaling_seqlen=scaling_seqlen,
         disable_contextual_mask=disable_contextual_mask,
+        attention_quant_mode=attention_quant_mode,
+        up_projection_fp8=up_projection_fp8,
+        down_projection_fp8=down_projection_fp8,
+        linear_fp8_scaling=linear_fp8_scaling,
+        linear_fp8_backward=linear_fp8_backward,
     )

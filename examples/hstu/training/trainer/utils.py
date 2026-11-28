@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import sys
+from dataclasses import asdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import commons.datasets as datasets
@@ -33,6 +34,7 @@ from utils import (
     DatasetArgs,
     DynamicEmbeddingArgs,
     EmbeddingArgs,
+    MixedPrecisionArgs,
     NetworkArgs,
     OptimizerArgs,
     TensorModelParallelArgs,
@@ -51,8 +53,11 @@ def get_embedding_vector_storage_multiplier(optimizer_type: str) -> int:
 
 
 def create_hstu_config(
-    network_args: NetworkArgs, tensor_model_parallel_args: TensorModelParallelArgs
+    network_args: NetworkArgs,
+    tensor_model_parallel_args: TensorModelParallelArgs,
+    mixed_precision_args: MixedPrecisionArgs | None = None,
 ):
+    """Build the HSTU configuration from training and precision arguments."""
     dtype = None
     if network_args.dtype_str == "bfloat16":
         dtype = torch.bfloat16
@@ -107,6 +112,7 @@ def create_hstu_config(
         recompute_input_silu=network_args.recompute_input_silu,
         scaling_seqlen=network_args.scaling_seqlen,
         disable_contextual_mask=network_args.disable_contextual_mask,
+        **(asdict(mixed_precision_args) if mixed_precision_args is not None else {}),
     )
 
 

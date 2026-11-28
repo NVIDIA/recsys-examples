@@ -448,6 +448,18 @@ class NetworkArgs:
 
 @gin.configurable
 @dataclass
+class MixedPrecisionArgs:
+    """Optional Hopper FP8 settings for HSTU training and inference."""
+
+    up_projection_fp8: bool = False
+    down_projection_fp8: bool = False
+    linear_fp8_scaling: str = "per-tensor"
+    linear_fp8_backward: bool = False
+    attention_quant_mode: int = -1
+
+
+@gin.configurable
+@dataclass
 class OptimizerArgs:
     """Optimizer Configuration.
 

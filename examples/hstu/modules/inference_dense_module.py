@@ -144,6 +144,12 @@ class InferenceDenseModule(torch.nn.Module):
         self._task_config = task_config
         self._use_exportable = use_exportable
         self._backbone = getattr(hstu_config, "backbone", "hstu")
+        if (
+            isinstance(hstu_config, InferenceHSTUConfig)
+            and hstu_config.attention_quant_mode != -1
+            and kvcache_config is not None
+        ):
+            raise ValueError("FP8 HSTU attention requires inference without a KV cache")
         if self._use_exportable:
             assert isinstance(
                 hstu_config, HSTUConfig
