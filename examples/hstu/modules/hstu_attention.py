@@ -15,10 +15,163 @@
 import abc
 from typing import Optional, Union
 
+import hstu
+import nvtx
 import torch
 from commons.utils.nvtx_op import output_nvtx_hook
 from configs import KernelBackend
 from hstu import hstu_attn_varlen_func
+
+
+def validate_hopper_attention_quant_mode(quant_mode: int) -> None:
+    """Reject IDs that the Hopper wrapper would silently run unquantized."""
+    if type(quant_mode) is not int or not -1 <= quant_mode <= 5:
+        raise ValueError(
+            "Hopper attention quantization mode must be an integer from -1 to 5"
+        )
+
+
+def prepare_hopper_fp8_attention_metadata(
+    quant_mode: int,
+    offsets: torch.Tensor,
+    num_contexts: Optional[torch.Tensor],
+    num_targets: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Check sequence alignment and drop empty spans for FP8 attention."""
+    # Mode 1 uses packed sequence offsets as byte coordinates for TMA.
+    if quant_mode == 1 and torch.any(offsets % 16):
+        raise ValueError(
+            "Hopper FP8 attention mode 1 requires sequence lengths that are multiples of 16"
+        )
+    if quant_mode in (1, 3, 4):
+        nonempty = offsets[1:] != offsets[:-1]
+        offsets = torch.cat((offsets[:1], offsets[1:][nonempty]))
+        if num_contexts is not None:
+            num_contexts = num_contexts[nonempty]
+        if num_targets is not None:
+            num_targets = num_targets[nonempty]
+    return offsets, num_contexts, num_targets
+
+
+def _as_hopper_fp8_column_major(x: torch.Tensor) -> torch.Tensor:
+    return x.transpose(0, 2).contiguous().transpose(0, 2)
+
+
+def quantize_hopper_attention_operands(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    offsets: torch.Tensor,
+    quant_mode: int,
+    dout: Optional[torch.Tensor] = None,
+):
+    """Prepare operands and scales for the raw Hopper attention kernels."""
+    # The FBGEMM autograd wrapper allocates gradients. The fused layer passes
+    # views of its packed gradient buffer to the raw backward op.
+    operands = (q, k, v) if dout is None else (q, k, v, dout)
+    transposed = (None, None, None)
+    extra: dict[str, torch.Tensor] = {}
+    with torch.cuda.device(q.device):
+        if quant_mode == 0:
+            quantized = tuple(x.to(torch.float8_e4m3fn) for x in operands)
+            descales = (q.new_ones((1,), dtype=torch.float32),) * len(operands)
+        elif quant_mode == 1:
+            quantized, descales, columns, column_descales, column_offsets = zip(
+                *(hstu.quantize_for_two_directions(x, offsets) for x in operands)
+            )
+            if dout is None:
+                extra.update(
+                    vt=_as_hopper_fp8_column_major(columns[2]),
+                    vt_descale=column_descales[2],
+                    cu_seqlens_vt_descale=column_offsets[2],
+                )
+            else:
+                transposed = tuple(
+                    _as_hopper_fp8_column_major(columns[i]) for i in (3, 0, 1)
+                )
+                extra.update(
+                    dot_descale=column_descales[3],
+                    qt_descale=column_descales[0],
+                    kt_descale=column_descales[1],
+                    cu_seqlens_qt_descale=column_offsets[0],
+                    cu_seqlens_kt_descale=column_offsets[1],
+                )
+        elif quant_mode == 2:
+            bm, bn = (
+                hstu.get_bm_and_bn_block_size_fwd(None, q.shape[-1])
+                if dout is None
+                else hstu.get_bm_and_bn_block_size_bwd()
+            )
+            quantized, descales, block_offsets = zip(
+                *(
+                    hstu.quantize_for_block_scale(x, offsets, block_size=block_size)
+                    for x, block_size in zip(operands, (bm, bn, bn, bm))
+                )
+            )
+            extra.update(
+                cu_seqlens_q_block_descale=block_offsets[0],
+                cu_seqlens_kv_block_descale=block_offsets[1],
+            )
+        else:
+            quantized, descales = zip(
+                *(
+                    hstu.quantize_for_head_batch_tensor(
+                        x, offsets, quant_mode=quant_mode
+                    )
+                    for x in operands
+                )
+            )
+    extra.update(zip(("q_descale", "k_descale", "v_descale", "do_descale"), descales))
+    return quantized, transposed, extra
+
+
+def hopper_hstu_attn_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    offsets: torch.Tensor,
+    max_seqlen: int,
+    scaling_seqlen: int,
+    num_contexts: Optional[torch.Tensor],
+    num_targets: Optional[torch.Tensor],
+    target_group_size: int,
+    alpha: float,
+    quant_mode: int,
+) -> torch.Tensor:
+    """Run packed Hopper attention at the requested FBGEMM quantization mode."""
+    assert q.dtype in (
+        torch.bfloat16,
+        torch.float16,
+    ), f"Hopper fwd expects bfloat16 or float16, got {q.dtype}"
+    operands = (q, k, v)
+    attn_scales = {}
+    if quant_mode != -1:
+        with nvtx.annotate("fp8 attention prepare operands fwd"):
+            operands, _, attn_scales = quantize_hopper_attention_operands(
+                q, k, v, offsets, quant_mode
+            )
+    out, _ = torch.ops.fbgemm.hstu_varlen_fwd_90(
+        *operands,
+        offsets,
+        offsets,
+        None,
+        None,  # seqused_q, seqused_k
+        max_seqlen,
+        max_seqlen,
+        scaling_seqlen,
+        num_contexts,
+        num_targets,
+        target_group_size,
+        -1,
+        0,
+        alpha,
+        None,
+        None,  # rab, func
+        quant_mode=quant_mode,
+        output_dtype=0 if q.dtype == torch.bfloat16 else 1,
+        **attn_scales,
+    )
+    return out
 
 
 class HSTUAttention(torch.nn.Module):

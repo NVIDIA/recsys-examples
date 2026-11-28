@@ -22,7 +22,13 @@ import nvtx
 import torch
 from commons.utils.clear_tensor_data import clear_tensor_data
 from configs import KernelBackend
-from ops.pt_ops.te_addmm import te_fp8_addmm_silu_fwd
+from modules.hstu_attention import (
+    hopper_hstu_attn_fwd,
+    prepare_hopper_fp8_attention_metadata,
+    quantize_hopper_attention_operands,
+    validate_hopper_attention_quant_mode,
+)
+from ops.pt_ops.te_addmm import get_fp8_addmm_silu_fwd
 from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd
 from ops.triton_ops.triton_addmm import triton_addmm_silu_bwd, triton_addmm_silu_fwd
 from ops.triton_ops.triton_hstu_attention import (
@@ -124,8 +130,10 @@ class FusedHSTULayerFunction(torch.autograd.Function):
         recompute_input_layernorm: bool = False,
         recompute_input_silu: bool = False,
         attention_quant_mode: int = -1,
-        linear_fp8: bool = False,
-        linear_fp8_backward: bool = True,
+        up_projection_fp8: bool = False,
+        down_projection_fp8: bool = False,
+        linear_fp8_scaling: str = "per-tensor",
+        linear_fp8_backward: bool = False,
     ) -> torch.Tensor:
         """Forward pass of the fused HSTU layer.
         Args:
@@ -157,16 +165,19 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             wgrad_event (Optional[torch.cuda.Event]): CUDA event for weight gradient computation. Defaults to None.
             recompute_input_layernorm (bool): Whether to recompute the input layer norm. Defaults to False.
             recompute_input_silu (bool): Whether to recompute the input silu. Defaults to False.
-            attention_quant_mode (int): Hopper attention quantization mode (-1 or 5).
-            linear_fp8 (bool): Use FP8 GEMMs for the two forward projections.
-            linear_fp8_backward (bool): Also use FP8 projection gradients when linear_fp8 is enabled.
+            attention_quant_mode (int): FBGEMM Hopper attention quantization mode, or -1 for unquantized attention.
+            up_projection_fp8 (bool): Use FP8 for the UVQK projection.
+            down_projection_fp8 (bool): Use FP8 for the output projection.
+            linear_fp8_scaling (str): Scaling for FP8 projections, "per-tensor" or "rowwise".
+            linear_fp8_backward (bool): Use FP8 gradients for enabled per-tensor FP8 projections.
         Returns:
             torch.Tensor: Output tensor of shape [T, hidden_size]
         """
         ctx.attn_backend = attn_backend
         # A data-parallel rank can have no valid tokens in a jagged batch.
         ctx.attention_quant_mode = attention_quant_mode if input.shape[0] else -1
-        ctx.linear_fp8_backward = linear_fp8 and linear_fp8_backward
+        ctx.up_projection_fp8_backward = up_projection_fp8 and linear_fp8_backward
+        ctx.down_projection_fp8_backward = down_projection_fp8 and linear_fp8_backward
         ctx.learnable_input_norm = input_norm_weight is not None
         ctx.learnable_output_norm = output_norm_weight is not None
         ctx.eps = ln_eps
@@ -202,11 +213,14 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             attention_dim_per_head * num_heads,
         ]
         ctx.split_arg_list = _split_arg_list
-        addmm_silu_fwd_impl = (
-            te_fp8_addmm_silu_fwd
-            if linear_fp8
-            else _get_addmm_silu_fwd_impl(input.device)
+        addmm_silu_fwd = _get_addmm_silu_fwd_impl(input.device)
+        fp8_addmm_silu_fwd = (
+            get_fp8_addmm_silu_fwd(linear_fp8_scaling)
+            if up_projection_fp8 or down_projection_fp8
+            else addmm_silu_fwd
         )
+        up_projection = fp8_addmm_silu_fwd if up_projection_fp8 else addmm_silu_fwd
+        down_projection = fp8_addmm_silu_fwd if down_projection_fp8 else addmm_silu_fwd
 
         def _ln_linear_silu_fwd(
             input, ln_weight, ln_bias, linear_weight, linear_bias, ln_eps
@@ -239,7 +253,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             ctx.input_num_warps = input_num_warps
             # 2. linear & silu
             # bias is 1D
-            linear_uvqk, silu_linear_uvqk = addmm_silu_fwd_impl(
+            linear_uvqk, silu_linear_uvqk = up_projection(
                 x=normed_input,
                 w=linear_weight,
                 y=linear_bias,
@@ -351,51 +365,25 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     None,  # rab, func
                 )
             elif sm_major_version == 9:
-                assert q.dtype in (
-                    torch.bfloat16,
-                    torch.float16,
-                ), f"Hopper fwd expects bfloat16 or float16, got {q.dtype}"
-                output_dtype = 0 if q.dtype == torch.bfloat16 else 1
-                attn_q, attn_k, attn_v = q, k, v
-                q_descale = k_descale = v_descale = None
-                if ctx.attention_quant_mode == 5:
-                    with nvtx.annotate("fp8 attention prepare operands fwd"):
-                        (
-                            (attn_q, q_descale),
-                            (attn_k, k_descale),
-                            (attn_v, v_descale),
-                        ) = (
-                            hstu.quantize_for_head_batch_tensor(
-                                tensor,
-                                seq_offsets_q,
-                                quant_mode=ctx.attention_quant_mode,
-                            )
-                            for tensor in (q, k, v)
-                        )
-                jagged_attn_output, _ = torch.ops.fbgemm.hstu_varlen_fwd_90(
-                    attn_q,
-                    attn_k,
-                    attn_v,
+                (
                     seq_offsets_q,
+                    num_contexts,
+                    num_targets,
+                ) = prepare_hopper_fp8_attention_metadata(
+                    ctx.attention_quant_mode, seq_offsets_q, num_contexts, num_targets
+                )
+                jagged_attn_output = hopper_hstu_attn_fwd(
+                    q,
+                    k,
+                    v,
                     seq_offsets_q,
-                    None,
-                    None,  # seqused_q, seqused_k
-                    max_seqlen_q,
                     max_seqlen_q,
                     scaling_seqlen,
                     num_contexts,
                     num_targets,
                     target_group_size,
-                    -1,
-                    0,
                     alpha,
-                    None,
-                    None,  # rab, func
-                    quant_mode=ctx.attention_quant_mode,
-                    output_dtype=output_dtype,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
+                    ctx.attention_quant_mode,
                 )
             elif sm_major_version == 10:
                 assert q.dtype in (
@@ -500,7 +488,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             x,
             w,
         ):
-            y, _ = addmm_silu_fwd_impl(
+            y, _ = down_projection(
                 x=x,
                 w=w,
                 y=residual,
@@ -604,35 +592,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
     def backward(
         ctx,
         grad_output,
-    ) -> Tuple[
-        torch.Tensor,
-        None,
-        None,
-        None,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        None,
-        Optional[torch.Tensor],
-        Optional[torch.Tensor],
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    ]:
+    ) -> Tuple[Optional[torch.Tensor], ...]:
         """Compute input and parameter gradients for the fused HSTU layer."""
 
         def _linear_residual_bwd(
@@ -651,7 +611,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 is_y_1d=False,
                 wgrad_stream=wgrad_stream,
                 wgrad_event=wgrad_event,
-                linear_fp8=ctx.linear_fp8_backward,
+                linear_fp8=ctx.down_projection_fp8_backward,
             )
 
             return grad_x, grad_w, grad_residual
@@ -747,29 +707,26 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     torch.float16,
                 ), f"Hopper bwd expects bfloat16 or float16, got {dout.dtype}"
                 output_dtype = 0 if dout.dtype == torch.bfloat16 else 1
-                q_descale = k_descale = v_descale = do_descale = None
-                if ctx.attention_quant_mode == 5:
+                dout_t = q_t = k_t = None
+                attn_scales = {}
+                if ctx.attention_quant_mode != -1:
                     with nvtx.annotate("fp8 attention prepare operands bwd"):
                         (
-                            (q, q_descale),
-                            (k, k_descale),
-                            (v, v_descale),
-                            (dout, do_descale),
-                        ) = (
-                            hstu.quantize_for_head_batch_tensor(
-                                tensor,
-                                seq_offsets_q,
-                                quant_mode=ctx.attention_quant_mode,
-                            )
-                            for tensor in (q, k, v, dout)
+                            operands,
+                            transposed,
+                            attn_scales,
+                        ) = quantize_hopper_attention_operands(
+                            q, k, v, seq_offsets_q, ctx.attention_quant_mode, dout
                         )
+                        q, k, v, dout = operands
+                        dout_t, q_t, k_t = transposed
                 dq, dk, dv, _ = torch.ops.fbgemm.hstu_varlen_bwd_90(
                     dout,
-                    None,  # dout_t
+                    dout_t,
                     q,
-                    None,  # q_t
+                    q_t,
                     k,
-                    None,  # k_t
+                    k_t,
                     v,
                     seq_offsets_q,
                     seq_offsets_q,
@@ -788,11 +745,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                     window_size_right,
                     alpha,
                     quant_mode=ctx.attention_quant_mode,
-                    q_descale=q_descale,
-                    k_descale=k_descale,
-                    v_descale=v_descale,
-                    do_descale=do_descale,
                     output_dtype=output_dtype,
+                    **attn_scales,
                 )
             elif sm_major_version == 10:
                 assert dout.dtype in (
@@ -942,7 +896,7 @@ class FusedHSTULayerFunction(torch.autograd.Function):
                 silu=True,
                 wgrad_stream=wgrad_stream,
                 wgrad_event=wgrad_event,
-                linear_fp8=ctx.linear_fp8_backward,
+                linear_fp8=ctx.up_projection_fp8_backward,
             )
             # # 2. ln
             grad_input, grad_ln_weight, grad_ln_bias = triton_weighted_layer_norm_bwd(
@@ -1144,6 +1098,8 @@ class FusedHSTULayerFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -1182,31 +1138,36 @@ def fused_hstu_op(
     recompute_input_layernorm: bool = False,
     recompute_input_silu: bool = False,
     attention_quant_mode: int = -1,
-    linear_fp8: bool = False,
-    linear_fp8_backward: bool = True,
+    up_projection_fp8: bool = False,
+    down_projection_fp8: bool = False,
+    linear_fp8_scaling: str = "per-tensor",
+    linear_fp8_backward: bool = False,
 ):
     """Apply the fused HSTU layer with optional Hopper FP8 kernels."""
-    if attention_quant_mode not in (-1, 5):
-        raise ValueError("attention_quant_mode must be -1 or 5")
-    if (attention_quant_mode == 5 or linear_fp8) and (
+    validate_hopper_attention_quant_mode(attention_quant_mode)
+    projection_fp8 = up_projection_fp8 or down_projection_fp8
+    if (attention_quant_mode != -1 or projection_fp8) and (
         input.dtype != torch.bfloat16
         or input.device.type != "cuda"
         or torch.cuda.get_device_capability(input.device)[0] != 9
     ):
         raise ValueError("HSTU FP8 requires Hopper and BF16 inputs")
-    if attention_quant_mode == 5 and (
+    if attention_quant_mode != -1 and (
         attn_backend != KernelBackend.CUTLASS
         or linear_dim_per_head != attention_dim_per_head
         or attention_dim_per_head not in (64, 128, 256)
     ):
         raise ValueError(
-            "FP8 mode 5 requires CUTLASS attention and "
+            "FP8 requires CUTLASS attention and "
             "equal Q/K/V head dimensions of 64, 128, or 256"
         )
-    if linear_fp8 and linear_fp8_backward and wgrad_stream is not None:
-        raise ValueError(
-            "FP8 HSTU projection backward requires synchronous weight gradients"
-        )
+    if projection_fp8 and linear_fp8_backward:
+        if linear_fp8_scaling != "per-tensor":
+            raise ValueError("FP8 projection backward requires per-tensor scaling")
+        if wgrad_stream is not None:
+            raise ValueError(
+                "FP8 HSTU projection backward requires synchronous weight gradients"
+            )
     out = FusedHSTULayerFunction.apply(
         input,
         seqlen_offsets,
@@ -1238,7 +1199,9 @@ def fused_hstu_op(
         recompute_input_layernorm,
         recompute_input_silu,
         attention_quant_mode,
-        linear_fp8,
+        up_projection_fp8,
+        down_projection_fp8,
+        linear_fp8_scaling,
         linear_fp8_backward,
     )
 

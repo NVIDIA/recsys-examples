@@ -162,7 +162,9 @@ class FusedHSTULayer(MegatronModule):
             recompute_input_layernorm=self._recompute_input_layernorm,
             recompute_input_silu=self._recompute_input_silu,
             attention_quant_mode=self.config.attention_quant_mode,
-            linear_fp8=self.config.linear_fp8,
+            up_projection_fp8=self.config.up_projection_fp8,
+            down_projection_fp8=self.config.down_projection_fp8,
+            linear_fp8_scaling=self.config.linear_fp8_scaling,
             linear_fp8_backward=self.config.linear_fp8_backward,
         )
         return jd.copy_others_but_set_values(values=output)

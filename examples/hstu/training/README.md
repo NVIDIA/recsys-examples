@@ -84,31 +84,35 @@ mkdir -p ./tmp_data && python3 ./hstu_data_preprocessor.py --dataset_name <"ml-1
 
 ### Start training
 
-For fused HSTU training on Hopper with tensor parallel size 1, use the Gin
-bindings below to enable Transformer Engine FP8 projections and per-tensor
-FBGEMM FP8 attention independently.
+For fused HSTU training on Hopper with tensor parallel size 1, these Gin
+bindings give the UVQK and output projection GEMMs row-wise E4M3 scaling.
+Attention, normalization, SiLU, gating, residuals, and backward use the BF16
+path. The HSTU implementation uses standalone casts and a separate BF16
+residual add. [ULTRA-HSTU §4.2.2](https://arxiv.org/html/2602.16986v2#S4.SS2.SSS2.Px1)
 
 ```gin
 NetworkArgs.dtype_str = "bfloat16"
 NetworkArgs.kernel_backend = "cutlass"
-MixedPrecisionArgs.mixed_precision_dtype = "fp8"
-MixedPrecisionArgs.hstu_attn_quantization_mode = "per-tensor"
+MixedPrecisionArgs.up_projection_fp8 = True
+MixedPrecisionArgs.down_projection_fp8 = True
+MixedPrecisionArgs.linear_fp8_scaling = "rowwise"
 ```
 
-FP8 projection forward uses E4M3 activations and weights. The FP8 backward
-path uses E5M2 output gradients. For FP8 projection forward with BF16
-projection backward and attention, use these bindings with the same
-BF16/CUTLASS network settings.
+The projections are independently configurable and default to the network
+dtype. Set `linear_fp8_scaling` to `"per-tensor"` (the default) for Transformer
+Engine current scaling. Set `linear_fp8_backward = True` to use FP8 backward
+GEMMs for the selected per-tensor projections. This requires synchronous
+weight gradients and uses E5M2 output gradients. The per-tensor path uses
+Transformer Engine's `Float8CurrentScalingQuantizer` (tested with 2.17).
+Projection scaling and token padding are local to the GEMMs, and the HSTU
+checkpoint format is shared across precision settings.
 
-```gin
-MixedPrecisionArgs.mixed_precision_dtype = "fp8"
-MixedPrecisionArgs.linear_fp8_backward = False
-MixedPrecisionArgs.hstu_attn_quantization_mode = "bf16"
-```
-
-FP8 projections require Transformer Engine with `Float8CurrentScalingQuantizer`
-(tested with 2.17). Projection padding is local to the GEMMs. The HSTU
-checkpoint format is compatible across these precision settings.
+Set `MixedPrecisionArgs.attention_quant_mode` independently to a native
+Hopper FBGEMM mode. The default `-1` uses unquantized attention. For example,
+`5` applies per-tensor FP8 scaling in both forward and backward. FP8
+attention requires CUTLASS and equal Q/K/V head dimensions of 64, 128, or 256.
+Mode `1` requires packed sequence lengths that are multiples of 16.
+[FBGEMM Hopper quantization modes](https://github.com/jiayus-nvidia/FBGEMM/blob/d6249db5f885da62ef43d9d0b31e14e72972f264/fbgemm_gpu/experimental/hstu/hstu/cuda_hstu_attention.py#L460-L485)
 
 The entrypoint for training are `pretrain_gr_retrieval.py` or `pretrain_gr_ranking.py`. We use gin-config to specify the model structure, training arguments, hyper-params etc.
 

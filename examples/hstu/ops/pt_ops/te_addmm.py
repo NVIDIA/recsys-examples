@@ -27,7 +27,7 @@ def _quantize(
 
 
 def te_fp8_addmm_silu_fwd(
-    x: torch.Tensor, w: torch.Tensor, y: torch.Tensor, silu: bool = False
+    x: torch.Tensor, w: torch.Tensor, y: torch.Tensor | None, silu: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Compute a BF16 projection and optional SiLU using an FP8 GEMM."""
     rows = x.size(0)
@@ -48,7 +48,7 @@ def te_fp8_addmm_silu_fwd(
         x_fp8 = _quantize(x, columnwise=False)
     w_fp8 = _quantize(w, columnwise=True)
     # TE uses column-major GEMM ordering: NN computes x @ w for [in, out] weights.
-    if y.ndim == 1:
+    if y is None or y.ndim == 1:
         z, *_ = general_gemm(w_fp8, x_fp8, layout="NN", out_dtype=x.dtype, bias=y)
     else:
         if padding:
@@ -62,6 +62,53 @@ def te_fp8_addmm_silu_fwd(
         )
     z = z[:rows]
     return z, F.silu(z) if silu else None
+
+
+def _quantize_fp8_per_row(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    fp8_dtype = torch.float8_e4m3fn
+    fp8_max = torch.finfo(fp8_dtype).max
+    with nvtx.annotate("fp8 projection contiguous operand"):
+        tensor = tensor.to(dtype=torch.float32, memory_format=torch.contiguous_format)
+    with nvtx.annotate("fp8 projection quantize operand"):
+        scale = tensor.abs().amax(dim=1, keepdim=True) / fp8_max
+        scale = torch.where(scale == 0, 1.0, scale)
+        quantized = (tensor / scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+    return quantized, scale
+
+
+def rowwise_fp8_addmm_silu_fwd(
+    x: torch.Tensor, w: torch.Tensor, y: torch.Tensor | None, silu: bool = False
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Use one E4M3 scale per activation row and weight output channel."""
+    if x.size(0) == 0:
+        z = x.new_empty((0, w.size(1)))
+        return z, F.silu(z) if silu else None
+
+    x_fp8, x_scale = _quantize_fp8_per_row(x)
+    weight_fp8, weight_scale = _quantize_fp8_per_row(w.t())
+    bias = y.contiguous() if y is not None and y.ndim == 1 else None
+    z = F.scaled_mm(
+        x_fp8,
+        weight_fp8.t(),
+        x_scale,
+        F.ScalingType.RowWise,
+        weight_scale.t(),
+        F.ScalingType.RowWise,
+        bias=bias,
+        output_dtype=x.dtype,
+        use_fast_accum=True,
+    )
+    if y is not None and bias is None:
+        z = z + y
+    return z, F.silu(z) if silu else None
+
+
+def get_fp8_addmm_silu_fwd(scaling: str):
+    if scaling == "per-tensor":
+        return te_fp8_addmm_silu_fwd
+    if scaling == "rowwise":
+        return rowwise_fp8_addmm_silu_fwd
+    raise ValueError(f"Unsupported HSTU FP8 projection scaling: {scaling}")
 
 
 def te_fp8_linear_bwd(

@@ -82,6 +82,10 @@ class InferenceHSTUConfig:
         contextual_max_seqlen (int): The (maximum) length of contextual features.
         embedding_backend (EmbeddingBackend, optional): Embedding backend to use.
         backbone (str): Dense inference backbone, either hstu or transformer.
+        up_projection_fp8 (bool): Enable FP8 for the HSTU UVQK projection.
+        down_projection_fp8 (bool): Enable FP8 for the HSTU output projection.
+        linear_fp8_scaling (str): Scaling for FP8 HSTU projections, "per-tensor" or "rowwise".
+        attention_quant_mode (int): Native Hopper FBGEMM mode for uncached HSTU attention, or -1.
         transformer_ffn_dim (int, optional): Transformer feed-forward width; defaults to four times hidden_size.
         transformer_fp8_linear (bool): Run the Transformer projections as FP8 DeepGEMM GEMMs; needs bf16 and cannot be exported.
         transformer_attention (str): Transformer attention, sdpa (padded reference) or fa4 (FlashAttention 4; needs bf16 or fp16 and cannot be exported).
@@ -112,12 +116,24 @@ class InferenceHSTUConfig:
     transformer_ffn_dim: Optional[int] = None
     transformer_fp8_linear: bool = False
     transformer_attention: str = "sdpa"
+    up_projection_fp8: bool = False
+    down_projection_fp8: bool = False
+    linear_fp8_scaling: str = "per-tensor"
+    attention_quant_mode: int = -1
 
     def __post_init__(self):
         assert self.is_causal
         assert self.target_group_size == 1
         if self.backbone not in ("hstu", "transformer"):
             raise ValueError(f"Unknown inference backbone: {self.backbone}")
+        if (
+            self.up_projection_fp8
+            or self.down_projection_fp8
+            or self.attention_quant_mode != -1
+        ) and (self.backbone != "hstu" or not self.bf16 or self.export_mode):
+            raise ValueError(
+                "HSTU FP8 requires the BF16 HSTU backbone in PyTorch inference"
+            )
         if self.transformer_fp8_linear and self.backbone != "transformer":
             raise ValueError("transformer_fp8_linear requires the transformer backbone")
         if self.transformer_fp8_linear and not self.bf16:
@@ -172,6 +188,10 @@ def get_inference_hstu_config(
     hstu_preprocessing_config: Optional[HSTUPreprocessingConfig] = None,
     transformer_fp8_linear: bool = False,
     transformer_attention: str = "sdpa",
+    up_projection_fp8: bool = False,
+    down_projection_fp8: bool = False,
+    linear_fp8_scaling: str = "per-tensor",
+    attention_quant_mode: int = -1,
 ) -> InferenceHSTUConfig:
     """
     Create the HSTU configuration.
@@ -192,6 +212,10 @@ def get_inference_hstu_config(
         position_encoding_config (Optional[PositionEncodingConfig], optional): Position embedding config. Defaults to None.
         contextual_max_seqlen (int, optional): The (maximum) length of contextual features.
         backbone (str, optional): Dense inference backbone, hstu or transformer. Defaults to hstu.
+        up_projection_fp8 (bool, optional): Enable FP8 for the HSTU UVQK projection.
+        down_projection_fp8 (bool, optional): Enable FP8 for the HSTU output projection.
+        linear_fp8_scaling (str, optional): Scaling for FP8 HSTU projections, "per-tensor" or "rowwise".
+        attention_quant_mode (int, optional): Native Hopper FBGEMM mode for uncached HSTU attention, or -1.
         transformer_ffn_dim (Optional[int], optional): Transformer feed-forward width. Defaults to four times hidden_size.
         hstu_preprocessing_config (Optional[HSTUPreprocessingConfig], optional): HSTU preprocessing config. Defaults to None.
         transformer_fp8_linear (bool, optional): Run the Transformer projections as FP8 DeepGEMM GEMMs; needs bf16 and cannot be exported. Defaults to False.
@@ -232,4 +256,8 @@ def get_inference_hstu_config(
         hstu_preprocessing_config=hstu_preprocessing_config,
         transformer_fp8_linear=transformer_fp8_linear,
         transformer_attention=transformer_attention,
+        up_projection_fp8=up_projection_fp8,
+        down_projection_fp8=down_projection_fp8,
+        linear_fp8_scaling=linear_fp8_scaling,
+        attention_quant_mode=attention_quant_mode,
     )

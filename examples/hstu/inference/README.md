@@ -146,6 +146,25 @@ Show the path contract without launching Triton:
 bash ./inference/launch_and_test_triton_python_backend.sh --help
 ```
 
+## FP8 HSTU inference on Hopper
+
+With the BF16 HSTU backbone, add these bindings to the inference Gin config
+to run the UVQK and output projection GEMMs with row-wise E4M3 scaling.
+
+```gin
+MixedPrecisionArgs.up_projection_fp8 = True
+MixedPrecisionArgs.down_projection_fp8 = True
+MixedPrecisionArgs.linear_fp8_scaling = "rowwise"
+```
+
+Enable either projection independently, or select `"per-tensor"` for
+Transformer Engine current scaling. The projections support BF16 attention
+with or without the KV cache. CUDA graphs with FP8 projections require row-wise
+scaling. To use FP8 attention, set
+`MixedPrecisionArgs.attention_quant_mode` to a Hopper FBGEMM mode (for
+example, `5` for per-tensor) and run with `--disable_kvcache`. FP8 attention
+requires eager execution, and HSTU FP8 is available in the PyTorch path.
+
 ## Consistency Check for Inference
 
 Currently, we use the evaluation metrics results (e.g. AUC) to check the consistency between training and inference.

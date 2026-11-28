@@ -34,7 +34,7 @@ from configs import (
 from modules.metrics import get_multi_event_metric_module
 from recsys_kvcache_manager.kvcache_config import get_kvcache_config
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
-from utils import DatasetArgs, NetworkArgs, RankingArgs
+from utils import DatasetArgs, MixedPrecisionArgs, NetworkArgs, RankingArgs
 
 sys.path.append("./model/")
 from inference_ranking_gr import get_inference_ranking_gr
@@ -132,6 +132,7 @@ def get_inference_hstu_model(
     use_kvcache,
 ):
     network_args = NetworkArgs()
+    mixed_precision_args = MixedPrecisionArgs()
     if network_args.dtype_str == "bfloat16":
         inference_dtype = torch.bfloat16
     # elif network_args.dtype_str == "float16":
@@ -163,6 +164,10 @@ def get_inference_hstu_model(
         transformer_ffn_dim=network_args.transformer_ffn_dim,
         transformer_fp8_linear=network_args.transformer_fp8_linear,
         transformer_attention=network_args.transformer_attention,
+        up_projection_fp8=mixed_precision_args.up_projection_fp8,
+        down_projection_fp8=mixed_precision_args.down_projection_fp8,
+        linear_fp8_scaling=mixed_precision_args.linear_fp8_scaling,
+        attention_quant_mode=mixed_precision_args.attention_quant_mode,
     )
 
     sm_major = torch.cuda.get_device_capability()[0]
@@ -259,7 +264,7 @@ def run_ranking_gr_simulate(
             num_contextual_features,
             total_max_seqlen,
             checkpoint_dir,
-            True,
+            use_kvcache=not disable_kvcache,
         )
 
         if check_auc:
@@ -470,8 +475,6 @@ if __name__ == "__main__":
             checkpoint_dir=args.checkpoint_dir, disable_kvcache=args.disable_kvcache
         )
     elif args.mode == RunningMode.SIMULATE:
-        if args.disable_kvcache:
-            print("disable_kvcache is ignored in Eval mode.")
         run_ranking_gr_simulate(
             checkpoint_dir=args.checkpoint_dir,
             check_auc=not args.disable_auc,

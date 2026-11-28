@@ -21,7 +21,13 @@ import torch
 import torch.nn.functional as F
 from configs import InferenceHSTUConfig
 from hstu import hstu_attn_varlen_func
+from modules.hstu_attention import (
+    hopper_hstu_attn_fwd,
+    prepare_hopper_fp8_attention_metadata,
+    validate_hopper_attention_quant_mode,
+)
 from modules.jagged_data import JaggedData
+from ops.pt_ops.te_addmm import get_fp8_addmm_silu_fwd
 from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd
 from ops.triton_ops.triton_addmm import triton_addmm_silu_fwd
 from ops.triton_ops.triton_layer_norm import triton_weighted_layer_norm_fwd
@@ -78,6 +84,8 @@ class PagedHSTUInferLayer(torch.nn.Module):
         ]
         self._max_seqlen = config.max_seq_len
         self._export_mode = self._resolve_export_mode(config)
+        self._attention_quant_mode = config.attention_quant_mode
+        validate_hopper_attention_quant_mode(self._attention_quant_mode)
 
         dtype = (
             torch.bfloat16
@@ -87,6 +95,25 @@ class PagedHSTUInferLayer(torch.nn.Module):
             else torch.float32
         )
         device = torch.cuda.current_device()
+        if (
+            config.up_projection_fp8
+            or config.down_projection_fp8
+            or self._attention_quant_mode != -1
+        ) and torch.cuda.get_device_capability(device)[0] != 9:
+            raise ValueError("HSTU FP8 inference requires Hopper")
+        if self._attention_quant_mode != -1 and config.head_dim not in (64, 128, 256):
+            raise ValueError(
+                "Hopper FP8 HSTU attention requires head_dim 64, 128, or 256"
+            )
+        fp8_projection = (
+            get_fp8_addmm_silu_fwd(config.linear_fp8_scaling)
+            if config.up_projection_fp8 or config.down_projection_fp8
+            else None
+        )
+        self._up_projection_fp8 = fp8_projection if config.up_projection_fp8 else None
+        self._down_projection_fp8 = (
+            fp8_projection if config.down_projection_fp8 else None
+        )
 
         # linear_uvqk
         self._linear_uvqk = torch.nn.Linear(
@@ -176,7 +203,14 @@ class PagedHSTUInferLayer(torch.nn.Module):
         return tensor[: batch_size + 1] if is_offsets else tensor[:batch_size]
 
     def uvqk_addmm_impl(self, input_data, num_tokens):
-        if not self._export_mode and num_tokens >= 2048:  # fusion impl
+        if self._up_projection_fp8 is not None:
+            _, silu_output_data = self._up_projection_fp8(
+                input_data,
+                self._linear_uvqk.weight.T,
+                self._linear_uvqk.bias,
+                silu=True,
+            )
+        elif not self._export_mode and num_tokens >= 2048:  # fusion impl
             _, silu_output_data = self.addmm_silu_impl(
                 x=input_data,
                 w=self._linear_uvqk_weight,  # transposed
@@ -190,7 +224,9 @@ class PagedHSTUInferLayer(torch.nn.Module):
         return silu_output_data
 
     def uvqk_addmm_inplace_impl(self, input_data, silu_output_data, num_tokens):
-        if num_tokens >= 1024:  # fusion impl
+        if self._up_projection_fp8 is not None:
+            silu_output_data.copy_(self.uvqk_addmm_impl(input_data, num_tokens))
+        elif num_tokens >= 1024:  # fusion impl
             self.addmm_silu_impl(
                 x=input_data,
                 w=self._linear_uvqk_weight,  # transposed
@@ -209,7 +245,13 @@ class PagedHSTUInferLayer(torch.nn.Module):
             F.silu(silu_output_data, inplace=True)
 
     def proj_addmm_impl(self, input_data, residual, num_tokens):
-        if not self._export_mode and num_tokens >= 2048:  # fusion impl
+        if self._down_projection_fp8 is not None:
+            output_data, _ = self._down_projection_fp8(
+                input_data, self._linear_proj.weight.T, residual
+            )
+        elif residual is None:
+            output_data = self._linear_proj(input_data)
+        elif not self._export_mode and num_tokens >= 2048:  # fusion impl
             output_data, _ = self.addmm_silu_impl(
                 x=input_data,
                 w=self._linear_proj_weight,  # transposed
@@ -225,7 +267,9 @@ class PagedHSTUInferLayer(torch.nn.Module):
         return output_data
 
     def proj_addmm_inplace_impl(self, input_data, residual, output_data, num_tokens):
-        if num_tokens >= 1024:  # fusion impl
+        if self._down_projection_fp8 is not None or residual is None:
+            output_data.copy_(self.proj_addmm_impl(input_data, residual, num_tokens))
+        elif num_tokens >= 1024:  # fusion impl
             self.addmm_silu_impl(
                 x=input_data,
                 w=self._linear_proj_weight,  # transposed
@@ -261,6 +305,33 @@ class PagedHSTUInferLayer(torch.nn.Module):
             )
 
         return parallel_input
+
+    def _fp8_attention(
+        self, query, key, value, jd, batch_size, max_seqlen, scaling_seqlen
+    ):
+        if torch.cuda.is_current_stream_capturing():
+            raise ValueError(
+                "FP8 HSTU attention requires inference without CUDA graphs"
+            )
+        offsets, num_contexts, num_targets = prepare_hopper_fp8_attention_metadata(
+            self._attention_quant_mode,
+            jd.seqlen_offsets[: batch_size + 1],
+            None,
+            jd.num_candidates[:batch_size],
+        )
+        return hopper_hstu_attn_fwd(
+            query,
+            key,
+            value,
+            offsets,
+            max_seqlen,
+            scaling_seqlen,
+            num_contexts,
+            num_targets,
+            self._target_group_size,
+            self._alpha,
+            self._attention_quant_mode,
+        )
 
     def hstu_attn_export_impl(
         self,
@@ -323,6 +394,8 @@ class PagedHSTUInferLayer(torch.nn.Module):
         jd: JaggedData,
         kv_cache_metadata,
     ) -> JaggedData:
+        if self._attention_quant_mode != -1 and kv_cache_metadata is not None:
+            raise ValueError("FP8 HSTU attention requires inference without a KV cache")
         normed_input = F.layer_norm(
             layer_input,
             normalized_shape=[self._embedding_dim],
@@ -406,6 +479,10 @@ class PagedHSTUInferLayer(torch.nn.Module):
                     kv_cache_metadata.kv_indices,
                     kv_cache_metadata.kv_last_page_len,
                 )
+        elif self._attention_quant_mode != -1 and num_tokens:
+            jagged_attn_output = self._fp8_attention(
+                query, key, value, jd, batch_size, jd.max_seqlen, jd.scaling_seqlen
+            )
         else:
             jagged_attn_output = hstu_attn_varlen_func(
                 query,
@@ -433,11 +510,9 @@ class PagedHSTUInferLayer(torch.nn.Module):
             jagged_attn_output, user, num_tokens >= 2048
         )
 
-        if self._residual:
-            layer_output = self.proj_addmm_impl(parallel_input, layer_input, num_tokens)
-        else:
-            layer_output = self._linear_proj(parallel_input)
-        return layer_output
+        return self.proj_addmm_impl(
+            parallel_input, layer_input if self._residual else None, num_tokens
+        )
 
     @torch.inference_mode()
     def forward_input(
@@ -448,6 +523,8 @@ class PagedHSTUInferLayer(torch.nn.Module):
         jd: JaggedData,
         kv_cache_metadata,
     ) -> JaggedData:
+        if self._attention_quant_mode != -1 and kv_cache_metadata is not None:
+            raise ValueError("FP8 HSTU attention requires inference without a KV cache")
         input_tensor = input_buffer[:num_tokens, ...]
         normed_input, _, _, _, _ = triton_weighted_layer_norm_fwd(
             x=input_tensor,
@@ -520,43 +597,49 @@ class PagedHSTUInferLayer(torch.nn.Module):
         kv_cache_table = (
             kv_cache_metadata.kv_cache_table[self.layer_idx] if use_kvcache else None
         )
-        jagged_attn_output = hstu_attn_varlen_func(
-            query,
-            key,
-            value,
-            jd.seqlen_offsets[: batch_size + 1],
-            kv_cache_metadata.kv_seqlen_offsets[: batch_size + 1]
-            if use_kvcache
-            else jd.seqlen_offsets[: batch_size + 1],
-            None,
-            None,  # seqused_q, seqused_k
-            self._max_seqlen,
-            self._max_seqlen,
-            self._max_seqlen,  # scaling_seqlen
-            None,  # num_contexts
-            jd.num_candidates[:batch_size],
-            target_group_size=1,
-            window_size=(-1, 0),
-            alpha=self._alpha,
-            kv_cache=kv_cache_table,
-            page_offsets=kv_cache_metadata.kv_indptr if use_kvcache else None,
-            page_ids=kv_cache_metadata.kv_indices if use_kvcache else None,
-            last_page_lens=kv_cache_metadata.kv_last_page_len if use_kvcache else None,
-        )
+        if self._attention_quant_mode != -1 and use_kvcache:
+            raise ValueError("FP8 HSTU attention requires inference without a KV cache")
+        if self._attention_quant_mode != -1 and num_tokens:
+            jagged_attn_output = self._fp8_attention(
+                query, key, value, jd, batch_size, self._max_seqlen, self._max_seqlen
+            )
+        else:
+            jagged_attn_output = hstu_attn_varlen_func(
+                query,
+                key,
+                value,
+                jd.seqlen_offsets[: batch_size + 1],
+                kv_cache_metadata.kv_seqlen_offsets[: batch_size + 1]
+                if use_kvcache
+                else jd.seqlen_offsets[: batch_size + 1],
+                None,
+                None,  # seqused_q, seqused_k
+                self._max_seqlen,
+                self._max_seqlen,
+                self._max_seqlen,  # scaling_seqlen
+                None,  # num_contexts
+                jd.num_candidates[:batch_size],
+                target_group_size=1,
+                window_size=(-1, 0),
+                alpha=self._alpha,
+                kv_cache=kv_cache_table,
+                page_offsets=kv_cache_metadata.kv_indptr if use_kvcache else None,
+                page_ids=kv_cache_metadata.kv_indices if use_kvcache else None,
+                last_page_lens=kv_cache_metadata.kv_last_page_len
+                if use_kvcache
+                else None,
+            )
 
         jagged_attn_output = jagged_attn_output.view(
             -1, self._num_heads * self._linear_dim_per_head
         )
         parallel_input = self.norm_mul_impl(jagged_attn_output, user, True)
 
-        if self._residual:
-            self.proj_addmm_inplace_impl(
-                parallel_input,
-                input_buffer[:num_tokens, ...],
-                self.output_buffer_[:num_tokens, ...],
-                num_tokens,
-            )
-        else:
-            self.output_buffer_[:num_tokens, ...] = self._linear_proj(parallel_input)
+        self.proj_addmm_inplace_impl(
+            parallel_input,
+            input_buffer[:num_tokens, ...] if self._residual else None,
+            self.output_buffer_[:num_tokens, ...],
+            num_tokens,
+        )
 
         return self.output_buffer_[:num_tokens, ...]

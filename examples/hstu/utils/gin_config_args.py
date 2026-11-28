@@ -449,19 +449,13 @@ class NetworkArgs:
 @gin.configurable
 @dataclass
 class MixedPrecisionArgs:
-    """Optional FP8 projections and HSTU attention for fused training on Hopper."""
+    """Optional Hopper FP8 settings for HSTU training and inference."""
 
-    mixed_precision_dtype: str | None = None
-    hstu_attn_quantization_mode: str = "bf16"
-    linear_fp8_backward: bool = True  # Applies when mixed_precision_dtype is FP8.
-
-    def __post_init__(self):
-        if self.mixed_precision_dtype not in (None, "fp8"):
-            raise ValueError("mixed_precision_dtype must be None or 'fp8'")
-        if self.hstu_attn_quantization_mode not in ("bf16", "per-tensor"):
-            raise ValueError(
-                "hstu_attn_quantization_mode must be 'bf16' or 'per-tensor'"
-            )
+    up_projection_fp8: bool = False
+    down_projection_fp8: bool = False
+    linear_fp8_scaling: str = "per-tensor"
+    linear_fp8_backward: bool = False
+    attention_quant_mode: int = -1
 
 
 @gin.configurable
